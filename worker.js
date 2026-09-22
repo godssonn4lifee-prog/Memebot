@@ -5,17 +5,7 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/") {
-      return new Response(
-        JSON.stringify({
-          bot: "Memebot",
-          status: "running",
-          trading: "DISABLED",
-          message: "Memebot is online."
-        }, null, 2),
-        {
-          headers: { "content-type": "application/json" }
-        }
-      );
+      return new Response("Memebot is running. Trading is DISABLED.");
     }
 
     if (url.pathname === "/status") {
@@ -23,7 +13,7 @@ export default {
         const rpcUrl =
           `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`;
 
-        const response = await fetch(rpcUrl, {
+        const rpcResponse = await fetch(rpcUrl, {
           method: "POST",
           headers: {
             "Content-Type": "application/json"
@@ -36,27 +26,23 @@ export default {
           })
         });
 
-        const data = await response.json();
-
-        if (data.error) {
-          throw new Error(data.error.message);
-        }
-
-        const lamports = data.result.value;
-        const sol = lamports / 1_000_000_000;
+        const data = await rpcResponse.json();
 
         return new Response(
           JSON.stringify({
             bot: "Memebot",
             trading: "DISABLED",
+            helius_connected: rpcResponse.ok,
             wallet: WALLET_ADDRESS,
-            sol_balance: sol,
-            message: "Wallet connection test successful."
+            helius_response: data
           }, null, 2),
           {
-            headers: { "content-type": "application/json" }
+            headers: {
+              "Content-Type": "application/json"
+            }
           }
         );
+
       } catch (error) {
         return new Response(
           JSON.stringify({
@@ -66,7 +52,9 @@ export default {
           }, null, 2),
           {
             status: 500,
-            headers: { "content-type": "application/json" }
+            headers: {
+              "Content-Type": "application/json"
+            }
           }
         );
       }
@@ -75,8 +63,7 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 
-  async scheduled(event, env, ctx) {
+  async scheduled() {
     console.log("Memebot scheduled test running");
-  
   }
 };
