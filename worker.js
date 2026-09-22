@@ -5,94 +5,70 @@ import {
   VersionedTransaction
 } from "@solana/web3.js";
 
-
-// ============================================================
-// CONSTANTS
-// ============================================================
-
 const SOL_MINT =
   "So11111111111111111111111111111111111111112";
 
 const USDC_MINT =
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
-const TOKEN_PROGRAM_ID =
-  new PublicKey(
-    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-  );
-
-const ASSOCIATED_TOKEN_PROGRAM_ID =
-  new PublicKey(
-    "ATokenGPvbdGVxr1b2hvZbsiqW5nQzV4M6YJx1d3r4V"
-  );
-
-const USDC_PUBLIC_KEY =
-  new PublicKey(USDC_MINT);
-
-const PROFIT_TARGET = 0.05;
-const STOP_LOSS = -0.02;
-
-const MIN_SOL_RESERVE = 0.01;
-
-const MAX_TRADE_USD = 20;
-
-const SLIPPAGE_BPS = 100;
-
-const MAX_PRICE_IMPACT_PERCENT = 1;
-
 const LIVE_TRADING = true;
 
-const API_BASE =
-  "https://api.jup.ag/swap/v1";
+// Trading rules
+const PROFIT_TARGET = 0.05;       // +5%
+const STOP_LOSS = -0.02;          // -2%
+const MIN_SOL_RESERVE = 0.01;     // keep SOL for fees
+const MAX_TRADE_USD = 20;
 
+// Safety filters for candidate tokens
+const MIN_LIQUIDITY_USD = 25000;
+const MIN_VOLUME_24H_USD = 10000;
+const MAX_PRICE_IMPACT_PERCENT = 1;
 
-// ============================================================
-// WORKER
-// ============================================================
+// Jupiter API
+const JUPITER_BASE =
+  "https://api.jup.ag";
+
+const SWAP_BASE =
+  `${JUPITER_BASE}/swap/v2`;
+
+const TOKEN_BASE =
+  `${JUPITER_BASE}/tokens/v2`;
+
+const PRICE_BASE =
+  `${JUPITER_BASE}/price/v3`;
 
 export default {
-
   async fetch(request, env) {
-
     try {
-
-      const url =
-        new URL(request.url);
-
+      const url = new URL(request.url);
 
       if (url.pathname === "/") {
-
         return json({
           bot: "Memebot",
           status: "online",
-          trading:
-            LIVE_TRADING
-              ? "ENABLED"
-              : "DISABLED"
+          trading: LIVE_TRADING ? "ENABLED" : "DISABLED",
+          strategy:
+            "SOL -> trending token -> SOL"
         });
-
       }
-
 
       if (url.pathname === "/status") {
-
-        const result =
-          await getStatus(env);
-
-        return json(result);
-
+        return json(
+          await getStatus(env)
+        );
       }
 
+      if (url.pathname === "/scan") {
+        return json(
+          await scanCandidates(env)
+        );
+      }
 
       if (url.pathname === "/run") {
-
-        const result =
-          await runBot(env);
-
-        return json(result);
-
+        return json(
+          await runBot(env)
+        );
       }
-
 
       return json({
         bot: "Memebot",
@@ -100,90 +76,65 @@ export default {
         endpoints: [
           "/",
           "/status",
+          "/scan",
           "/run"
         ]
       });
 
     } catch (error) {
-
       console.error(
         "FETCH ERROR:",
         error
       );
 
-
       return json({
-
         bot: "Memebot",
-
         status: "error",
-
         error:
           error?.message ||
-          String(error),
-
-        name:
-          error?.name ||
-          "Error"
-
+          String(error)
       }, 500);
-
     }
-
   },
 
-
   async scheduled(event, env, ctx) {
-
     try {
-
       console.log(
         "Memebot cron started:",
         event.cron
       );
 
-
       const result =
         await runBot(env);
-
 
       console.log(
         "Memebot cron result:",
         JSON.stringify(result)
       );
 
-
     } catch (error) {
-
       console.error(
         "MEMEBOT CRON ERROR:",
         error?.message ||
         String(error)
       );
-
     }
-
   }
-
 };
 
 
-// ============================================================
-// MAIN BOT
-// ============================================================
+/* =========================================================
+   MAIN BOT
+   ========================================================= */
 
 async function runBot(env) {
-
   validateSecrets(env);
-
 
   const wallet =
     getWallet(env);
 
-
   const connection =
     getConnection(env);
-
 
   const solBalance =
     await getSolBalance(
@@ -191,246 +142,385 @@ async function runBot(env) {
       wallet.publicKey
     );
 
-
   const usdcBalance =
     await getUsdcBalance(
       connection,
       wallet.publicKey
     );
 
-
-  const solPrice =
-    await getSolPrice(env);
-
-
   let position =
     await loadPosition(env);
 
-
-  // ==========================================================
-  // NO POSITION
-  // BUY SOL
-  // ==========================================================
+  /*
+   * =======================================================
+   * NO CURRENT POSITION
+   * =======================================================
+   */
 
   if (!position) {
+    const availableLamports =
+      getSpendableSolLamports(
+        solBalance
+      );
 
-    if (usdcBalance < 1) {
-
+    if (availableLamports <= 0) {
       return {
-
         bot: "Memebot",
-
         trading: "ENABLED",
-
         action: "WAITING",
-
         reason:
-          "USDC balance is too low.",
-
+          "Not enough SOL after reserve.",
         sol_balance:
           solBalance,
-
         usdc_balance:
-          usdcBalance,
-
-        sol_price:
-          solPrice
-
+          usdcBalance
       };
-
     }
 
+    const solPrice =
+      await getSolUsdPrice(env);
 
-    const tradeUsd =
-      Math.min(
-        MAX_TRADE_USD,
-        usdcBalance
+    const maxTradeLamports =
+      Math.floor(
+        (
+          MAX_TRADE_USD /
+          solPrice
+        ) *
+        1_000_000_000
       );
 
+    const tradeLamports =
+      Math.min(
+        availableLamports,
+        maxTradeLamports
+      );
+
+    if (tradeLamports <= 0) {
+      return {
+        bot: "Memebot",
+        trading: "ENABLED",
+        action: "WAITING",
+        reason:
+          "Calculated SOL trade amount is too small.",
+        sol_balance:
+          solBalance,
+        sol_price:
+          solPrice
+      };
+    }
+
+    /*
+     * Find the strongest currently trending
+     * candidate and verify that Jupiter can
+     * actually quote the trade.
+     */
+
+    const candidate =
+      await selectBestCandidate(
+        env,
+        tradeLamports
+      );
+
+    if (!candidate) {
+      return {
+        bot: "Memebot",
+        trading: "ENABLED",
+        action: "WAITING",
+        reason:
+          "No eligible trending token passed the safety filters.",
+        sol_balance:
+          solBalance,
+        sol_price:
+          solPrice
+      };
+    }
 
     if (!LIVE_TRADING) {
-
       return {
-
         bot: "Memebot",
-
         trading: "DISABLED",
-
-        action:
-          "BUY_WOULD_EXECUTE",
-
-        amount_usdc:
-          tradeUsd,
-
-        sol_price:
-          solPrice
-
+        action: "BUY_WOULD_EXECUTE",
+        token:
+          candidate.symbol,
+        mint:
+          candidate.mint,
+        trade_sol:
+          tradeLamports /
+          1_000_000_000,
+        estimated_token_amount:
+          candidate.quote.outAmount
       };
-
     }
 
+    console.log(
+      "BUYING TOKEN:",
+      candidate.symbol,
+      candidate.mint
+    );
 
-    const usdcAmount =
-      Math.floor(
-        tradeUsd * 1_000_000
-      );
-
-
-    const result =
-      await executeSwap(
+    const buyResult =
+      await executeJupiterOrder(
         env,
         wallet,
-        connection,
-        USDC_MINT,
         SOL_MINT,
-        usdcAmount.toString()
+        candidate.mint,
+        tradeLamports.toString()
       );
 
-
-    const solReceived =
-      Number(
-        result.outputAmount
-      ) /
-      1_000_000_000;
-
-
-    if (solReceived <= 0) {
-
+    if (
+      buyResult.status !==
+      "Success"
+    ) {
       throw new Error(
-        "Buy completed without receiving SOL."
+        `Buy failed: ${JSON.stringify(buyResult)}`
       );
-
     }
 
-
-    const entryPrice =
-      tradeUsd /
-      solReceived;
-
+    const actualTokenAmount =
+      buyResult.totalOutputAmount ||
+      buyResult.outputAmountResult ||
+      candidate.quote.outAmount;
 
     position = {
+      tokenMint:
+        candidate.mint,
 
-      entryPrice,
+      tokenSymbol:
+        candidate.symbol,
 
-      solAmount:
-        solReceived,
+      tokenName:
+        candidate.name,
 
-      investedUsd:
-        tradeUsd,
+      tokenDecimals:
+        candidate.decimals,
+
+      entrySol:
+        Number(
+          buyResult.totalInputAmount ||
+          tradeLamports
+        ) /
+        1_000_000_000,
+
+      tokenAmount:
+        actualTokenAmount,
 
       openedAt:
         Date.now(),
 
       buySignature:
-        result.signature
+        buyResult.signature,
 
+      selectionScore:
+        candidate.score,
+
+      selectionReason:
+        candidate.reason
     };
-
 
     await savePosition(
       env,
       position
     );
 
-
     return {
-
       bot: "Memebot",
-
       trading: "ENABLED",
+      action: "BOUGHT_TOKEN",
 
-      action:
-        "BOUGHT_SOL",
+      token:
+        candidate.symbol,
 
-      invested_usdc:
-        tradeUsd,
+      token_name:
+        candidate.name,
 
-      sol_received:
-        solReceived,
+      token_mint:
+        candidate.mint,
 
-      entry_price:
-        entryPrice,
+      spent_sol:
+        position.entrySol,
 
-      signature:
-        result.signature
+      token_amount:
+        actualTokenAmount,
 
+      buy_signature:
+        buyResult.signature,
+
+      selection_score:
+        candidate.score,
+
+      selection_reason:
+        candidate.reason
     };
-
   }
 
 
-  // ==========================================================
-  // POSITION EXISTS
-  // ==========================================================
+  /*
+   * =======================================================
+   * CURRENT POSITION
+   * =======================================================
+   */
+
+  const tokenBalance =
+    await getTokenBalance(
+      connection,
+      wallet.publicKey,
+      position.tokenMint
+    );
+
+  if (
+    !tokenBalance ||
+    tokenBalance.amount === "0"
+  ) {
+    await clearPosition(env);
+
+    return {
+      bot: "Memebot",
+      trading: "ENABLED",
+      action: "POSITION_CLEARED",
+      reason:
+        "Tracked token balance is zero."
+    };
+  }
+
+  /*
+   * Get an actual executable sell quote.
+   * This is much safer than relying only on
+   * a stale displayed token price.
+   */
+
+  let sellQuote;
+
+  try {
+    sellQuote =
+      await getJupiterOrder(
+        env,
+        position.tokenMint,
+        SOL_MINT,
+        tokenBalance.amount,
+        wallet.publicKey.toBase58()
+      );
+  } catch (error) {
+    return {
+      bot: "Memebot",
+      trading: "ENABLED",
+      action: "HOLDING_TOKEN",
+      token:
+        position.tokenSymbol,
+      reason:
+        "Could not obtain current sell quote.",
+      error:
+        error?.message ||
+        String(error)
+    };
+  }
+
+  const expectedSol =
+    Number(
+      sellQuote.outAmount ||
+      0
+    ) /
+    1_000_000_000;
+
+  const entrySol =
+    Number(
+      position.entrySol
+    );
+
+  if (
+    entrySol <= 0 ||
+    expectedSol <= 0
+  ) {
+    return {
+      bot: "Memebot",
+      trading: "ENABLED",
+      action: "HOLDING_TOKEN",
+      token:
+        position.tokenSymbol,
+      reason:
+        "Invalid position or sell quote."
+    };
+  }
 
   const change =
     (
-      solPrice -
-      position.entryPrice
+      expectedSol -
+      entrySol
     ) /
-    position.entryPrice;
-
+    entrySol;
 
   const changePercent =
     change * 100;
 
 
-  // ==========================================================
-  // PROFIT TARGET
-  // ==========================================================
+  /*
+   * =======================================================
+   * PROFIT TARGET
+   * =======================================================
+   */
 
-  if (change >= PROFIT_TARGET) {
-
-    return await sellAndRebuy(
+  if (
+    change >= PROFIT_TARGET
+  ) {
+    return await sellPosition(
       env,
       wallet,
       connection,
       position,
-      solPrice,
+      tokenBalance.amount,
+      sellQuote,
       "PROFIT_TARGET",
       changePercent
     );
-
   }
 
 
-  // ==========================================================
-  // STOP LOSS
-  // ==========================================================
+  /*
+   * =======================================================
+   * STOP LOSS
+   * =======================================================
+   */
 
-  if (change <= STOP_LOSS) {
-
-    return await sellAndRebuy(
+  if (
+    change <= STOP_LOSS
+  ) {
+    return await sellPosition(
       env,
       wallet,
       connection,
       position,
-      solPrice,
+      tokenBalance.amount,
+      sellQuote,
       "STOP_LOSS",
       changePercent
     );
-
   }
 
 
-  // ==========================================================
-  // HOLD
-  // ==========================================================
+  /*
+   * =======================================================
+   * HOLD
+   * =======================================================
+   */
 
   return {
-
     bot: "Memebot",
-
     trading: "ENABLED",
+    action: "HOLDING_TOKEN",
 
-    action:
-      "HOLDING_SOL",
+    token:
+      position.tokenSymbol,
 
-    entry_price:
-      position.entryPrice,
+    token_name:
+      position.tokenName,
 
-    current_price:
-      solPrice,
+    token_mint:
+      position.tokenMint,
+
+    entry_sol:
+      entrySol,
+
+    estimated_sell_sol:
+      expectedSol,
 
     change_percent:
       changePercent,
@@ -439,769 +529,710 @@ async function runBot(env) {
       5,
 
     stop_loss_percent:
-      -2
+      -2,
 
+    buy_signature:
+      position.buySignature
   };
-
 }
 
 
-// ============================================================
-// SELL THEN REBUY
-// ============================================================
+/* =========================================================
+   SELL POSITION
+   ========================================================= */
 
-async function sellAndRebuy(
+async function sellPosition(
   env,
   wallet,
   connection,
   position,
-  currentPrice,
+  tokenAmount,
+  sellQuote,
   reason,
   changePercent
 ) {
-
-  // ----------------------------------------------------------
-  // SELLABLE SOL
-  // ----------------------------------------------------------
-
-  const sellAmount =
-    await getSellableSol(
-      connection,
-      wallet.publicKey
-    );
-
-
-  if (sellAmount <= 0) {
-
-    throw new Error(
-      "No sellable SOL available after keeping the network reserve."
-    );
-
+  if (!LIVE_TRADING) {
+    return {
+      bot: "Memebot",
+      trading: "DISABLED",
+      action: "SELL_WOULD_EXECUTE",
+      token:
+        position.tokenSymbol,
+      reason,
+      change_percent:
+        changePercent
+    };
   }
 
-
-  // ----------------------------------------------------------
-  // SELL SOL -> USDC
-  // ----------------------------------------------------------
+  console.log(
+    "SELLING TOKEN:",
+    position.tokenSymbol
+  );
 
   const sellResult =
-    await executeSwap(
+    await executeJupiterOrder(
       env,
       wallet,
-      connection,
+      position.tokenMint,
       SOL_MINT,
-      USDC_MINT,
-      sellAmount.toString()
+      tokenAmount
     );
 
-
-  await clearPosition(env);
-
-
-  // ----------------------------------------------------------
-  // READ USDC
-  // ----------------------------------------------------------
-
-  const usdcBalance =
-    await getUsdcBalance(
-      connection,
-      wallet.publicKey
+  if (
+    sellResult.status !==
+    "Success"
+  ) {
+    throw new Error(
+      `Sell failed: ${JSON.stringify(sellResult)}`
     );
-
-
-  if (usdcBalance < 1) {
-
-    return {
-
-      bot: "Memebot",
-
-      trading: "ENABLED",
-
-      action:
-        reason === "PROFIT_TARGET"
-          ? "SOLD_PROFIT"
-          : "SOLD_STOP_LOSS",
-
-      change_percent:
-        changePercent,
-
-      sell_signature:
-        sellResult.signature,
-
-      next_action:
-        "WAITING_FOR_USDC"
-
-    };
-
   }
 
-
-  // ----------------------------------------------------------
-  // BUY SOL AGAIN
-  // ----------------------------------------------------------
-
-  const tradeUsd =
-    Math.min(
-      MAX_TRADE_USD,
-      usdcBalance
-    );
-
-
-  const usdcAmount =
-    Math.floor(
-      tradeUsd * 1_000_000
-    );
-
-
-  const buyResult =
-    await executeSwap(
-      env,
-      wallet,
-      connection,
-      USDC_MINT,
-      SOL_MINT,
-      usdcAmount.toString()
-    );
-
-
-  const newSol =
+  const solReceived =
     Number(
-      buyResult.outputAmount
+      sellResult.totalOutputAmount ||
+      sellResult.outputAmountResult ||
+      sellQuote.outAmount ||
+      0
     ) /
     1_000_000_000;
 
-
-  if (newSol <= 0) {
-
-    throw new Error(
-      "Rebuy completed without receiving SOL."
+  const entrySol =
+    Number(
+      position.entrySol
     );
 
-  }
+  const realizedChange =
+    entrySol > 0
+      ? (
+          solReceived -
+          entrySol
+        ) /
+        entrySol
+      : 0;
 
-
-  const newEntryPrice =
-    tradeUsd /
-    newSol;
-
-
-  const newPosition = {
-
-    entryPrice:
-      newEntryPrice,
-
-    solAmount:
-      newSol,
-
-    investedUsd:
-      tradeUsd,
-
-    openedAt:
-      Date.now(),
-
-    buySignature:
-      buyResult.signature,
-
-    previousSellSignature:
-      sellResult.signature
-
-  };
-
-
-  await savePosition(
-    env,
-    newPosition
-  );
-
+  await clearPosition(env);
 
   return {
-
     bot: "Memebot",
-
     trading: "ENABLED",
 
     action:
       reason === "PROFIT_TARGET"
-        ? "SOLD_PROFIT_AND_REBUY"
-        : "SOLD_STOP_LOSS_AND_REBUY",
+        ? "SOLD_PROFIT"
+        : "SOLD_STOP_LOSS",
 
-    previous_entry_price:
-      position.entryPrice,
+    token:
+      position.tokenSymbol,
 
-    sell_price:
-      currentPrice,
+    token_name:
+      position.tokenName,
 
-    change_percent:
-      changePercent,
+    token_mint:
+      position.tokenMint,
+
+    reason,
+
+    entry_sol:
+      entrySol,
+
+    sol_received:
+      solReceived,
+
+    realized_change_percent:
+      realizedChange * 100,
 
     sell_signature:
       sellResult.signature,
 
-    new_entry_price:
-      newEntryPrice,
-
-    new_sol:
-      newSol,
-
-    buy_signature:
-      buyResult.signature
-
+    next_action:
+      "WAITING_FOR_NEXT_TRENDING_TOKEN"
   };
-
 }
 
 
-// ============================================================
-// JUPITER SWAP
-// ============================================================
+/* =========================================================
+   TOKEN SELECTION
+   ========================================================= */
 
-async function executeSwap(
+async function selectBestCandidate(
   env,
-  wallet,
-  connection,
-  inputMint,
-  outputMint,
-  amount
+  tradeLamports
 ) {
+  const candidates =
+    await getTrendingTokens(env);
 
-  const quoteUrl =
-    new URL(
-      `${API_BASE}/quote`
+  if (
+    candidates.length === 0
+  ) {
+    return null;
+  }
+
+  const ranked =
+    candidates
+      .map(token => {
+        const liquidity =
+          toNumber(
+            token.liquidity
+          );
+
+        const volume24h =
+          getVolume24h(token);
+
+        const organicScore =
+          toNumber(
+            token.organicScore
+          );
+
+        const priceChange =
+          getPriceChange(token);
+
+        /*
+         * Jupiter already ranks toptrending tokens.
+         * This additional score rewards liquidity,
+         * activity and momentum without blindly
+         * buying the biggest percentage gainer.
+         */
+
+        const score =
+          (
+            organicScore * 0.40
+          ) +
+          (
+            Math.min(
+              liquidity / 1000000,
+              10
+            ) * 20
+          ) +
+          (
+            Math.min(
+              volume24h / 1000000,
+              10
+            ) * 15
+          ) +
+          (
+            Math.max(
+              Math.min(
+                priceChange,
+                50
+              ),
+              -50
+            ) * 0.5
+          );
+
+        return {
+          ...token,
+          score
+        };
+      })
+      .filter(token => {
+        if (
+          !token.mint ||
+          token.mint === SOL_MINT ||
+          token.mint === USDC_MINT
+        ) {
+          return false;
+        }
+
+        if (
+          token.audit &&
+          token.audit.isSus === true
+        ) {
+          return false;
+        }
+
+        const liquidity =
+          toNumber(
+            token.liquidity
+          );
+
+        const volume24h =
+          getVolume24h(token);
+
+        if (
+          liquidity <
+          MIN_LIQUIDITY_USD
+        ) {
+          return false;
+        }
+
+        if (
+          volume24h <
+          MIN_VOLUME_24H_USD
+        ) {
+          return false;
+        }
+
+        return true;
+      })
+      .sort(
+        (a, b) =>
+          b.score -
+          a.score
+      );
+
+  /*
+   * Test only the strongest candidates.
+   * The quote itself is the final execution check.
+   */
+
+  const limited =
+    ranked.slice(0, 8);
+
+  for (
+    const token of limited
+  ) {
+    try {
+      const quote =
+        await getJupiterOrder(
+          env,
+          SOL_MINT,
+          token.mint,
+          tradeLamports.toString(),
+          null
+        );
+
+      if (
+        !quote.outAmount ||
+        Number(quote.outAmount) <= 0
+      ) {
+        continue;
+      }
+
+      const priceImpact =
+        getPriceImpactPercent(
+          quote
+        );
+
+      if (
+        priceImpact >
+        MAX_PRICE_IMPACT_PERCENT
+      ) {
+        console.log(
+          "Rejected:",
+          token.symbol,
+          "price impact:",
+          priceImpact
+        );
+
+        continue;
+      }
+
+      return {
+        mint:
+          token.mint,
+
+        symbol:
+          token.symbol ||
+          "UNKNOWN",
+
+        name:
+          token.name ||
+          token.symbol ||
+          "Unknown Token",
+
+        decimals:
+          Number(
+            token.decimals ||
+            0
+          ),
+
+        score:
+          token.score,
+
+        reason:
+          "Trending + liquidity + volume + momentum passed screening.",
+
+        quote
+      };
+
+    } catch (error) {
+      console.log(
+        "Candidate rejected:",
+        token.symbol ||
+        token.mint,
+        error?.message ||
+        String(error)
+      );
+    }
+  }
+
+  return null;
+}
+
+
+/* =========================================================
+   TRENDING TOKEN DATA
+   ========================================================= */
+
+async function getTrendingTokens(env) {
+  const headers = {
+    "x-api-key":
+      env.JUPITER_API_KEY
+  };
+
+  const urls = [
+    `${TOKEN_BASE}/toptrending/1h?limit=20`,
+    `${TOKEN_BASE}/toptrending/6h?limit=20`,
+    `${TOKEN_BASE}/toptraded/1h?limit=20`
+  ];
+
+  const responses =
+    await Promise.all(
+      urls.map(url =>
+        fetch(
+          url,
+          { headers }
+        )
+      )
     );
 
+  const all = [];
 
-  quoteUrl.searchParams.set(
+  for (
+    const response of responses
+  ) {
+    if (!response.ok) {
+      console.log(
+        "Token API request failed:",
+        response.status
+      );
+
+      continue;
+    }
+
+    const data =
+      await response.json();
+
+    const list =
+      Array.isArray(data)
+        ? data
+        : Array.isArray(data.data)
+          ? data.data
+          : [];
+
+    all.push(
+      ...list
+    );
+  }
+
+  /*
+   * Deduplicate by mint.
+   */
+
+  const map =
+    new Map();
+
+  for (
+    const token of all
+  ) {
+    if (
+      token &&
+      token.id
+    ) {
+      token.mint =
+        token.id;
+    }
+
+    if (
+      token &&
+      token.address &&
+      !token.mint
+    ) {
+      token.mint =
+        token.address;
+    }
+
+    if (
+      token &&
+      token.mint &&
+      !map.has(token.mint)
+    ) {
+      map.set(
+        token.mint,
+        token
+      );
+    }
+  }
+
+  return Array.from(
+    map.values()
+  );
+}
+
+
+/* =========================================================
+   JUPITER SWAP V2
+   ========================================================= */
+
+async function getJupiterOrder(
+  env,
+  inputMint,
+  outputMint,
+  amount,
+  taker
+) {
+  const url =
+    new URL(
+      `${SWAP_BASE}/order`
+    );
+
+  url.searchParams.set(
     "inputMint",
     inputMint
   );
 
-  quoteUrl.searchParams.set(
+  url.searchParams.set(
     "outputMint",
     outputMint
   );
 
-  quoteUrl.searchParams.set(
+  url.searchParams.set(
     "amount",
     amount
   );
 
-  quoteUrl.searchParams.set(
-    "slippageBps",
-    SLIPPAGE_BPS.toString()
-  );
+  /*
+   * A taker causes Jupiter to return
+   * the actual transaction to sign.
+   *
+   * For candidate screening we can omit it.
+   */
 
-  quoteUrl.searchParams.set(
-    "instructionVersion",
-    "V2"
-  );
+  if (taker) {
+    url.searchParams.set(
+      "taker",
+      taker
+    );
+  }
 
-
-  const quoteResponse =
+  const response =
     await fetch(
-      quoteUrl.toString(),
+      url.toString(),
       {
-
         method: "GET",
-
         headers: {
           "x-api-key":
             env.JUPITER_API_KEY
         }
-
       }
     );
 
+  const text =
+    await response.text();
 
-  const quoteText =
-    await quoteResponse.text();
-
-
-  if (!quoteResponse.ok) {
-
+  if (!response.ok) {
     throw new Error(
-      `Jupiter quote failed: ${quoteText}`
+      `Jupiter order failed: ${text}`
     );
-
   }
 
-
-  const quote =
-    JSON.parse(quoteText);
-
+  const order =
+    JSON.parse(text);
 
   if (
-    quote.error ||
-    !quote.outAmount
+    order.errorCode ||
+    order.errorMessage
   ) {
-
     throw new Error(
-      `Jupiter returned no valid route: ${JSON.stringify(quote)}`
+      `Jupiter order rejected: ${
+        order.errorMessage ||
+        JSON.stringify(order)
+      }`
     );
-
   }
-
-
-  // ----------------------------------------------------------
-  // PRICE IMPACT
-  // ----------------------------------------------------------
-
-  const priceImpact =
-    Number(
-      quote.priceImpactPct || 0
-    ) * 100;
-
 
   if (
-    priceImpact >
-    MAX_PRICE_IMPACT_PERCENT
+    !order.outAmount
   ) {
-
     throw new Error(
-      `Trade rejected: price impact ${priceImpact.toFixed(4)}% exceeds ${MAX_PRICE_IMPACT_PERCENT}%.`
+      "Jupiter order returned no output amount."
     );
-
   }
 
+  return order;
+}
 
-  // ----------------------------------------------------------
-  // BUILD SWAP
-  // ----------------------------------------------------------
 
-  const swapResponse =
-    await fetch(
-      `${API_BASE}/swap`,
-      {
-
-        method: "POST",
-
-        headers: {
-
-          "Content-Type":
-            "application/json",
-
-          "x-api-key":
-            env.JUPITER_API_KEY
-
-        },
-
-        body:
-          JSON.stringify({
-
-            quoteResponse:
-              quote,
-
-            userPublicKey:
-              wallet.publicKey.toBase58(),
-
-            wrapAndUnwrapSol:
-              true,
-
-            dynamicComputeUnitLimit:
-              true,
-
-            dynamicSlippage:
-              true,
-
-            prioritizationFeeLamports: {
-
-              priorityLevelWithMaxLamports: {
-
-                priorityLevel:
-                  "veryHigh",
-
-                maxLamports:
-                  1_000_000
-
-              }
-
-            }
-
-          })
-
-      }
+async function executeJupiterOrder(
+  env,
+  wallet,
+  inputMint,
+  outputMint,
+  amount
+) {
+  const order =
+    await getJupiterOrder(
+      env,
+      inputMint,
+      outputMint,
+      amount,
+      wallet.publicKey.toBase58()
     );
-
-
-  const swapText =
-    await swapResponse.text();
-
-
-  if (!swapResponse.ok) {
-
-    throw new Error(
-      `Jupiter swap build failed: ${swapText}`
-    );
-
-  }
-
-
-  const swapData =
-    JSON.parse(swapText);
-
 
   if (
-    swapData.error ||
-    !swapData.swapTransaction
+    !order.transaction
   ) {
-
     throw new Error(
-      `Jupiter did not return a transaction: ${JSON.stringify(swapData)}`
+      `Jupiter did not return a transaction: ${JSON.stringify(order)}`
     );
-
   }
 
-
-  // ----------------------------------------------------------
-  // DESERIALIZE
-  // ----------------------------------------------------------
+  /*
+   * Jupiter V2 returns a versioned transaction.
+   */
 
   const transactionBytes =
     base64ToBytes(
-      swapData.swapTransaction
+      order.transaction
     );
-
 
   const transaction =
     VersionedTransaction.deserialize(
       transactionBytes
     );
 
-
-  // ----------------------------------------------------------
-  // SIGN
-  // ----------------------------------------------------------
-
   transaction.sign([
     wallet
   ]);
 
+  const signedTransaction =
+    bytesToBase64(
+      transaction.serialize()
+    );
 
-  // ----------------------------------------------------------
-  // SEND
-  // ----------------------------------------------------------
-
-  const signature =
-    await connection.sendRawTransaction(
-      transaction.serialize(),
+  const executeResponse =
+    await fetch(
+      `${SWAP_BASE}/execute`,
       {
-        skipPreflight: false,
-        maxRetries: 3
+        method: "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json",
+
+          "x-api-key":
+            env.JUPITER_API_KEY
+        },
+
+        body:
+          JSON.stringify({
+            signedTransaction,
+            requestId:
+              order.requestId
+          })
       }
     );
 
-
-  // ----------------------------------------------------------
-  // CONFIRM
-  // ----------------------------------------------------------
-
-  const latest =
-    await connection.getLatestBlockhash(
-      "confirmed"
-    );
-
-
-  const confirmation =
-    await connection.confirmTransaction(
-      {
-        signature,
-
-        blockhash:
-          latest.blockhash,
-
-        lastValidBlockHeight:
-          latest.lastValidBlockHeight
-
-      },
-
-      "confirmed"
-    );
-
+  const executeText =
+    await executeResponse.text();
 
   if (
-    confirmation.value &&
-    confirmation.value.err
+    !executeResponse.ok
   ) {
-
     throw new Error(
-      `Transaction failed: ${JSON.stringify(confirmation.value.err)}`
+      `Jupiter execute failed: ${executeText}`
     );
-
   }
 
+  const result =
+    JSON.parse(
+      executeText
+    );
 
-  return {
+  if (
+    result.status !==
+    "Success"
+  ) {
+    throw new Error(
+      `Jupiter transaction failed: ${JSON.stringify(result)}`
+    );
+  }
 
-    signature,
-
-    outputAmount:
-      quote.outAmount
-
-  };
-
+  return result;
 }
 
 
-// ============================================================
-// SOL PRICE
-// ============================================================
+/* =========================================================
+   PRICE DATA
+   ========================================================= */
 
-async function getSolPrice(env) {
-
-  const quote =
-    await getQuote(
-      env,
-      SOL_MINT,
-      USDC_MINT,
-      "1000000000"
-    );
-
-
-  return (
-    Number(
-      quote.outAmount
-    ) /
-    1_000_000
-  );
-
-}
-
-
-// ============================================================
-// GENERIC JUPITER QUOTE
-// ============================================================
-
-async function getQuote(
-  env,
-  inputMint,
-  outputMint,
-  amount
-) {
-
-  const url =
-    new URL(
-      `${API_BASE}/quote`
-    );
-
-
-  url.searchParams.set(
-    "inputMint",
-    inputMint
-  );
-
-  url.searchParams.set(
-    "outputMint",
-    outputMint
-  );
-
-  url.searchParams.set(
-    "amount",
-    amount
-  );
-
-  url.searchParams.set(
-    "slippageBps",
-    SLIPPAGE_BPS.toString()
-  );
-
-  url.searchParams.set(
-    "instructionVersion",
-    "V2"
-  );
-
-
+async function getSolUsdPrice(env) {
   const response =
     await fetch(
-      url.toString(),
+      `${PRICE_BASE}?ids=${SOL_MINT}`,
       {
-
         headers: {
           "x-api-key":
             env.JUPITER_API_KEY
         }
-
       }
     );
-
 
   const text =
     await response.text();
 
-
   if (!response.ok) {
-
     throw new Error(
-      `Jupiter price quote failed: ${text}`
+      `SOL price request failed: ${text}`
     );
-
   }
-
 
   const data =
     JSON.parse(text);
 
+  const item =
+    data?.data?.[SOL_MINT] ||
+    data?.[SOL_MINT];
 
-  if (
-    data.error ||
-    !data.outAmount
-  ) {
-
-    throw new Error(
-      `Invalid Jupiter price quote: ${JSON.stringify(data)}`
+  const price =
+    Number(
+      item?.usdPrice ||
+      item?.price ||
+      0
     );
 
+  if (
+    !Number.isFinite(price) ||
+    price <= 0
+  ) {
+    throw new Error(
+      "Jupiter returned an invalid SOL price."
+    );
   }
 
-
-  return data;
-
+  return price;
 }
 
 
-// ============================================================
-// SOL BALANCE
-// ============================================================
+/* =========================================================
+   SOL BALANCE
+   ========================================================= */
 
 async function getSolBalance(
   connection,
   publicKey
 ) {
-
   const lamports =
     await connection.getBalance(
       publicKey,
       "confirmed"
     );
-
 
   return (
     lamports /
     1_000_000_000
   );
-
 }
 
 
-// ============================================================
-// USDC BALANCE
-//
-// This deliberately DOES NOT use:
-// getParsedTokenAccountsByOwner()
-//
-// Instead we derive the wallet's USDC Associated Token Account
-// and directly ask Solana for its balance.
-//
-// This removes the "could not find mint" failure path.
-// ============================================================
-
-async function getUsdcBalance(
-  connection,
-  owner
+function getSpendableSolLamports(
+  solBalance
 ) {
-
-  const ata =
-    await findUsdcAssociatedTokenAccount(
-      owner
+  const totalLamports =
+    Math.floor(
+      solBalance *
+      1_000_000_000
     );
-
-
-  try {
-
-    const result =
-      await connection.getTokenAccountBalance(
-        ata,
-        "confirmed"
-      );
-
-
-    return Number(
-      result.value.uiAmountString ||
-      0
-    );
-
-  } catch (error) {
-
-    const message =
-      error?.message ||
-      String(error);
-
-
-    // No USDC account yet = zero USDC.
-    if (
-      message.includes("could not find account") ||
-      message.includes("Invalid param") ||
-      message.includes("AccountNotFound")
-    ) {
-
-      return 0;
-
-    }
-
-
-    // Some RPC providers return a generic
-    // account-not-found message.
-    if (
-      message.toLowerCase().includes(
-        "not found"
-      )
-    ) {
-
-      return 0;
-
-    }
-
-
-    throw error;
-
-  }
-
-}
-
-
-// ============================================================
-// DERIVE USDC ATA
-// ============================================================
-
-async function findUsdcAssociatedTokenAccount(
-  owner
-) {
-
-  const [address] =
-    PublicKey.findProgramAddressSync(
-
-      [
-        owner.toBuffer(),
-
-        TOKEN_PROGRAM_ID.toBuffer(),
-
-        USDC_PUBLIC_KEY.toBuffer()
-
-      ],
-
-      ASSOCIATED_TOKEN_PROGRAM_ID
-
-    );
-
-
-  return address;
-
-}
-
-
-// ============================================================
-// SELLABLE SOL
-// ============================================================
-
-async function getSellableSol(
-  connection,
-  publicKey
-) {
-
-  const lamports =
-    await connection.getBalance(
-      publicKey,
-      "confirmed"
-    );
-
 
   const reserve =
     Math.floor(
@@ -1209,341 +1240,388 @@ async function getSellableSol(
       1_000_000_000
     );
 
-
-  const safetyBuffer =
+  const extraSafety =
     5_000_000;
-
-
-  const sellable =
-    lamports -
-    reserve -
-    safetyBuffer;
-
 
   return Math.max(
     0,
-    sellable
+    totalLamports -
+      reserve -
+      extraSafety
   );
-
 }
 
 
-// ============================================================
-// WALLET
-// ============================================================
+/* =========================================================
+   TOKEN BALANCE
+   ========================================================= */
+
+async function getTokenBalance(
+  connection,
+  owner,
+  mint
+) {
+  const mintPublicKey =
+    new PublicKey(
+      mint
+    );
+
+  const result =
+    await connection.getParsedTokenAccountsByOwner(
+      owner,
+      {
+        mint:
+          mintPublicKey
+      },
+      "confirmed"
+    );
+
+  let rawAmount =
+    0n;
+
+  let decimals =
+    0;
+
+  for (
+    const account of result.value
+  ) {
+    const info =
+      account.account.data.parsed.info;
+
+    const tokenAmount =
+      info.tokenAmount;
+
+    decimals =
+      Number(
+        tokenAmount.decimals
+      );
+
+    rawAmount +=
+      BigInt(
+        tokenAmount.amount
+      );
+  }
+
+  return {
+    amount:
+      rawAmount.toString(),
+
+    decimals,
+
+    uiAmount:
+      decimals > 0
+        ? Number(rawAmount) /
+          Math.pow(
+            10,
+            decimals
+          )
+        : Number(rawAmount)
+  };
+}
+
+
+/* =========================================================
+   USDC BALANCE
+   ========================================================= */
+
+async function getUsdcBalance(
+  connection,
+  owner
+) {
+  try {
+    const result =
+      await getTokenBalance(
+        connection,
+        owner,
+        USDC_MINT
+      );
+
+    return result.uiAmount;
+
+  } catch (error) {
+    console.log(
+      "USDC balance lookup failed:",
+      error?.message ||
+      String(error)
+    );
+
+    return 0;
+  }
+}
+
+
+/* =========================================================
+   WALLET
+   ========================================================= */
 
 function getWallet(env) {
-
   if (
     !env.WALLET_PRIVATE_KEY
   ) {
-
     throw new Error(
       "WALLET_PRIVATE_KEY secret is missing."
     );
-
   }
-
 
   const secret =
     decodePrivateKey(
       env.WALLET_PRIVATE_KEY
     );
 
-
   if (
     secret.length !== 64 &&
     secret.length !== 32
   ) {
-
     throw new Error(
       `WALLET_PRIVATE_KEY decoded to ${secret.length} bytes. Expected 32 or 64 bytes.`
     );
-
   }
-
 
   if (
     secret.length === 32
   ) {
-
     return Keypair.fromSeed(
       secret
     );
-
   }
-
 
   return Keypair.fromSecretKey(
     secret
   );
-
 }
 
 
-// ============================================================
-// SOLANA CONNECTION
-// ============================================================
+/* =========================================================
+   HELIUS CONNECTION
+   ========================================================= */
 
 function getConnection(env) {
-
   if (
     !env.HELIUS_API_KEY
   ) {
-
     throw new Error(
       "HELIUS_API_KEY secret is missing."
     );
-
   }
 
-
   return new Connection(
-
     `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`,
-
     "confirmed"
-
   );
-
 }
 
 
-// ============================================================
-// PRIVATE KEY DECODER
-// ============================================================
+/* =========================================================
+   PRIVATE KEY DECODER
+   ========================================================= */
 
 function decodePrivateKey(value) {
-
   const text =
     value.trim();
-
-
-  // JSON array
 
   if (
     text.startsWith("[")
   ) {
-
     const array =
       JSON.parse(text);
-
 
     return Uint8Array.from(
       array
     );
-
   }
-
-
-  // Comma separated
 
   if (
     text.includes(",")
   ) {
-
     return Uint8Array.from(
-
       text
         .split(",")
         .map(
-          x => Number(
-            x.trim()
-          )
+          x =>
+            Number(
+              x.trim()
+            )
         )
-
     );
-
   }
 
-
-  // Base64
-
   try {
-
     const bytes =
-      base64ToBytes(text);
-
+      base64ToBytes(
+        text
+      );
 
     if (
       bytes.length === 32 ||
       bytes.length === 64
     ) {
-
       return bytes;
-
     }
 
   } catch (_) {}
 
-
-  // Base58
-
-  return base58Decode(text);
-
+  return base58Decode(
+    text
+  );
 }
 
 
-// ============================================================
-// BASE64
-// ============================================================
+/* =========================================================
+   BASE64
+   ========================================================= */
 
 function base64ToBytes(
   base64
 ) {
-
   const binary =
     atob(base64);
-
 
   const bytes =
     new Uint8Array(
       binary.length
     );
 
-
   for (
     let i = 0;
     i < binary.length;
     i++
   ) {
-
     bytes[i] =
       binary.charCodeAt(i);
-
   }
 
-
   return bytes;
-
 }
 
 
-// ============================================================
-// BASE58
-// ============================================================
+function bytesToBase64(
+  bytes
+) {
+  let binary =
+    "";
+
+  const chunkSize =
+    0x8000;
+
+  for (
+    let i = 0;
+    i < bytes.length;
+    i += chunkSize
+  ) {
+    binary +=
+      String.fromCharCode(
+        ...bytes.subarray(
+          i,
+          Math.min(
+            i + chunkSize,
+            bytes.length
+          )
+        )
+      );
+  }
+
+  return btoa(
+    binary
+  );
+}
+
+
+/* =========================================================
+   BASE58
+   ========================================================= */
 
 function base58Decode(
   value
 ) {
-
   const alphabet =
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-
   let digits = [0];
-
 
   for (
     const character of value
   ) {
-
     const index =
       alphabet.indexOf(
         character
       );
 
-
     if (
       index < 0
     ) {
-
       throw new Error(
         "Invalid WALLET_PRIVATE_KEY."
       );
-
     }
-
 
     let carry =
       index;
-
 
     for (
       let j = 0;
       j < digits.length;
       j++
     ) {
-
       const number =
-        digits[j] * 58 +
+        digits[j] *
+          58 +
         carry;
-
 
       digits[j] =
         number & 255;
-
 
       carry =
         Math.floor(
           number / 256
         );
-
     }
-
 
     while (
       carry > 0
     ) {
-
       digits.push(
         carry & 255
       );
-
 
       carry =
         Math.floor(
           carry / 256
         );
-
     }
-
   }
-
 
   for (
     let i = 0;
-
     i < value.length &&
     value[i] === "1";
-
     i++
   ) {
-
     digits.push(0);
-
   }
-
 
   return Uint8Array.from(
     digits.reverse()
   );
-
 }
 
 
-// ============================================================
-// KV
-// ============================================================
+/* =========================================================
+   KV POSITION STORAGE
+   ========================================================= */
 
 async function loadPosition(
   env
 ) {
-
   if (!env.BOT_KV) {
-
     throw new Error(
       "BOT_KV binding is missing."
     );
-
   }
-
 
   return await env.BOT_KV.get(
     "position",
     "json"
   );
-
 }
 
 
@@ -1551,62 +1629,50 @@ async function savePosition(
   env,
   position
 ) {
-
   if (!env.BOT_KV) {
-
     throw new Error(
       "BOT_KV binding is missing."
     );
-
   }
-
 
   await env.BOT_KV.put(
     "position",
-    JSON.stringify(position)
+    JSON.stringify(
+      position
+    )
   );
-
 }
 
 
 async function clearPosition(
   env
 ) {
-
   if (!env.BOT_KV) {
-
     throw new Error(
       "BOT_KV binding is missing."
     );
-
   }
-
 
   await env.BOT_KV.delete(
     "position"
   );
-
 }
 
 
-// ============================================================
-// STATUS
-// ============================================================
+/* =========================================================
+   STATUS
+   ========================================================= */
 
 async function getStatus(
   env
 ) {
-
   validateSecrets(env);
-
 
   const wallet =
     getWallet(env);
 
-
   const connection =
     getConnection(env);
-
 
   const solBalance =
     await getSolBalance(
@@ -1614,20 +1680,16 @@ async function getStatus(
       wallet.publicKey
     );
 
-
   const usdcBalance =
     await getUsdcBalance(
       connection,
       wallet.publicKey
     );
 
-
   const position =
     await loadPosition(env);
 
-
   return {
-
     bot:
       "Memebot",
 
@@ -1638,6 +1700,9 @@ async function getStatus(
       LIVE_TRADING
         ? "ENABLED"
         : "DISABLED",
+
+    strategy:
+      "SOL -> trending token -> SOL",
 
     wallet:
       wallet.publicKey.toBase58(),
@@ -1650,94 +1715,302 @@ async function getStatus(
 
     position:
       position
-
   };
-
 }
 
 
-// ============================================================
-// SECRET VALIDATION
-// ============================================================
+/* =========================================================
+   SCAN ENDPOINT
+   ========================================================= */
+
+async function scanCandidates(
+  env
+) {
+  validateSecrets(env);
+
+  const solPrice =
+    await getSolUsdPrice(
+      env
+    );
+
+  const connection =
+    getConnection(env);
+
+  const wallet =
+    getWallet(env);
+
+  const solBalance =
+    await getSolBalance(
+      connection,
+      wallet.publicKey
+    );
+
+  const availableLamports =
+    getSpendableSolLamports(
+      solBalance
+    );
+
+  if (
+    availableLamports <= 0
+  ) {
+    return {
+      action:
+        "WAITING",
+      reason:
+        "Not enough SOL after reserve."
+    };
+  }
+
+  const maxTradeLamports =
+    Math.floor(
+      (
+        MAX_TRADE_USD /
+        solPrice
+      ) *
+      1_000_000_000
+    );
+
+  const tradeLamports =
+    Math.min(
+      availableLamports,
+      maxTradeLamports
+    );
+
+  const tokens =
+    await getTrendingTokens(
+      env
+    );
+
+  const results = [];
+
+  for (
+    const token of tokens.slice(
+      0,
+      10
+    )
+  ) {
+    const liquidity =
+      toNumber(
+        token.liquidity
+      );
+
+    const volume24h =
+      getVolume24h(token);
+
+    if (
+      liquidity <
+      MIN_LIQUIDITY_USD ||
+      volume24h <
+      MIN_VOLUME_24H_USD
+    ) {
+      continue;
+    }
+
+    try {
+      const quote =
+        await getJupiterOrder(
+          env,
+          SOL_MINT,
+          token.mint ||
+          token.id,
+          tradeLamports.toString(),
+          null
+        );
+
+      results.push({
+        symbol:
+          token.symbol,
+        name:
+          token.name,
+        mint:
+          token.mint ||
+          token.id,
+        liquidity,
+        volume_24h:
+          volume24h,
+        price_change:
+          getPriceChange(token),
+        price_impact:
+          getPriceImpactPercent(
+            quote
+          ),
+        output_amount:
+          quote.outAmount
+      });
+
+    } catch (_) {}
+  }
+
+  return {
+    bot:
+      "Memebot",
+
+    strategy:
+      "SOL -> trending token -> SOL",
+
+    sol_balance:
+      solBalance,
+
+    sol_price:
+      solPrice,
+
+    trade_sol:
+      tradeLamports /
+      1_000_000_000,
+
+    candidates:
+      results
+  };
+}
+
+
+/* =========================================================
+   TOKEN HELPERS
+   ========================================================= */
+
+function getVolume24h(
+  token
+) {
+  const direct =
+    toNumber(
+      token.volume24h
+    );
+
+  if (direct > 0) {
+    return direct;
+  }
+
+  const stats =
+    token.stats ||
+    token.stats24h ||
+    {};
+
+  return toNumber(
+    stats.volume24h ||
+    stats.volume
+  );
+}
+
+
+function getPriceChange(
+  token
+) {
+  const direct =
+    toNumber(
+      token.priceChange24h
+    );
+
+  if (
+    Number.isFinite(
+      direct
+    )
+  ) {
+    return direct;
+  }
+
+  const stats =
+    token.stats ||
+    token.stats24h ||
+    {};
+
+  return toNumber(
+    stats.priceChange24h ||
+    stats.priceChange ||
+    0
+  );
+}
+
+
+function getPriceImpactPercent(
+  quote
+) {
+  const value =
+    toNumber(
+      quote.priceImpactPct
+    );
+
+  return value;
+}
+
+
+function toNumber(
+  value
+) {
+  const number =
+    Number(
+      value
+    );
+
+  return Number.isFinite(
+    number
+  )
+    ? number
+    : 0;
+}
+
+
+/* =========================================================
+   SECRET / BINDING VALIDATION
+   ========================================================= */
 
 function validateSecrets(
   env
 ) {
-
   if (
     !env.HELIUS_API_KEY
   ) {
-
     throw new Error(
       "HELIUS_API_KEY secret is missing."
     );
-
   }
-
 
   if (
     !env.JUPITER_API_KEY
   ) {
-
     throw new Error(
       "JUPITER_API_KEY secret is missing."
     );
-
   }
-
 
   if (
     !env.WALLET_PRIVATE_KEY
   ) {
-
     throw new Error(
       "WALLET_PRIVATE_KEY secret is missing."
     );
-
   }
-
 
   if (
     !env.BOT_KV
   ) {
-
     throw new Error(
       "BOT_KV binding is missing."
     );
-
   }
-
 }
 
 
-// ============================================================
-// JSON RESPONSE
-// ============================================================
+/* =========================================================
+   JSON RESPONSE
+   ========================================================= */
 
 function json(
   data,
   status = 200
 ) {
-
   return new Response(
-
     JSON.stringify(
       data,
       null,
       2
     ),
-
     {
-
       status,
 
       headers: {
         "Content-Type":
           "application/json"
       }
-
     }
-
   );
-
 }
