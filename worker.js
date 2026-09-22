@@ -4,8 +4,8 @@ const LIVE_TRADING = true;
 // TRADING SETTINGS
 // ===============================
 
-const PROFIT_TARGET = 0.015;       // +1.5%
-const STOP_LOSS = -0.01;           // -1%
+const PROFIT_TARGET = 0.015;
+const STOP_LOSS = -0.01;
 
 const SMALL_TRADE_CAP_USD = 2;
 const LARGE_TRADE_CAP_USD = 5;
@@ -13,11 +13,9 @@ const BALANCE_THRESHOLD_USD = 20;
 
 const MIN_SOL_RESERVE = 0.01;
 
-// Maximum number of simultaneous token positions.
 const MAX_POSITIONS = 10;
 
-// Don't open another position in the same token.
-const MAX_ROUND_TRIP_LOSS = 0.005; // 0.5%
+const MAX_ROUND_TRIP_LOSS = 0.005;
 
 const MIN_LIQUIDITY_USD = 25000;
 
@@ -150,7 +148,6 @@ async function runBot(env, manual = false) {
     }
   }
 
-  // Refresh positions after possible sales.
   let currentPositions =
     await getPositions(env);
 
@@ -278,10 +275,6 @@ async function findAndBuy(
 
   const walletValueUsd =
     solBalance * solPriceUsd;
-
-  // --------------------------------
-  // DYNAMIC TRADE CAP
-  // --------------------------------
 
   const maxTradeUsd =
     walletValueUsd >=
@@ -597,10 +590,6 @@ async function managePosition(
   const changePercent =
     change * 100;
 
-  // --------------------------------
-  // TAKE PROFIT
-  // --------------------------------
-
   if (
     change >= PROFIT_TARGET
   ) {
@@ -613,10 +602,6 @@ async function managePosition(
       changePercent
     );
   }
-
-  // --------------------------------
-  // STOP LOSS
-  // --------------------------------
 
   if (
     change <= STOP_LOSS
@@ -756,12 +741,6 @@ async function sellPosition(
 // ===============================
 // TOKEN MINT HELPER
 // ===============================
-//
-// Jupiter Tokens V2 can identify a
-// token using "id". Older response
-// formats may use "address" or "mint".
-// Check all three so discovery works
-// across the response formats.
 
 function getTokenMint(token) {
   return (
@@ -801,7 +780,6 @@ async function selectCandidate(
       continue;
     }
 
-    // Never buy a token already held.
     if (
       existingMints.has(mint)
     ) {
@@ -947,17 +925,11 @@ async function selectCandidate(
 
     candidates.push({
       ...token,
-
       mint,
-
       price,
-
       liquidity,
-
       organicScore,
-
       momentum,
-
       score
     });
   }
@@ -967,8 +939,6 @@ async function selectCandidate(
       b.score - a.score
   );
 
-  // Test the strongest two with
-  // actual executable Jupiter routes.
   const testCandidates =
     candidates.slice(0, 2);
 
@@ -1144,9 +1114,6 @@ async function getPrices(
   const ids =
     mints.join(",");
 
-  // FIXED:
-  // Use a real JavaScript template literal
-  // instead of a normal quoted string.
   const url =
     `${PRICE_API}?ids=${encodeURIComponent(ids)}`;
 
@@ -1193,9 +1160,6 @@ async function getOrder(
   outputMint,
   amount
 ) {
-  // FIXED:
-  // These must be template literals so
-  // the variables are actually inserted.
   const url =
     `${SWAP_API}/order` +
     `?inputMint=${encodeURIComponent(inputMint)}` +
@@ -1578,6 +1542,19 @@ async function heliusRpc(
 // ===============================
 // PRIVATE KEY
 // ===============================
+//
+// IMPORTANT:
+// Cloudflare Web Crypto treats "raw"
+// Ed25519 imports as public keys.
+// Therefore a Solana 32-byte seed must
+// be wrapped as PKCS#8 before importing
+// it for the "sign" operation.
+//
+// The PKCS#8 prefix below is the standard
+// Ed25519 private-key wrapper for a
+// 32-byte seed.
+//
+// ===============================
 
 async function importPrivateKey(
   value
@@ -1592,6 +1569,9 @@ async function importPrivateKey(
   if (
     bytes.length === 64
   ) {
+    // Solana 64-byte secret-key arrays
+    // contain the 32-byte seed followed by
+    // the 32-byte public key.
     secretBytes =
       bytes.slice(
         0,
@@ -1610,9 +1590,46 @@ async function importPrivateKey(
     );
   }
 
-  return await crypto.subtle.importKey(
-    "raw",
+  // PKCS#8 DER prefix for Ed25519:
+  //
+  // 30 2e
+  // 02 01 00
+  // 30 05
+  // 06 03 2b 65 70
+  // 04 22
+  // 04 20
+  //
+  // followed by the 32-byte Ed25519 seed.
+  const pkcs8Prefix =
+    new Uint8Array([
+      0x30, 0x2e,
+      0x02, 0x01, 0x00,
+      0x30, 0x05,
+      0x06, 0x03,
+      0x2b, 0x65, 0x70,
+      0x04, 0x22,
+      0x04, 0x20
+    ]);
+
+  const pkcs8Key =
+    new Uint8Array(
+      pkcs8Prefix.length +
+      secretBytes.length
+    );
+
+  pkcs8Key.set(
+    pkcs8Prefix,
+    0
+  );
+
+  pkcs8Key.set(
     secretBytes,
+    pkcs8Prefix.length
+  );
+
+  return await crypto.subtle.importKey(
+    "pkcs8",
+    pkcs8Key.buffer,
     {
       name:
         "Ed25519"
@@ -1894,10 +1911,6 @@ async function getPositions(
   ) {
     return positions;
   }
-
-  // --------------------------------
-  // MIGRATE OLD SINGLE POSITION
-  // --------------------------------
 
   const oldPosition =
     await env.BOT_KV.get(
@@ -2266,4 +2279,4 @@ function json(
       }
     }
   );
-}
+          }
