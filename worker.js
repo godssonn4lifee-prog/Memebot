@@ -4,7 +4,7 @@ const LIVE_TRADING = true;
 // TRADING SETTINGS
 // ===============================
 
-const PROFIT_TARGET = 0.015;
+const PROFIT_TARGET = 0.025;
 const STOP_LOSS = -0.01;
 
 const SMALL_TRADE_CAP_USD = 2;
@@ -112,10 +112,6 @@ async function runBot(env, manual = false) {
   const wallet =
     await getWalletInfo(env);
 
-  // --------------------------------
-  // MANAGE EVERY OPEN POSITION
-  // --------------------------------
-
   const managementResults = [];
 
   for (const position of positions) {
@@ -151,10 +147,6 @@ async function runBot(env, manual = false) {
   let currentPositions =
     await getPositions(env);
 
-  // --------------------------------
-  // RATE LIMIT COOLDOWN
-  // --------------------------------
-
   const cooldown =
     await getCooldown(env);
 
@@ -169,10 +161,6 @@ async function runBot(env, manual = false) {
       )
     });
   }
-
-  // --------------------------------
-  // SCAN COOLDOWN
-  // --------------------------------
 
   const lastScan =
     await getLastScan(env);
@@ -190,10 +178,6 @@ async function runBot(env, manual = false) {
     });
   }
 
-  // --------------------------------
-  // MAX POSITION CHECK
-  // --------------------------------
-
   if (
     currentPositions.length >=
     MAX_POSITIONS
@@ -207,10 +191,6 @@ async function runBot(env, manual = false) {
   }
 
   await setLastScan(env);
-
-  // --------------------------------
-  // LOOK FOR ANOTHER COIN
-  // --------------------------------
 
   const buyResult =
     await findAndBuy(
@@ -231,7 +211,7 @@ async function runBot(env, manual = false) {
 }
 
 // ===============================
-// FIND AND BUY ANOTHER TOKEN
+// FIND AND BUY
 // ===============================
 
 async function findAndBuy(
@@ -389,10 +369,6 @@ async function findAndBuy(
     });
   }
 
-  // --------------------------------
-  // EXECUTE BUY
-  // --------------------------------
-
   const order =
     await getOrder(
       env,
@@ -497,7 +473,7 @@ async function findAndBuy(
     open_positions:
       updatedPositions.length,
     profit_target:
-      "1.5%",
+      "2.5%",
     stop_loss:
       "-1%",
     signature:
@@ -506,7 +482,7 @@ async function findAndBuy(
 }
 
 // ===============================
-// MANAGE ONE POSITION
+// MANAGE POSITION
 // ===============================
 
 async function managePosition(
@@ -633,7 +609,7 @@ async function managePosition(
         changePercent.toFixed(4)
       ),
     take_profit_percent:
-      1.5,
+      2.5,
     stop_loss_percent:
       -1
   });
@@ -1182,6 +1158,12 @@ async function getOrder(
 // ===============================
 // EXECUTE ORDER
 // ===============================
+//
+// Solana signs the MESSAGE portion
+// of the transaction, not the entire
+// serialized transaction.
+//
+// ===============================
 
 async function executeOrder(
   env,
@@ -1197,14 +1179,58 @@ async function executeOrder(
     );
   }
 
+  const transactionBytes =
+    base64ToBytes(
+      transaction
+    );
+
   const signer =
     await importPrivateKey(
       env.WALLET_PRIVATE_KEY
     );
 
-  const transactionBytes =
-    base64ToBytes(
-      transaction
+  // Read the transaction's signature
+  // count and locate the first signature.
+  const countInfo =
+    readShortVec(
+      transactionBytes,
+      0
+    );
+
+  const signatureCount =
+    countInfo.value;
+
+  const signatureOffset =
+    countInfo.offset;
+
+  if (
+    signatureCount < 1
+  ) {
+    throw new Error(
+      "Transaction contains no signatures."
+    );
+  }
+
+  // Each Solana transaction signature
+  // occupies 64 bytes.
+  const messageOffset =
+    signatureOffset +
+    signatureCount * 64;
+
+  if (
+    messageOffset >=
+    transactionBytes.length
+  ) {
+    throw new Error(
+      "Invalid Solana transaction message offset."
+    );
+  }
+
+  // IMPORTANT:
+  // Sign only the Solana message.
+  const messageBytes =
+    transactionBytes.slice(
+      messageOffset
     );
 
   const signedBytes =
@@ -1214,16 +1240,33 @@ async function executeOrder(
           "Ed25519"
       },
       signer,
+      messageBytes
+    );
+
+  const signature =
+    new Uint8Array(
+      signedBytes
+    );
+
+  if (
+    signature.length !== 64
+  ) {
+    throw new Error(
+      "Invalid Ed25519 signature length."
+    );
+  }
+
+  // Put our signature into the first
+  // signature slot.
+  const signedTransaction =
+    new Uint8Array(
       transactionBytes
     );
 
-  const signedTransaction =
-    replaceSignature(
-      transactionBytes,
-      new Uint8Array(
-        signedBytes
-      )
-    );
+  signedTransaction.set(
+    signature,
+    signatureOffset
+  );
 
   const rpcResponse =
     await fetch(
@@ -1542,19 +1585,6 @@ async function heliusRpc(
 // ===============================
 // PRIVATE KEY
 // ===============================
-//
-// IMPORTANT:
-// Cloudflare Web Crypto treats "raw"
-// Ed25519 imports as public keys.
-// Therefore a Solana 32-byte seed must
-// be wrapped as PKCS#8 before importing
-// it for the "sign" operation.
-//
-// The PKCS#8 prefix below is the standard
-// Ed25519 private-key wrapper for a
-// 32-byte seed.
-//
-// ===============================
 
 async function importPrivateKey(
   value
@@ -1569,9 +1599,6 @@ async function importPrivateKey(
   if (
     bytes.length === 64
   ) {
-    // Solana 64-byte secret-key arrays
-    // contain the 32-byte seed followed by
-    // the 32-byte public key.
     secretBytes =
       bytes.slice(
         0,
@@ -1590,16 +1617,6 @@ async function importPrivateKey(
     );
   }
 
-  // PKCS#8 DER prefix for Ed25519:
-  //
-  // 30 2e
-  // 02 01 00
-  // 30 05
-  // 06 03 2b 65 70
-  // 04 22
-  // 04 20
-  //
-  // followed by the 32-byte Ed25519 seed.
   const pkcs8Prefix =
     new Uint8Array([
       0x30, 0x2e,
@@ -1685,99 +1702,6 @@ function decodePrivateKey(
   return base58Decode(
     text
   );
-}
-
-// ===============================
-// TRANSACTION SIGNING
-// ===============================
-
-function replaceSignature(
-  transaction,
-  signature
-) {
-  const countInfo =
-    readShortVec(
-      transaction,
-      0
-    );
-
-  const signatureCount =
-    countInfo.value;
-
-  const offset =
-    countInfo.offset;
-
-  if (
-    signatureCount < 1
-  ) {
-    throw new Error(
-      "Transaction contains no signatures."
-    );
-  }
-
-  if (
-    signature.length !== 64
-  ) {
-    throw new Error(
-      "Invalid Ed25519 signature length."
-    );
-  }
-
-  const result =
-    new Uint8Array(
-      transaction
-    );
-
-  result.set(
-    signature,
-    offset
-  );
-
-  return result;
-}
-
-function readShortVec(
-  bytes,
-  offset
-) {
-  let value = 0;
-  let size = 0;
-  let shift = 0;
-
-  while (true) {
-    const byte =
-      bytes[
-        offset + size
-      ];
-
-    value |=
-      (byte & 0x7f) <<
-      shift;
-
-    size++;
-
-    if (
-      (byte & 0x80) ===
-      0
-    ) {
-      break;
-    }
-
-    shift += 7;
-
-    if (size > 5) {
-      throw new Error(
-        "Invalid Solana shortvec."
-      );
-    }
-  }
-
-  return {
-    value,
-
-    offset:
-      offset + size
-  };
 }
 
 // ===============================
@@ -2279,4 +2203,4 @@ function json(
       }
     }
   );
-          }
+      }
