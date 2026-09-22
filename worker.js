@@ -11,8 +11,10 @@ const SOL_MINT =
 const USDC_MINT =
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGkGZwyTDt1v";
 
-const SOL_PUBLIC_KEY = new PublicKey(SOL_MINT);
-const USDC_PUBLIC_KEY = new PublicKey(USDC_MINT);
+const TOKEN_PROGRAM =
+  new PublicKey(
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+  );
 
 const PROFIT_TARGET = 0.05;
 const STOP_LOSS = -0.02;
@@ -39,26 +41,30 @@ export default {
 
     try {
 
-      const url = new URL(request.url);
+      const url =
+        new URL(request.url);
 
       if (url.pathname === "/") {
 
         return json({
           bot: "Memebot",
           status: "online",
-          trading: LIVE_TRADING
-            ? "ENABLED"
-            : "DISABLED"
+          trading:
+            LIVE_TRADING
+              ? "ENABLED"
+              : "DISABLED"
         });
 
       }
 
       if (url.pathname === "/status") {
-        return await status(env);
+        return await getStatus(env);
       }
 
       if (url.pathname === "/run") {
-        return await runBot(env);
+        return json(
+          await runBot(env)
+        );
       }
 
       return json({
@@ -72,7 +78,9 @@ export default {
 
       return json({
         bot: "Memebot",
-        error: error.message || String(error)
+        error:
+          error.message ||
+          String(error)
       }, 500);
 
     }
@@ -138,14 +146,25 @@ async function runBot(env) {
     if (usdcBalance < 1) {
 
       return {
+
         bot: "Memebot",
-        trading: LIVE_TRADING
-          ? "ENABLED"
-          : "DISABLED",
+
+        trading: "ENABLED",
+
         action: "WAITING",
-        reason: "USDC balance is too low.",
-        sol_balance: solBalance,
-        usdc_balance: usdcBalance
+
+        reason:
+          "USDC balance is too low.",
+
+        sol_balance:
+          solBalance,
+
+        usdc_balance:
+          usdcBalance,
+
+        sol_price:
+          solPrice
+
       };
 
     }
@@ -158,19 +177,6 @@ async function runBot(env) {
       );
 
 
-    if (!LIVE_TRADING) {
-
-      return {
-        bot: "Memebot",
-        trading: "DISABLED",
-        action: "BUY_WOULD_EXECUTE",
-        amount_usdc: tradeUsd,
-        sol_price: solPrice
-      };
-
-    }
-
-
     const usdcAmount =
       Math.floor(
         tradeUsd * 1_000_000
@@ -178,7 +184,7 @@ async function runBot(env) {
 
 
     const result =
-      await swap(
+      await executeSwap(
         env,
         wallet,
         connection,
@@ -189,8 +195,9 @@ async function runBot(env) {
 
 
     const solReceived =
-      Number(result.outputAmount) /
-      1_000_000_000;
+      Number(
+        result.outputAmount
+      ) / 1_000_000_000;
 
 
     if (solReceived <= 0) {
@@ -237,7 +244,8 @@ async function runBot(env) {
 
       trading: "ENABLED",
 
-      action: "BOUGHT_SOL",
+      action:
+        "BOUGHT_SOL",
 
       invested_usdc:
         tradeUsd,
@@ -257,7 +265,7 @@ async function runBot(env) {
 
 
   // ----------------------------------------------------------
-  // POSITION EXISTS
+  // EXISTING POSITION
   // ----------------------------------------------------------
 
   const change =
@@ -273,7 +281,7 @@ async function runBot(env) {
 
 
   // ----------------------------------------------------------
-  // TAKE PROFIT
+  // PROFIT
   // ----------------------------------------------------------
 
   if (change >= PROFIT_TARGET) {
@@ -320,7 +328,8 @@ async function runBot(env) {
 
     trading: "ENABLED",
 
-    action: "HOLDING_SOL",
+    action:
+      "HOLDING_SOL",
 
     entry_price:
       position.entryPrice,
@@ -343,7 +352,7 @@ async function runBot(env) {
 
 
 // ============================================================
-// SELL THEN IMMEDIATELY BUY AGAIN
+// SELL THEN BUY AGAIN
 // ============================================================
 
 async function sellAndRebuy(
@@ -355,10 +364,6 @@ async function sellAndRebuy(
   reason,
   changePercent
 ) {
-
-  // ----------------------------------------------------------
-  // SELL
-  // ----------------------------------------------------------
 
   const sellAmount =
     await getSellableSol(
@@ -376,8 +381,10 @@ async function sellAndRebuy(
   }
 
 
+  // SELL SOL -> USDC
+
   const sellResult =
-    await swap(
+    await executeSwap(
       env,
       wallet,
       connection,
@@ -390,9 +397,7 @@ async function sellAndRebuy(
   await clearPosition(env);
 
 
-  // ----------------------------------------------------------
-  // GET NEW USDC BALANCE
-  // ----------------------------------------------------------
+  // Get resulting USDC
 
   const usdcBalance =
     await getUsdcBalance(
@@ -428,9 +433,7 @@ async function sellAndRebuy(
   }
 
 
-  // ----------------------------------------------------------
-  // BUY AGAIN IMMEDIATELY
-  // ----------------------------------------------------------
+  // BUY SOL AGAIN
 
   const tradeUsd =
     Math.min(
@@ -439,20 +442,20 @@ async function sellAndRebuy(
     );
 
 
-  const usdcAmount =
+  const buyAmount =
     Math.floor(
       tradeUsd * 1_000_000
     );
 
 
   const buyResult =
-    await swap(
+    await executeSwap(
       env,
       wallet,
       connection,
       USDC_MINT,
       SOL_MINT,
-      usdcAmount.toString()
+      buyAmount.toString()
     );
 
 
@@ -545,7 +548,7 @@ async function sellAndRebuy(
 // JUPITER SWAP
 // ============================================================
 
-async function swap(
+async function executeSwap(
   env,
   wallet,
   connection,
@@ -590,8 +593,6 @@ async function swap(
     await fetch(
       quoteUrl.toString(),
       {
-        method: "GET",
-
         headers: {
           "x-api-key":
             env.JUPITER_API_KEY
@@ -623,15 +624,11 @@ async function swap(
   ) {
 
     throw new Error(
-      `Jupiter returned no valid route: ${JSON.stringify(quote)}`
+      `No valid Jupiter route: ${JSON.stringify(quote)}`
     );
 
   }
 
-
-  // ----------------------------------------------------------
-  // PRICE IMPACT CHECK
-  // ----------------------------------------------------------
 
   const priceImpact =
     Number(
@@ -645,28 +642,27 @@ async function swap(
   ) {
 
     throw new Error(
-      `Trade rejected: price impact ${priceImpact.toFixed(4)}% is above ${MAX_PRICE_IMPACT_PERCENT}%.`
+      `Trade rejected because price impact is ${priceImpact.toFixed(4)}%.`
     );
 
   }
 
 
-  // ----------------------------------------------------------
-  // BUILD TRANSACTION
-  // ----------------------------------------------------------
-
   const swapResponse =
     await fetch(
       `${API_BASE}/swap`,
       {
+
         method: "POST",
 
         headers: {
+
           "Content-Type":
             "application/json",
 
           "x-api-key":
             env.JUPITER_API_KEY
+
         },
 
         body: JSON.stringify({
@@ -719,29 +715,25 @@ async function swap(
   }
 
 
-  const swapResponseJson =
+  const swapData =
     JSON.parse(swapText);
 
 
   if (
-    swapResponseJson.error ||
-    !swapResponseJson.swapTransaction
+    swapData.error ||
+    !swapData.swapTransaction
   ) {
 
     throw new Error(
-      `Jupiter did not return a transaction: ${JSON.stringify(swapResponseJson)}`
+      `No swap transaction returned: ${JSON.stringify(swapData)}`
     );
 
   }
 
 
-  // ----------------------------------------------------------
-  // DECODE TRANSACTION
-  // ----------------------------------------------------------
-
   const transactionBytes =
-    base64ToUint8Array(
-      swapResponseJson.swapTransaction
+    base64ToBytes(
+      swapData.swapTransaction
     );
 
 
@@ -756,10 +748,6 @@ async function swap(
   ]);
 
 
-  // ----------------------------------------------------------
-  // SEND
-  // ----------------------------------------------------------
-
   const signature =
     await connection.sendRawTransaction(
       transaction.serialize(),
@@ -769,10 +757,6 @@ async function swap(
       }
     );
 
-
-  // ----------------------------------------------------------
-  // CONFIRM
-  // ----------------------------------------------------------
 
   const latest =
     await connection.getLatestBlockhash(
@@ -792,7 +776,6 @@ async function swap(
           latest.lastValidBlockHeight
 
       },
-
       "confirmed"
     );
 
@@ -832,20 +815,21 @@ async function getSolPrice(env) {
       env,
       SOL_MINT,
       USDC_MINT,
-      "100000000"
+      "1000000000"
     );
 
 
   return (
-    Number(quote.outAmount) /
-    1_000_000
-  ) * 10;
+    Number(
+      quote.outAmount
+    ) / 1_000_000
+  );
 
 }
 
 
 // ============================================================
-// GENERIC QUOTE
+// QUOTE
 // ============================================================
 
 async function getQuote(
@@ -906,7 +890,7 @@ async function getQuote(
   if (!response.ok) {
 
     throw new Error(
-      `Jupiter price quote failed: ${text}`
+      `Jupiter price request failed: ${text}`
     );
 
   }
@@ -922,7 +906,7 @@ async function getQuote(
   ) {
 
     throw new Error(
-      `Invalid Jupiter price quote: ${JSON.stringify(data)}`
+      `Invalid Jupiter price response: ${JSON.stringify(data)}`
     );
 
   }
@@ -934,7 +918,7 @@ async function getQuote(
 
 
 // ============================================================
-// BALANCES
+// SOL BALANCE
 // ============================================================
 
 async function getSolBalance(
@@ -957,6 +941,16 @@ async function getSolBalance(
 }
 
 
+// ============================================================
+// USDC BALANCE
+//
+// IMPORTANT:
+// We DO NOT ask the RPC node to filter by mint.
+// We retrieve the wallet's token accounts using the
+// Token Program, then inspect the mint ourselves.
+// This avoids the "could not find mint" error.
+// ============================================================
+
 async function getUsdcBalance(
   connection,
   publicKey
@@ -966,8 +960,8 @@ async function getUsdcBalance(
     await connection.getParsedTokenAccountsByOwner(
       publicKey,
       {
-        mint:
-          USDC_PUBLIC_KEY
+        programId:
+          TOKEN_PROGRAM
       },
       "confirmed"
     );
@@ -980,13 +974,36 @@ async function getUsdcBalance(
     const account of result.value
   ) {
 
-    const amount =
-      account.account.data.parsed.info
-        .tokenAmount.uiAmount;
+    try {
+
+      const info =
+        account.account.data.parsed.info;
 
 
-    total +=
-      Number(amount || 0);
+      const mint =
+        info.mint;
+
+
+      if (
+        mint !== USDC_MINT
+      ) {
+        continue;
+      }
+
+
+      const amount =
+        info.tokenAmount
+          .uiAmountString;
+
+
+      total +=
+        Number(amount || 0);
+
+    } catch (_) {
+
+      continue;
+
+    }
 
   }
 
@@ -1029,12 +1046,10 @@ async function getSellableSol(
     safetyBuffer;
 
 
-  if (sellable <= 0) {
-    return 0;
-  }
-
-
-  return sellable;
+  return Math.max(
+    0,
+    sellable
+  );
 
 }
 
@@ -1066,6 +1081,31 @@ function getWallet(env) {
 
 
 // ============================================================
+// CONNECTION
+// ============================================================
+
+function getConnection(env) {
+
+  if (
+    !env.HELIUS_API_KEY
+  ) {
+
+    throw new Error(
+      "HELIUS_API_KEY secret is missing."
+    );
+
+  }
+
+
+  return new Connection(
+    `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`,
+    "confirmed"
+  );
+
+}
+
+
+// ============================================================
 // PRIVATE KEY DECODER
 // ============================================================
 
@@ -1075,23 +1115,17 @@ function decodePrivateKey(value) {
     value.trim();
 
 
-  // JSON array
   if (
     text.startsWith("[")
   ) {
 
-    const array =
-      JSON.parse(text);
-
-
     return Uint8Array.from(
-      array
+      JSON.parse(text)
     );
 
   }
 
 
-  // Comma-separated numbers
   if (
     text.includes(",")
   ) {
@@ -1099,19 +1133,18 @@ function decodePrivateKey(value) {
     return Uint8Array.from(
       text
         .split(",")
-        .map(x =>
-          Number(x.trim())
+        .map(
+          x => Number(x.trim())
         )
     );
 
   }
 
 
-  // Base64
   try {
 
     const bytes =
-      base64ToUint8Array(text);
+      base64ToBytes(text);
 
 
     if (
@@ -1126,8 +1159,6 @@ function decodePrivateKey(value) {
   } catch (_) {}
 
 
-
-  // Base58
   return base58Decode(text);
 
 }
@@ -1137,9 +1168,7 @@ function decodePrivateKey(value) {
 // BASE64
 // ============================================================
 
-function base64ToUint8Array(
-  base64
-) {
+function base64ToBytes(base64) {
 
   const binary =
     atob(base64);
@@ -1178,51 +1207,53 @@ function base58Decode(value) {
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 
-  let digits = [0];
+  let bytes = [0];
 
 
   for (
     const character of value
   ) {
 
-    const carryStart =
+    const index =
       alphabet.indexOf(
         character
       );
 
 
     if (
-      carryStart < 0
+      index < 0
     ) {
 
       throw new Error(
-        "Invalid WALLET_PRIVATE_KEY."
+        "Invalid WALLET_PRIVATE_KEY format."
       );
 
     }
 
 
     let carry =
-      carryStart;
+      index;
 
 
     for (
-      let j = 0;
-      j < digits.length;
-      j++
+      let i = 0;
+      i < bytes.length;
+      i++
     ) {
 
       const number =
-        digits[j] * 58 +
+        bytes[i] * 58 +
         carry;
 
 
-      digits[j] =
+      bytes[i] =
         number & 255;
 
 
       carry =
-        number >> 8;
+        Math.floor(
+          number / 256
+        );
 
     }
 
@@ -1231,13 +1262,15 @@ function base58Decode(value) {
       carry > 0
     ) {
 
-      digits.push(
+      bytes.push(
         carry & 255
       );
 
 
       carry =
-        carry >> 8;
+        Math.floor(
+          carry / 256
+        );
 
     }
 
@@ -1251,25 +1284,23 @@ function base58Decode(value) {
     i++
   ) {
 
-    digits.push(0);
+    bytes.push(0);
 
   }
 
 
   return Uint8Array.from(
-    digits.reverse()
+    bytes.reverse()
   );
 
 }
 
 
 // ============================================================
-// KV POSITION
+// POSITION STORAGE
 // ============================================================
 
-async function loadPosition(
-  env
-) {
+async function loadPosition(env) {
 
   if (!env.BOT_KV) {
 
@@ -1310,9 +1341,7 @@ async function savePosition(
 }
 
 
-async function clearPosition(
-  env
-) {
+async function clearPosition(env) {
 
   if (!env.BOT_KV) {
 
@@ -1334,7 +1363,7 @@ async function clearPosition(
 // STATUS
 // ============================================================
 
-async function status(env) {
+async function getStatus(env) {
 
   validateSecrets(env);
 
@@ -1365,11 +1394,13 @@ async function status(env) {
     await loadPosition(env);
 
 
-  return json({
+  return {
 
-    bot: "Memebot",
+    bot:
+      "Memebot",
 
-    status: "online",
+    status:
+      "online",
 
     trading:
       LIVE_TRADING
@@ -1388,32 +1419,7 @@ async function status(env) {
     position:
       position
 
-  });
-
-}
-
-
-// ============================================================
-// CONNECTION
-// ============================================================
-
-function getConnection(env) {
-
-  if (
-    !env.HELIUS_API_KEY
-  ) {
-
-    throw new Error(
-      "HELIUS_API_KEY secret is missing."
-    );
-
-  }
-
-
-  return new Connection(
-    `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`,
-    "confirmed"
-  );
+  };
 
 }
 
@@ -1471,12 +1477,12 @@ function validateSecrets(env) {
 
 
 // ============================================================
-// JSON RESPONSE
+// JSON
 // ============================================================
 
 function json(
   data,
-  statusCode = 200
+  status = 200
 ) {
 
   return new Response(
@@ -1486,15 +1492,11 @@ function json(
       2
     ),
     {
-
-      status:
-        statusCode,
-
+      status,
       headers: {
         "Content-Type":
           "application/json"
       }
-
     }
   );
 
