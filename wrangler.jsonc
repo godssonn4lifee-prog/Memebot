@@ -5,7 +5,7 @@
   "kv_namespaces": [
     {
       "binding": "BOT_KV",
-      "id": "YOUR_KV_NAMESPACE_ID"
+      "id": "fc27010016114b769454ba49edc1176b"
     }
   ],
   "triggers": {
