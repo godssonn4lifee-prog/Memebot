@@ -1,3 +1,5 @@
+const WALLET_ADDRESS = "266pAnqVEivGn3bH87c3pbTcrR5iCnpZSt6E9H6rcvS6";
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -11,54 +13,70 @@ export default {
           message: "Memebot is online."
         }, null, 2),
         {
-          headers: {
-            "content-type": "application/json"
-          }
+          headers: { "content-type": "application/json" }
         }
       );
     }
 
     if (url.pathname === "/status") {
-      const lastRun = await env.BOT_KV.get("last_run");
-      const lastSignal = await env.BOT_KV.get("last_signal");
+      try {
+        const rpcUrl =
+          `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`;
 
-      return new Response(
-        JSON.stringify({
-          bot: "Memebot",
-          trading: "DISABLED",
-          last_run: lastRun,
-          last_signal: lastSignal
-        }, null, 2),
-        {
+        const response = await fetch(rpcUrl, {
+          method: "POST",
           headers: {
-            "content-type": "application/json"
-          }
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getBalance",
+            params: [WALLET_ADDRESS]
+          })
+        });
+
+        const data = await response.json();
+
+        if (data.error) {
+          throw new Error(data.error.message);
         }
-      );
+
+        const lamports = data.result.value;
+        const sol = lamports / 1_000_000_000;
+
+        return new Response(
+          JSON.stringify({
+            bot: "Memebot",
+            trading: "DISABLED",
+            wallet: WALLET_ADDRESS,
+            sol_balance: sol,
+            message: "Wallet connection test successful."
+          }, null, 2),
+          {
+            headers: { "content-type": "application/json" }
+          }
+        );
+      } catch (error) {
+        return new Response(
+          JSON.stringify({
+            bot: "Memebot",
+            trading: "DISABLED",
+            error: error.message
+          }, null, 2),
+          {
+            status: 500,
+            headers: { "content-type": "application/json" }
+          }
+        );
+      }
     }
 
     return new Response("Not found", { status: 404 });
   },
 
-  async scheduled(controller, env, ctx) {
-    const now = new Date().toISOString();
-
-    await env.BOT_KV.put("last_run", now);
-
-    // Safe mode:
-    // No trades are executed.
-    // No wallet keys are used.
-    // This is where the trading strategy will eventually run.
-
-    await env.BOT_KV.put(
-      "last_signal",
-      JSON.stringify({
-        time: now,
-        action: "HOLD",
-        reason: "Trading is disabled while the bot is being tested."
-      })
-    );
-
-    console.log("Memebot scheduled run:", now);
+  async scheduled(event, env, ctx) {
+    console.log("Memebot scheduled test running");
+  
   }
 };
