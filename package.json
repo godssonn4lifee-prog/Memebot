@@ -1,9 +1,1131 @@
-{
-  "name": "memebot",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "@solana/web3.js": "^1.98.4"
+import {
+  Connection,
+  Keypair,
+  VersionedTransaction,
+  PublicKey
+} from "@solana/web3.js";
+
+/*
+  MEMEBOT — SOL / USDC
+  Strategy:
+    1. Buy SOL immediately when no position exists.
+    2. Track the SOL entry price in BOT_KV.
+    3. Sell at +5% profit OR -2% loss.
+    4. Immediately buy SOL again after the sale.
+    5. Repeat.
+
+  REQUIRED CLOUDFLARE SECRETS:
+    HELIUS_API_KEY
+    WALLET_PRIVATE_KEY
+    JUPITER_API_KEY
+
+  REQUIRED KV BINDING:
+    BOT_KV
+*/
+
+// ============================================================
+// SETTINGS
+// ============================================================
+
+const LIVE_TRADING = false;
+
+// Take profit: +5%
+const TAKE_PROFIT_PERCENT = 5;
+
+// Stop loss: -2%
+const STOP_LOSS_PERCENT = 2;
+
+// Maximum USD value of one trade.
+// Start small while testing.
+const MAX_TRADE_USD = 20;
+
+// Keep this much SOL in the wallet for network fees.
+const MIN_SOL_RESERVE = 0.01;
+
+// Maximum acceptable Jupiter price impact.
+const MAX_PRICE_IMPACT_PERCENT = 1.0;
+
+// Jupiter slippage.
+// 50 = 0.50%
+const SLIPPAGE_BPS = 50;
+
+// SOL
+const SOL_MINT =
+  "So11111111111111111111111111111111111111112";
+
+// USDC
+const USDC_MINT =
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+// KV keys
+const POSITION_KEY = "memebot_position";
+const LOCK_KEY = "memebot_trade_lock";
+const LAST_TRADE_KEY = "memebot_last_trade";
+
+// ============================================================
+// RESPONSE HELPERS
+// ============================================================
+
+function json(data, status = 200) {
+  return new Response(
+    JSON.stringify(data, null, 2),
+    {
+      status,
+      headers: {
+        "content-type": "application/json"
+      }
+    }
+  );
+}
+
+// ============================================================
+// BASE58 DECODER
+// ============================================================
+
+function decodeBase58(value) {
+  const alphabet =
+    "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+  let num = 0n;
+
+  for (const char of value.trim()) {
+    const index = alphabet.indexOf(char);
+
+    if (index < 0) {
+      throw new Error("Invalid base58 private key.");
+    }
+
+    num =
+      num * 58n +
+      BigInt(index);
+  }
+
+  const bytes = [];
+
+  while (num > 0n) {
+    bytes.push(
+      Number(num & 255n)
+    );
+    num >>= 8n;
+  }
+
+  for (
+    let i = 0;
+    i < value.length &&
+    value[i] === "1";
+    i++
+  ) {
+    bytes.push(0);
+  }
+
+  bytes.reverse();
+
+  return Uint8Array.from(bytes);
+}
+
+// ============================================================
+// PRIVATE KEY DECODER
+// ============================================================
+
+function decodeSecret(secret) {
+  if (!secret) {
+    throw new Error(
+      "WALLET_PRIVATE_KEY secret is missing."
+    );
+  }
+
+  const trimmed =
+    secret.trim();
+
+  // JSON array format
+  if (trimmed.startsWith("[")) {
+    const parsed =
+      JSON.parse(trimmed);
+
+    return Uint8Array.from(parsed);
+  }
+
+  // Base58 format
+  return decodeBase58(trimmed);
+}
+
+// ============================================================
+// WALLET
+// ============================================================
+
+function getWallet(env) {
+  const secret =
+    decodeSecret(
+      env.WALLET_PRIVATE_KEY
+    );
+
+  const wallet =
+    Keypair.fromSecretKey(secret);
+
+  return wallet;
+}
+
+// ============================================================
+// JUPITER
+// ============================================================
+
+function jupiterHeaders(env) {
+  const headers = {
+    "accept":
+      "application/json",
+    "content-type":
+      "application/json"
+  };
+
+  if (env.JUPITER_API_KEY) {
+    headers["x-api-key"] =
+      env.JUPITER_API_KEY;
+  }
+
+  return headers;
+}
+
+async function getQuote(
+  env,
+  inputMint,
+  outputMint,
+  amount
+) {
+  const url =
+    new URL(
+      "https://api.jup.ag/swap/v1/quote"
+    );
+
+  url.searchParams.set(
+    "inputMint",
+    inputMint
+  );
+
+  url.searchParams.set(
+    "outputMint",
+    outputMint
+  );
+
+  url.searchParams.set(
+    "amount",
+    String(amount)
+  );
+
+  url.searchParams.set(
+    "slippageBps",
+    String(SLIPPAGE_BPS)
+  );
+
+  const response =
+    await fetch(
+      url.toString(),
+      {
+        method: "GET",
+        headers:
+          jupiterHeaders(env)
+      }
+    );
+
+  const text =
+    await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `Jupiter quote failed ${response.status}: ${text}`
+    );
+  }
+
+  const quote =
+    JSON.parse(text);
+
+  if (
+    !quote ||
+    !quote.routePlan?.length
+  ) {
+    throw new Error(
+      "Jupiter returned no usable route."
+    );
+  }
+
+  return quote;
+}
+
+// ============================================================
+// JUPITER SWAP TRANSACTION
+// ============================================================
+
+async function buildSwap(
+  env,
+  quote,
+  walletPublicKey
+) {
+  const response =
+    await fetch(
+      "https://api.jup.ag/swap/v1/swap",
+      {
+        method: "POST",
+        headers:
+          jupiterHeaders(env),
+        body: JSON.stringify({
+          quoteResponse: quote,
+          userPublicKey:
+            walletPublicKey,
+          wrapAndUnwrapSol: true,
+          dynamicComputeUnitLimit: true,
+          prioritizationFeeLamports:
+            "auto"
+        })
+      }
+    );
+
+  const text =
+    await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `Jupiter swap build failed ${response.status}: ${text}`
+    );
+  }
+
+  const result =
+    JSON.parse(text);
+
+  if (
+    !result.swapTransaction
+  ) {
+    throw new Error(
+      `Jupiter returned no swap transaction: ${text}`
+    );
+  }
+
+  return result;
+}
+
+// ============================================================
+// SEND SIGNED SWAP
+// ============================================================
+
+async function signAndSend(
+  env,
+  swapTransaction
+) {
+  const wallet =
+    getWallet(env);
+
+  const connection =
+    new Connection(
+      `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`,
+      "confirmed"
+    );
+
+  const transaction =
+    VersionedTransaction.deserialize(
+      Buffer.from(
+        swapTransaction,
+        "base64"
+      )
+    );
+
+  transaction.sign([
+    wallet
+  ]);
+
+  const rawTransaction =
+    transaction.serialize();
+
+  const signature =
+    await connection.sendRawTransaction(
+      rawTransaction,
+      {
+        skipPreflight: false,
+        maxRetries: 3
+      }
+    );
+
+  await connection.confirmTransaction(
+    signature,
+    "confirmed"
+  );
+
+  return signature;
+}
+
+// ============================================================
+// PRICE
+// ============================================================
+
+async function getSolPrice(env) {
+  const quote =
+    await getQuote(
+      env,
+      SOL_MINT,
+      USDC_MINT,
+      "1000000000"
+    );
+
+  // 1 SOL -> USDC.
+  // USDC has 6 decimals.
+  const price =
+    Number(
+      quote.outAmount
+    ) / 1_000_000;
+
+  if (
+    !Number.isFinite(price) ||
+    price <= 0
+  ) {
+    throw new Error(
+      "Unable to determine SOL price."
+    );
+  }
+
+  return price;
+}
+
+// ============================================================
+// WALLET BALANCES
+// ============================================================
+
+async function getBalances(env) {
+  const wallet =
+    getWallet(env);
+
+  const connection =
+    new Connection(
+      `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`,
+      "confirmed"
+    );
+
+  const lamports =
+    await connection.getBalance(
+      wallet.publicKey
+    );
+
+  const sol =
+    lamports /
+    1_000_000_000;
+
+  const tokenAccounts =
+    await connection.getParsedTokenAccountsByOwner(
+      wallet.publicKey,
+      {
+        mint:
+          new PublicKey(
+            USDC_MINT
+          )
+      }
+    );
+
+  let usdc = 0;
+
+  for (
+    const account
+    of tokenAccounts.value
+  ) {
+    const amount =
+      account.account.data.parsed.info
+        .tokenAmount.uiAmount;
+
+    if (
+      Number.isFinite(amount)
+    ) {
+      usdc += amount;
+    }
+  }
+
+  return {
+    wallet:
+      wallet.publicKey.toBase58(),
+    sol,
+    usdc,
+    lamports
+  };
+}
+
+// ============================================================
+// POSITION STATE
+// ============================================================
+
+async function getPosition(env) {
+  const value =
+    await env.BOT_KV.get(
+      POSITION_KEY
+    );
+
+  if (!value) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
   }
 }
+
+async function savePosition(
+  env,
+  position
+) {
+  await env.BOT_KV.put(
+    POSITION_KEY,
+    JSON.stringify(position)
+  );
+}
+
+async function clearPosition(env) {
+  await env.BOT_KV.delete(
+    POSITION_KEY
+  );
+}
+
+// ============================================================
+// TRADE LOCK
+// ============================================================
+
+async function acquireLock(env) {
+  const existing =
+    await env.BOT_KV.get(
+      LOCK_KEY
+    );
+
+  if (existing) {
+    const timestamp =
+      Number(existing);
+
+    // Ignore stale locks older than 5 minutes.
+    if (
+      Date.now() -
+        timestamp <
+      5 * 60 * 1000
+    ) {
+      return false;
+    }
+  }
+
+  await env.BOT_KV.put(
+    LOCK_KEY,
+    String(Date.now()),
+    {
+      expirationTtl: 300
+    }
+  );
+
+  return true;
+}
+
+async function releaseLock(env) {
+  await env.BOT_KV.delete(
+    LOCK_KEY
+  );
+}
+
+// ============================================================
+// BUY SOL WITH USDC
+// ============================================================
+
+async function buySol(env) {
+  const balances =
+    await getBalances(env);
+
+  if (
+    balances.usdc <= 0
+  ) {
+    return {
+      action: "BUY_SKIPPED",
+      reason:
+        "No USDC available.",
+      balances
+    };
+  }
+
+  const tradeUsd =
+    Math.min(
+      MAX_TRADE_USD,
+      balances.usdc
+    );
+
+  if (
+    tradeUsd <= 0
+  ) {
+    return {
+      action: "BUY_SKIPPED",
+      reason:
+        "Trade amount is zero."
+    };
+  }
+
+  // USDC has 6 decimals.
+  const amount =
+    Math.floor(
+      tradeUsd * 1_000_000
+    );
+
+  const quote =
+    await getQuote(
+      env,
+      USDC_MINT,
+      SOL_MINT,
+      amount
+    );
+
+  const priceImpact =
+    Number(
+      quote.priceImpactPct || 999
+    ) * 100;
+
+  if (
+    priceImpact >
+    MAX_PRICE_IMPACT_PERCENT
+  ) {
+    return {
+      action: "BUY_SKIPPED",
+      reason:
+        "Price impact too high.",
+      priceImpact
+    };
+  }
+
+  if (!LIVE_TRADING) {
+    return {
+      action:
+        "BUY_READY",
+      trading:
+        "DISABLED",
+      tradeUsd,
+      expectedSol:
+        Number(
+          quote.outAmount
+        ) / 1_000_000_000,
+      priceImpact
+    };
+  }
+
+  const swap =
+    await buildSwap(
+      env,
+      quote,
+      getWallet(env)
+        .publicKey
+        .toBase58()
+    );
+
+  const signature =
+    await signAndSend(
+      env,
+      swap.swapTransaction
+    );
+
+  const solReceived =
+    Number(
+      quote.outAmount
+    ) / 1_000_000_000;
+
+  const entryPrice =
+    tradeUsd /
+    solReceived;
+
+  const position = {
+    side: "SOL",
+    entryPrice,
+    solAmount:
+      solReceived,
+    investedUsdc:
+      tradeUsd,
+    openedAt:
+      new Date().toISOString(),
+    buySignature:
+      signature
+  };
+
+  await savePosition(
+    env,
+    position
+  );
+
+  await env.BOT_KV.put(
+    LAST_TRADE_KEY,
+    JSON.stringify({
+      action: "BUY",
+      signature,
+      time:
+        new Date().toISOString()
+    })
+  );
+
+  return {
+    action: "BUY",
+    trading: "ENABLED",
+    signature,
+    tradeUsd,
+    solReceived,
+    entryPrice
+  };
+}
+
+// ============================================================
+// SELL SOL FOR USDC
+// ============================================================
+
+async function sellSol(
+  env,
+  position,
+  reason
+) {
+  const balances =
+    await getBalances(env);
+
+  const reserveLamports =
+    Math.floor(
+      MIN_SOL_RESERVE *
+        1_000_000_000
+    );
+
+  const spendableLamports =
+    Math.max(
+      0,
+      balances.lamports -
+        reserveLamports
+    );
+
+  if (
+    spendableLamports <= 0
+  ) {
+    return {
+      action:
+        "SELL_SKIPPED",
+      reason:
+        "SOL fee reserve would be too low.",
+      balances
+    };
+  }
+
+  const quote =
+    await getQuote(
+      env,
+      SOL_MINT,
+      USDC_MINT,
+      String(
+        spendableLamports
+      )
+    );
+
+  const priceImpact =
+    Number(
+      quote.priceImpactPct || 999
+    ) * 100;
+
+  if (
+    priceImpact >
+    MAX_PRICE_IMPACT_PERCENT
+  ) {
+    return {
+      action:
+        "SELL_SKIPPED",
+      reason:
+        "Price impact too high.",
+      priceImpact
+    };
+  }
+
+  const usdcReceived =
+    Number(
+      quote.outAmount
+    ) / 1_000_000;
+
+  if (!LIVE_TRADING) {
+    return {
+      action:
+        "SELL_READY",
+      trading:
+        "DISABLED",
+      reason,
+      estimatedUsdc:
+        usdcReceived,
+      priceImpact
+    };
+  }
+
+  const swap =
+    await buildSwap(
+      env,
+      quote,
+      getWallet(env)
+        .publicKey
+        .toBase58()
+    );
+
+  const signature =
+    await signAndSend(
+      env,
+      swap.swapTransaction
+    );
+
+  await clearPosition(env);
+
+  await env.BOT_KV.put(
+    LAST_TRADE_KEY,
+    JSON.stringify({
+      action: "SELL",
+      reason,
+      signature,
+      time:
+        new Date().toISOString()
+    })
+  );
+
+  return {
+    action: "SELL",
+    trading: "ENABLED",
+    reason,
+    signature,
+    usdcReceived
+  };
+}
+
+// ============================================================
+// MAIN BOT LOOP
+// ============================================================
+
+async function runBot(env) {
+  if (!env.BOT_KV) {
+    throw new Error(
+      "BOT_KV binding is missing."
+    );
+  }
+
+  if (!env.HELIUS_API_KEY) {
+    throw new Error(
+      "HELIUS_API_KEY secret is missing."
+    );
+  }
+
+  if (!env.WALLET_PRIVATE_KEY) {
+    throw new Error(
+      "WALLET_PRIVATE_KEY secret is missing."
+    );
+  }
+
+  if (!env.JUPITER_API_KEY) {
+    throw new Error(
+      "JUPITER_API_KEY secret is missing."
+    );
+  }
+
+  const locked =
+    await acquireLock(env);
+
+  if (!locked) {
+    return {
+      bot: "Memebot",
+      trading:
+        LIVE_TRADING
+          ? "ENABLED"
+          : "DISABLED",
+      action:
+        "SKIPPED",
+      reason:
+        "Another trade cycle is already running."
+    };
+  }
+
+  try {
+    const price =
+      await getSolPrice(env);
+
+    let position =
+      await getPosition(env);
+
+    // --------------------------------------------------------
+    // NO POSITION = BUY IMMEDIATELY
+    // --------------------------------------------------------
+
+    if (!position) {
+      const buyResult =
+        await buySol(env);
+
+      // In dry-run mode, do NOT save a fake position.
+      return {
+        bot: "Memebot",
+        trading:
+          LIVE_TRADING
+            ? "ENABLED"
+            : "DISABLED",
+        currentSolPrice:
+          price,
+        position:
+          null,
+        ...buyResult
+      };
+    }
+
+    // --------------------------------------------------------
+    // POSITION EXISTS
+    // --------------------------------------------------------
+
+    const entryPrice =
+      Number(
+        position.entryPrice
+      );
+
+    if (
+      !Number.isFinite(entryPrice) ||
+      entryPrice <= 0
+    ) {
+      throw new Error(
+        "Stored position has an invalid entry price."
+      );
+    }
+
+    const changePercent =
+      ((price - entryPrice) /
+        entryPrice) *
+      100;
+
+    // +5% TAKE PROFIT
+    if (
+      changePercent >=
+      TAKE_PROFIT_PERCENT
+    ) {
+      const sellResult =
+        await sellSol(
+          env,
+          position,
+          "TAKE_PROFIT"
+        );
+
+      // Immediately buy again after a real sale.
+      if (
+        LIVE_TRADING &&
+        sellResult.action === "SELL"
+      ) {
+        const buyResult =
+          await buySol(env);
+
+        return {
+          bot: "Memebot",
+          trading: "ENABLED",
+          currentSolPrice:
+            price,
+          entryPrice,
+          changePercent,
+          sell:
+            sellResult,
+          rebuy:
+            buyResult
+        };
+      }
+
+      return {
+        bot: "Memebot",
+        trading:
+          LIVE_TRADING
+            ? "ENABLED"
+            : "DISABLED",
+        currentSolPrice:
+          price,
+        entryPrice,
+        changePercent,
+        ...sellResult
+      };
+    }
+
+    // -2% STOP LOSS
+    if (
+      changePercent <=
+      -STOP_LOSS_PERCENT
+    ) {
+      const sellResult =
+        await sellSol(
+          env,
+          position,
+          "STOP_LOSS"
+        );
+
+      // Immediately buy again after a real sale.
+      if (
+        LIVE_TRADING &&
+        sellResult.action === "SELL"
+      ) {
+        const buyResult =
+          await buySol(env);
+
+        return {
+          bot: "Memebot",
+          trading: "ENABLED",
+          currentSolPrice:
+            price,
+          entryPrice,
+          changePercent,
+          sell:
+            sellResult,
+          rebuy:
+            buyResult
+        };
+      }
+
+      return {
+        bot: "Memebot",
+        trading:
+          LIVE_TRADING
+            ? "ENABLED"
+            : "DISABLED",
+        currentSolPrice:
+          price,
+        entryPrice,
+        changePercent,
+        ...sellResult
+      };
+    }
+
+    // --------------------------------------------------------
+    // HOLD
+    // --------------------------------------------------------
+
+    return {
+      bot: "Memebot",
+      trading:
+        LIVE_TRADING
+          ? "ENABLED"
+          : "DISABLED",
+      action: "HOLD",
+      currentSolPrice:
+        price,
+      entryPrice,
+      changePercent,
+      takeProfit:
+        TAKE_PROFIT_PERCENT,
+      stopLoss:
+        -STOP_LOSS_PERCENT,
+      nextTakeProfitPrice:
+        entryPrice *
+        (1 +
+          TAKE_PROFIT_PERCENT /
+            100),
+      nextStopLossPrice:
+        entryPrice *
+        (1 -
+          STOP_LOSS_PERCENT /
+            100)
+    };
+
+  } finally {
+    await releaseLock(env);
+  }
+}
+
+// ============================================================
+// HTTP HANDLER
+// ============================================================
+
+export default {
+  async fetch(
+    request,
+    env
+  ) {
+    try {
+      const url =
+        new URL(
+          request.url
+        );
+
+      // Basic status endpoint.
+      if (
+        url.pathname === "/" ||
+        url.pathname === "/status"
+      ) {
+        const position =
+          await getPosition(env);
+
+        let balances =
+          null;
+
+        try {
+          balances =
+            await getBalances(env);
+        } catch {
+          balances =
+            null;
+        }
+
+        return json({
+          bot: "Memebot",
+          trading:
+            LIVE_TRADING
+              ? "ENABLED"
+              : "DISABLED",
+          strategy:
+            "Immediate buy / +5% take-profit / -2% stop-loss / immediate rebuy",
+          position,
+          balances
+        });
+      }
+
+      // Manually test the bot cycle.
+      if (
+        url.pathname ===
+        "/run"
+      ) {
+        const result =
+          await runBot(env);
+
+        return json(
+          result
+        );
+      }
+
+      return json({
+        bot: "Memebot",
+        error:
+          "Unknown endpoint."
+      }, 404);
+
+    } catch (error) {
+      console.error(
+        "Worker error:",
+        error
+      );
+
+      return json({
+        bot: "Memebot",
+        trading:
+          LIVE_TRADING
+            ? "ENABLED"
+            : "DISABLED",
+        trade: "ERROR",
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error)
+      }, 500);
+    }
+  },
+
+  // ==========================================================
+  // CLOUDFLARE CRON
+  // ==========================================================
+
+  async scheduled(
+    controller,
+    env,
+    ctx
+  ) {
+    try {
+      const result =
+        await runBot(env);
+
+      console.log(
+        "Memebot scheduled result:",
+        JSON.stringify(result)
+      );
+
+    } catch (error) {
+      console.error(
+        "Memebot scheduled error:",
+        error
+      );
+
+      throw error;
+    }
+  }
+};
