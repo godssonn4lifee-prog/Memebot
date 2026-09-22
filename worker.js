@@ -35,63 +35,64 @@ const TOKEN_API = "https://api.jup.ag/tokens/v2";
 const PRICE_API = "https://api.jup.ag/price/v3";
 
 const SOL_MINT =
-  "So11111111111111111111111111111111111111112";
+"So11111111111111111111111111111111111111112";
 
 const WALLET_ADDRESS =
-  "266pAnqVEivGn3bH87c3pbTcrR5iCnpZSt6E9H6rcvS6";
+"266pAnqVEivGn3bH87c3pbTcrR5iCnpZSt6E9H6rcvS6";
 
 // ===============================
 // WORKER
 // ===============================
 
 export default {
-  async fetch(request, env) {
-    try {
-      const url = new URL(request.url);
+async fetch(request, env) {
+try {
+const url = new URL(request.url);
 
-      if (url.pathname === "/") {
-        return json({
-          ok: true,
-          bot: "memebott",
-          live_trading: LIVE_TRADING,
-          message: "Memebott is running."
-        });
-      }
-
-      if (url.pathname === "/status") {
-        return await getStatus(env);
-      }
-
-      if (url.pathname === "/run") {
-        return await runBot(env, true);
-      }
-
-      return json({
-        ok: false,
-        error: "Not found"
-      }, 404);
-
-    } catch (error) {
-      console.error(error);
-
-      return json({
-        ok: false,
-        error: error?.message || String(error)
-      }, 500);
-    }
-  },
-
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(
-      runBot(env, false)
-        .catch(error => {
-          console.error(
-            "Scheduled bot error:",
-            error
-          );
-        })
-    );
+  if (url.pathname === "/") {
+    return json({
+      ok: true,
+      bot: "memebott",
+      live_trading: LIVE_TRADING,
+      message: "Memebott is running."
+    });
   }
+
+  if (url.pathname === "/status") {
+    return await getStatus(env);
+  }
+
+  if (url.pathname === "/run") {
+    return await runBot(env, true);
+  }
+
+  return json({
+    ok: false,
+    error: "Not found"
+  }, 404);
+
+} catch (error) {
+  console.error(error);
+
+  return json({
+    ok: false,
+    error: error?.message || String(error)
+  }, 500);
+}
+
+},
+
+async scheduled(event, env, ctx) {
+ctx.waitUntil(
+runBot(env, false)
+.catch(error => {
+console.error(
+"Scheduled bot error:",
+error
+);
+})
+);
+}
 };
 
 // ===============================
@@ -99,138 +100,139 @@ export default {
 // ===============================
 
 async function runBot(env, manual = false) {
-  const validation = validateSecrets(env);
+const validation = validateSecrets(env);
 
-  if (!validation.ok) {
-    return json({
-      ok: false,
-      error: validation.error
-    }, 500);
-  }
+if (!validation.ok) {
+return json({
+ok: false,
+error: validation.error
+}, 500);
+}
 
-  const positions =
-    await getPositions(env);
+const positions =
+await getPositions(env);
 
-  const wallet =
-    await getWalletInfo(env);
+const wallet =
+await getWalletInfo(env);
 
-  // --------------------------------
-  // MANAGE EVERY OPEN POSITION
-  // --------------------------------
+// --------------------------------
+// MANAGE EVERY OPEN POSITION
+// --------------------------------
 
-  const managementResults = [];
+const managementResults = [];
 
-  for (const position of positions) {
-    try {
-      const result =
-        await managePosition(
-          env,
-          position
-        );
+for (const position of positions) {
+try {
+const result =
+await managePosition(
+env,
+position
+);
 
-      managementResults.push(
-        await responseToObject(result)
-      );
+  managementResults.push(
+    await responseToObject(result)
+  );
 
-    } catch (error) {
-      console.error(
-        "Position management error:",
-        position.symbol,
-        error
-      );
+} catch (error) {
+  console.error(
+    "Position management error:",
+    position.symbol,
+    error
+  );
 
-      managementResults.push({
-        ok: false,
-        action: "POSITION_ERROR",
-        token: position.symbol,
-        error:
-          error?.message ||
-          String(error)
-      });
-    }
-  }
-
-  // Refresh positions after possible sales.
-  let currentPositions =
-    await getPositions(env);
-
-  // --------------------------------
-  // RATE LIMIT COOLDOWN
-  // --------------------------------
-
-  const cooldown =
-    await getCooldown(env);
-
-  if (cooldown > Date.now()) {
-    return json({
-      ok: true,
-      action: "MANAGING_POSITIONS",
-      positions: currentPositions,
-      management: managementResults,
-      seconds_remaining: Math.ceil(
-        (cooldown - Date.now()) / 1000
-      )
-    });
-  }
-
-  // --------------------------------
-  // SCAN COOLDOWN
-  // --------------------------------
-
-  const lastScan =
-    await getLastScan(env);
-
-  if (
-    !manual &&
-    lastScan >
-      Date.now() - SCAN_COOLDOWN_MS
-  ) {
-    return json({
-      ok: true,
-      action: "MANAGING_POSITIONS",
-      positions: currentPositions,
-      management: managementResults
-    });
-  }
-
-  // --------------------------------
-  // MAX POSITION CHECK
-  // --------------------------------
-
-  if (
-    currentPositions.length >=
-    MAX_POSITIONS
-  ) {
-    return json({
-      ok: true,
-      action: "MAX_POSITIONS",
-      positions: currentPositions,
-      management: managementResults
-    });
-  }
-
-  await setLastScan(env);
-
-  // --------------------------------
-  // LOOK FOR ANOTHER COIN
-  // --------------------------------
-
-  const buyResult =
-    await findAndBuy(
-      env,
-      wallet,
-      currentPositions
-    );
-
-  return json({
-    ok: true,
-    action: "MULTI_POSITION_RUN",
-    positions:
-      await getPositions(env),
-    management: managementResults,
-    new_trade:
-      await responseToObject(buyResult)
+  managementResults.push({
+    ok: false,
+    action: "POSITION_ERROR",
+    token: position.symbol,
+    error:
+      error?.message ||
+      String(error)
   });
+}
+
+}
+
+// Refresh positions after possible sales.
+let currentPositions =
+await getPositions(env);
+
+// --------------------------------
+// RATE LIMIT COOLDOWN
+// --------------------------------
+
+const cooldown =
+await getCooldown(env);
+
+if (cooldown > Date.now()) {
+return json({
+ok: true,
+action: "MANAGING_POSITIONS",
+positions: currentPositions,
+management: managementResults,
+seconds_remaining: Math.ceil(
+(cooldown - Date.now()) / 1000
+)
+});
+}
+
+// --------------------------------
+// SCAN COOLDOWN
+// --------------------------------
+
+const lastScan =
+await getLastScan(env);
+
+if (
+!manual &&
+lastScan >
+Date.now() - SCAN_COOLDOWN_MS
+) {
+return json({
+ok: true,
+action: "MANAGING_POSITIONS",
+positions: currentPositions,
+management: managementResults
+});
+}
+
+// --------------------------------
+// MAX POSITION CHECK
+// --------------------------------
+
+if (
+currentPositions.length >=
+MAX_POSITIONS
+) {
+return json({
+ok: true,
+action: "MAX_POSITIONS",
+positions: currentPositions,
+management: managementResults
+});
+}
+
+await setLastScan(env);
+
+// --------------------------------
+// LOOK FOR ANOTHER COIN
+// --------------------------------
+
+const buyResult =
+await findAndBuy(
+env,
+wallet,
+currentPositions
+);
+
+return json({
+ok: true,
+action: "MULTI_POSITION_RUN",
+positions:
+await getPositions(env),
+management: managementResults,
+new_trade:
+await responseToObject(buyResult)
+});
 }
 
 // ===============================
@@ -238,278 +240,280 @@ async function runBot(env, manual = false) {
 // ===============================
 
 async function findAndBuy(
-  env,
-  wallet,
-  existingPositions
+env,
+wallet,
+existingPositions
 ) {
-  const solBalance =
-    wallet.solBalance;
+const solBalance =
+wallet.solBalance;
 
-  if (
-    solBalance <= MIN_SOL_RESERVE
-  ) {
-    return json({
-      ok: true,
-      action: "NO_TRADE",
-      reason:
-        "Not enough uncommitted SOL after reserve.",
-      sol_balance:
-        solBalance
-    });
-  }
+if (
+solBalance <= MIN_SOL_RESERVE
+) {
+return json({
+ok: true,
+action: "NO_TRADE",
+reason:
+"Not enough uncommitted SOL after reserve.",
+sol_balance:
+solBalance
+});
+}
 
-  const solPriceUsd =
-    await getUsdPrice(
-      env,
-      SOL_MINT
-    );
+const solPriceUsd =
+await getUsdPrice(
+env,
+SOL_MINT
+);
 
-  if (
-    !solPriceUsd ||
-    solPriceUsd <= 0
-  ) {
-    return json({
-      ok: false,
-      action: "NO_TRADE",
-      error:
-        "Could not determine SOL price."
-    }, 500);
-  }
+if (
+!solPriceUsd ||
+solPriceUsd <= 0
+) {
+return json({
+ok: false,
+action: "NO_TRADE",
+error:
+"Could not determine SOL price."
+}, 500);
+}
 
-  const walletValueUsd =
-    solBalance * solPriceUsd;
+const walletValueUsd =
+solBalance * solPriceUsd;
 
-  // --------------------------------
-  // DYNAMIC TRADE CAP
-  // --------------------------------
+// --------------------------------
+// DYNAMIC TRADE CAP
+// --------------------------------
 
-  const maxTradeUsd =
-    walletValueUsd >=
-    BALANCE_THRESHOLD_USD
-      ? LARGE_TRADE_CAP_USD
-      : SMALL_TRADE_CAP_USD;
+const maxTradeUsd =
+walletValueUsd >=
+BALANCE_THRESHOLD_USD
+? LARGE_TRADE_CAP_USD
+: SMALL_TRADE_CAP_USD;
 
-  const availableSol =
-    Math.max(
-      0,
-      solBalance - MIN_SOL_RESERVE
-    );
+const availableSol =
+Math.max(
+0,
+solBalance - MIN_SOL_RESERVE
+);
 
-  const availableUsd =
-    availableSol * solPriceUsd;
+const availableUsd =
+availableSol * solPriceUsd;
 
-  const tradeUsd =
-    Math.min(
-      maxTradeUsd,
-      availableUsd
-    );
+const tradeUsd =
+Math.min(
+maxTradeUsd,
+availableUsd
+);
 
-  if (tradeUsd <= 0) {
-    return json({
-      ok: true,
-      action: "NO_TRADE",
-      reason:
-        "No uncommitted SOL available.",
-      sol_balance:
-        solBalance,
-      wallet_value_usd:
-        walletValueUsd,
-      max_trade_usd:
-        maxTradeUsd
-    });
-  }
+if (tradeUsd <= 0) {
+return json({
+ok: true,
+action: "NO_TRADE",
+reason:
+"No uncommitted SOL available.",
+sol_balance:
+solBalance,
+wallet_value_usd:
+walletValueUsd,
+max_trade_usd:
+maxTradeUsd
+});
+}
 
-  const tradeLamports =
-    Math.floor(
-      (tradeUsd / solPriceUsd) *
-      1_000_000_000
-    );
+const tradeLamports =
+Math.floor(
+(tradeUsd / solPriceUsd) *
+1_000_000_000
+);
 
-  if (tradeLamports <= 0) {
-    return json({
-      ok: true,
-      action: "NO_TRADE",
-      reason:
-        "Trade amount rounded to zero."
-    });
-  }
+if (tradeLamports <= 0) {
+return json({
+ok: true,
+action: "NO_TRADE",
+reason:
+"Trade amount rounded to zero."
+});
+}
 
-  const existingMints =
-    new Set(
-      existingPositions.map(
-        position =>
-          position.mint
-      )
-    );
+const existingMints =
+new Set(
+existingPositions.map(
+position =>
+position.mint
+)
+);
 
-  let candidate;
+let candidate;
 
-  try {
-    candidate =
-      await selectCandidate(
-        env,
-        tradeLamports,
-        existingMints
-      );
+try {
+candidate =
+await selectCandidate(
+env,
+tradeLamports,
+existingMints
+);
 
-  } catch (error) {
-    if (
-      isRateLimitError(error)
-    ) {
-      await setCooldown(
-        env,
-        Date.now() +
-          RATE_LIMIT_COOLDOWN_MS
-      );
-    }
+} catch (error) {
+if (
+isRateLimitError(error)
+) {
+await setCooldown(
+env,
+Date.now() +
+RATE_LIMIT_COOLDOWN_MS
+);
+}
 
-    throw error;
-  }
+throw error;
 
-  if (!candidate) {
-    return json({
-      ok: true,
-      action: "NO_TRADE",
-      reason:
-        "No suitable new token found.",
-      wallet_value_usd:
-        walletValueUsd,
-      max_trade_usd:
-        maxTradeUsd,
-      open_positions:
-        existingPositions.length
-    });
-  }
+}
 
-  if (!LIVE_TRADING) {
-    return json({
-      ok: true,
-      action: "PAPER_BUY",
-      token:
-        candidate.symbol,
-      mint:
-        candidate.mint,
-      trade_usd:
-        tradeUsd,
-      max_trade_usd:
-        maxTradeUsd
-    });
-  }
+if (!candidate) {
+return json({
+ok: true,
+action: "NO_TRADE",
+reason:
+"No suitable new token found.",
+wallet_value_usd:
+walletValueUsd,
+max_trade_usd:
+maxTradeUsd,
+open_positions:
+existingPositions.length
+});
+}
 
-  // --------------------------------
-  // EXECUTE BUY
-  // --------------------------------
+if (!LIVE_TRADING) {
+return json({
+ok: true,
+action: "PAPER_BUY",
+token:
+candidate.symbol,
+mint:
+candidate.mint,
+trade_usd:
+tradeUsd,
+max_trade_usd:
+maxTradeUsd
+});
+}
 
-  const order =
-    await getOrder(
-      env,
-      SOL_MINT,
-      candidate.mint,
-      tradeLamports
-    );
+// --------------------------------
+// EXECUTE BUY
+// --------------------------------
 
-  if (!order) {
-    return json({
-      ok: false,
-      action: "BUY_ERROR",
-      error:
-        "Jupiter did not return a buy order."
-    }, 500);
-  }
+const order =
+await getOrder(
+env,
+SOL_MINT,
+candidate.mint,
+tradeLamports
+);
 
-  const executed =
-    await executeOrder(
-      env,
-      order
-    );
+if (!order) {
+return json({
+ok: false,
+action: "BUY_ERROR",
+error:
+"Jupiter did not return a buy order."
+}, 500);
+}
 
-  if (
-    !executed ||
-    !executed.signature
-  ) {
-    return json({
-      ok: false,
-      action: "BUY_ERROR",
-      error:
-        "Buy transaction was not confirmed.",
-      result:
-        executed
-    }, 500);
-  }
+const executed =
+await executeOrder(
+env,
+order
+);
 
-  const entrySol =
-    Number(
-      order.inAmount ||
-      tradeLamports
-    ) /
-    1_000_000_000;
+if (
+!executed ||
+!executed.signature
+) {
+return json({
+ok: false,
+action: "BUY_ERROR",
+error:
+"Buy transaction was not confirmed.",
+result:
+executed
+}, 500);
+}
 
-  const position = {
-    mint:
-      candidate.mint,
+const entrySol =
+Number(
+order.inAmount ||
+tradeLamports
+) /
+1_000_000_000;
 
-    symbol:
-      candidate.symbol ||
-      "UNKNOWN",
+const position = {
+mint:
+candidate.mint,
 
-    name:
-      candidate.name ||
-      candidate.symbol ||
-      "UNKNOWN",
+symbol:
+  candidate.symbol ||
+  "UNKNOWN",
 
-    entrySol:
-      entrySol,
+name:
+  candidate.name ||
+  candidate.symbol ||
+  "UNKNOWN",
 
-    entryUsd:
-      tradeUsd,
+entrySol:
+  entrySol,
 
-    buySignature:
-      executed.signature,
+entryUsd:
+  tradeUsd,
 
-    createdAt:
-      Date.now(),
+buySignature:
+  executed.signature,
 
-    selectionScore:
-      candidate.score,
+createdAt:
+  Date.now(),
 
-    selectionReason:
-      "Trending token with liquidity, momentum and executable route"
-  };
+selectionScore:
+  candidate.score,
 
-  const updatedPositions = [
-    ...existingPositions,
-    position
-  ];
+selectionReason:
+  "Trending token with liquidity, momentum and executable route"
 
-  await savePositions(
-    env,
-    updatedPositions
-  );
+};
 
-  return json({
-    ok: true,
-    action: "BOUGHT",
-    token:
-      position.symbol,
-    mint:
-      position.mint,
-    entry_sol:
-      position.entrySol,
-    entry_usd:
-      position.entryUsd,
-    wallet_value_usd:
-      walletValueUsd,
-    max_trade_usd:
-      maxTradeUsd,
-    open_positions:
-      updatedPositions.length,
-    profit_target:
-      "1.5%",
-    stop_loss:
-      "-1%",
-    signature:
-      executed.signature
-  });
+const updatedPositions = [
+...existingPositions,
+position
+];
+
+await savePositions(
+env,
+updatedPositions
+);
+
+return json({
+ok: true,
+action: "BOUGHT",
+token:
+position.symbol,
+mint:
+position.mint,
+entry_sol:
+position.entrySol,
+entry_usd:
+position.entryUsd,
+wallet_value_usd:
+walletValueUsd,
+max_trade_usd:
+maxTradeUsd,
+open_positions:
+updatedPositions.length,
+profit_target:
+"1.5%",
+stop_loss:
+"-1%",
+signature:
+executed.signature
+});
 }
 
 // ===============================
@@ -517,143 +521,142 @@ async function findAndBuy(
 // ===============================
 
 async function managePosition(
-  env,
-  position
+env,
+position
 ) {
-  const tokenBalance =
-    await getTokenBalance(
-      env,
-      position.mint
-    );
+const tokenBalance =
+await getTokenBalance(
+env,
+position.mint
+);
 
-  if (
-    !tokenBalance ||
-    tokenBalance.amount <= 0
-  ) {
-    // The token may have already been
-    // sold externally. Remove stale position.
-    await removePosition(
-      env,
-      position.mint
-    );
+if (
+!tokenBalance ||
+tokenBalance.amount <= 0
+) {
+await removePosition(
+env,
+position.mint
+);
 
-    return json({
-      ok: true,
-      action:
-        "POSITION_REMOVED",
-      token:
-        position.symbol,
-      reason:
-        "No token balance found."
-    });
-  }
+return json({
+  ok: true,
+  action:
+    "POSITION_REMOVED",
+  token:
+    position.symbol,
+  reason:
+    "No token balance found."
+});
 
-  const quote =
-    await getOrder(
-      env,
-      position.mint,
-      SOL_MINT,
-      tokenBalance.rawAmount
-    );
+}
 
-  if (!quote) {
-    return json({
-      ok: false,
-      action:
-        "QUOTE_ERROR",
-      token:
-        position.symbol
-    }, 500);
-  }
+const quote =
+await getOrder(
+env,
+position.mint,
+SOL_MINT,
+tokenBalance.rawAmount
+);
 
-  const currentSol =
-    Number(
-      quote.outAmount
-    ) /
-    1_000_000_000;
+if (!quote) {
+return json({
+ok: false,
+action:
+"QUOTE_ERROR",
+token:
+position.symbol
+}, 500);
+}
 
-  const entrySol =
-    Number(
-      position.entrySol
-    );
+const currentSol =
+Number(
+quote.outAmount
+) /
+1_000_000_000;
 
-  if (
-    !entrySol ||
-    entrySol <= 0
-  ) {
-    return json({
-      ok: false,
-      action:
-        "POSITION_ERROR",
-      reason:
-        "Invalid entry SOL amount.",
-      token:
-        position.symbol
-    }, 500);
-  }
+const entrySol =
+Number(
+position.entrySol
+);
 
-  const change =
-    (currentSol - entrySol) /
-    entrySol;
+if (
+!entrySol ||
+entrySol <= 0
+) {
+return json({
+ok: false,
+action:
+"POSITION_ERROR",
+reason:
+"Invalid entry SOL amount.",
+token:
+position.symbol
+}, 500);
+}
 
-  const changePercent =
-    change * 100;
+const change =
+(currentSol - entrySol) /
+entrySol;
 
-  // --------------------------------
-  // TAKE PROFIT
-  // --------------------------------
+const changePercent =
+change * 100;
 
-  if (
-    change >= PROFIT_TARGET
-  ) {
-    return await sellPosition(
-      env,
-      position,
-      tokenBalance,
-      "TAKE_PROFIT",
-      currentSol,
-      changePercent
-    );
-  }
+// --------------------------------
+// TAKE PROFIT
+// --------------------------------
 
-  // --------------------------------
-  // STOP LOSS
-  // --------------------------------
+if (
+change >= PROFIT_TARGET
+) {
+return await sellPosition(
+env,
+position,
+tokenBalance,
+"TAKE_PROFIT",
+currentSol,
+changePercent
+);
+}
 
-  if (
-    change <= STOP_LOSS
-  ) {
-    return await sellPosition(
-      env,
-      position,
-      tokenBalance,
-      "STOP_LOSS",
-      currentSol,
-      changePercent
-    );
-  }
+// --------------------------------
+// STOP LOSS
+// --------------------------------
 
-  return json({
-    ok: true,
-    action:
-      "HOLDING_TOKEN",
-    token:
-      position.symbol,
-    mint:
-      position.mint,
-    entry_sol:
-      entrySol,
-    current_sol:
-      currentSol,
-    change_percent:
-      Number(
-        changePercent.toFixed(4)
-      ),
-    take_profit_percent:
-      1.5,
-    stop_loss_percent:
-      -1
-  });
+if (
+change <= STOP_LOSS
+) {
+return await sellPosition(
+env,
+position,
+tokenBalance,
+"STOP_LOSS",
+currentSol,
+changePercent
+);
+}
+
+return json({
+ok: true,
+action:
+"HOLDING_TOKEN",
+token:
+position.symbol,
+mint:
+position.mint,
+entry_sol:
+entrySol,
+current_sol:
+currentSol,
+change_percent:
+Number(
+changePercent.toFixed(4)
+),
+take_profit_percent:
+1.5,
+stop_loss_percent:
+-1
+});
 }
 
 // ===============================
@@ -661,98 +664,118 @@ async function managePosition(
 // ===============================
 
 async function sellPosition(
-  env,
-  position,
-  tokenBalance,
-  reason,
-  currentSol,
-  changePercent
+env,
+position,
+tokenBalance,
+reason,
+currentSol,
+changePercent
 ) {
-  if (!LIVE_TRADING) {
-    await removePosition(
-      env,
-      position.mint
-    );
+if (!LIVE_TRADING) {
+await removePosition(
+env,
+position.mint
+);
 
-    return json({
-      ok: true,
-      action:
-        "PAPER_SELL",
-      reason,
-      token:
-        position.symbol,
-      current_sol:
-        currentSol,
-      change_percent:
-        changePercent
-    });
-  }
+return json({
+  ok: true,
+  action:
+    "PAPER_SELL",
+  reason,
+  token:
+    position.symbol,
+  current_sol:
+    currentSol,
+  change_percent:
+    changePercent
+});
 
-  const order =
-    await getOrder(
-      env,
-      position.mint,
-      SOL_MINT,
-      tokenBalance.rawAmount
-    );
+}
 
-  if (!order) {
-    return json({
-      ok: false,
-      action:
-        "SELL_QUOTE_ERROR",
-      token:
-        position.symbol
-    }, 500);
-  }
+const order =
+await getOrder(
+env,
+position.mint,
+SOL_MINT,
+tokenBalance.rawAmount
+);
 
-  const executed =
-    await executeOrder(
-      env,
-      order
-    );
+if (!order) {
+return json({
+ok: false,
+action:
+"SELL_QUOTE_ERROR",
+token:
+position.symbol
+}, 500);
+}
 
-  if (
-    !executed ||
-    !executed.signature
-  ) {
-    return json({
-      ok: false,
-      action:
-        "SELL_ERROR",
-      reason,
-      token:
-        position.symbol,
-      result:
-        executed
-    }, 500);
-  }
+const executed =
+await executeOrder(
+env,
+order
+);
 
-  await removePosition(
-    env,
-    position.mint
-  );
+if (
+!executed ||
+!executed.signature
+) {
+return json({
+ok: false,
+action:
+"SELL_ERROR",
+reason,
+token:
+position.symbol,
+result:
+executed
+}, 500);
+}
 
-  return json({
-    ok: true,
-    action:
-      "SOLD",
-    reason,
-    token:
-      position.symbol,
-    mint:
-      position.mint,
-    entry_sol:
-      position.entrySol,
-    exit_sol:
-      currentSol,
-    change_percent:
-      Number(
-        changePercent.toFixed(4)
-      ),
-    signature:
-      executed.signature
-  });
+await removePosition(
+env,
+position.mint
+);
+
+return json({
+ok: true,
+action:
+"SOLD",
+reason,
+token:
+position.symbol,
+mint:
+position.mint,
+entry_sol:
+position.entrySol,
+exit_sol:
+currentSol,
+change_percent:
+Number(
+changePercent.toFixed(4)
+),
+signature:
+executed.signature
+});
+}
+
+// ===============================
+// TOKEN MINT HELPER
+// ===============================
+//
+// Jupiter Tokens V2 can identify a
+// token using "id". Older response
+// formats may use "address" or "mint".
+// Check all three so discovery works
+// across the response formats.
+
+function getTokenMint(token) {
+return (
+token?.id ||
+token?.address ||
+token?.mint ||
+null
+);
 }
 
 // ===============================
@@ -760,136 +783,59 @@ async function sellPosition(
 // ===============================
 
 async function selectCandidate(
-  env,
-  tradeLamports,
-  existingMints
+env,
+tradeLamports,
+existingMints
 ) {
-  const tokens =
-    await getTrendingTokens(env);
+const tokens =
+await getTrendingTokens(env);
 
-  if (!tokens.length) {
-    return null;
-  }
+if (!tokens.length) {
+return null;
+}
 
-  const unique = [];
-  const seen = new Set();
+const unique = [];
+const seen = new Set();
 
-  for (const token of tokens) {
-    const mint =
-      token.address ||
-      token.mint;
+for (const token of tokens) {
+const mint =
+getTokenMint(token);
 
-    if (!mint) continue;
+if (!mint) continue;
 
-    if (mint === SOL_MINT) {
-      continue;
+if (mint === SOL_MINT) {
+  continue;
+}
+
+// Never buy a token already held.
+if (
+  existingMints.has(mint)
+) {
+  continue;
+}
+
+if (seen.has(mint)) {
+  continue;
+}
+
+seen.add(mint);
+
+unique.push({
+  ...token,
+  mint
+});
+
+}
+
+const filtered =
+unique
+.filter(token => {
+const mint =
+getTokenMint(token);
+
+    if (!mint) {
+      return false;
     }
-
-    // Never buy a token already held.
-    if (
-      existingMints.has(mint)
-    ) {
-      continue;
-    }
-
-    if (seen.has(mint)) {
-      continue;
-    }
-
-    seen.add(mint);
-    unique.push(token);
-  }
-
-  const filtered =
-    unique
-      .filter(token => {
-        const mint =
-          token.address ||
-          token.mint;
-
-        if (!mint) {
-          return false;
-        }
-
-        const liquidity =
-          Number(
-            token.liquidity ??
-            token.liquidityUsd ??
-            token.liquidityUSD ??
-            0
-          );
-
-        if (
-          liquidity > 0 &&
-          liquidity <
-            MIN_LIQUIDITY_USD
-        ) {
-          return false;
-        }
-
-        const symbol =
-          String(
-            token.symbol ||
-            token.name ||
-            ""
-          ).toUpperCase();
-
-        if (
-          symbol === "SOL" ||
-          symbol === "USDC" ||
-          symbol === "USDT"
-        ) {
-          return false;
-        }
-
-        return true;
-      })
-      .slice(
-        0,
-        MAX_CANDIDATES
-      );
-
-  if (!filtered.length) {
-    return null;
-  }
-
-  let prices = {};
-
-  try {
-    prices =
-      await getPrices(
-        env,
-        filtered.map(
-          token =>
-            token.address ||
-            token.mint
-        )
-      );
-
-  } catch (error) {
-    console.error(
-      "Price lookup error:",
-      error?.message ||
-      error
-    );
-  }
-
-  const candidates = [];
-
-  for (const token of filtered) {
-    const mint =
-      token.address ||
-      token.mint;
-
-    const priceData =
-      prices[mint];
-
-    const price =
-      Number(
-        priceData?.usdPrice ??
-        priceData?.price ??
-        0
-      );
 
     const liquidity =
       Number(
@@ -899,145 +845,229 @@ async function selectCandidate(
         0
       );
 
-    const organicScore =
-      Number(
-        token.organicScore ??
-        token.organic_score ??
-        0
-      );
+    if (
+      liquidity > 0 &&
+      liquidity <
+        MIN_LIQUIDITY_USD
+    ) {
+      return false;
+    }
 
-    const momentum =
-      Number(
-        token.momentum ??
-        token.stats5m?.priceChange ??
-        token.stats1h?.priceChange ??
-        0
-      );
+    const symbol =
+      String(
+        token.symbol ||
+        token.name ||
+        ""
+      ).toUpperCase();
 
-    const score =
-      organicScore +
-      Math.log10(
-        Math.max(
-          liquidity,
-          1
-        )
-      ) +
-      momentum;
+    if (
+      symbol === "SOL" ||
+      symbol === "USDC" ||
+      symbol === "USDT"
+    ) {
+      return false;
+    }
 
-    candidates.push({
-      ...token,
-
-      mint,
-
-      price,
-
-      liquidity,
-
-      organicScore,
-
-      momentum,
-
-      score
-    });
-  }
-
-  candidates.sort(
-    (a, b) =>
-      b.score - a.score
+    return true;
+  })
+  .slice(
+    0,
+    MAX_CANDIDATES
   );
 
-  // Test the strongest two with
-  // actual executable Jupiter routes.
-  const testCandidates =
-    candidates.slice(0, 2);
+if (!filtered.length) {
+return null;
+}
 
-  for (
-    const candidate
-    of testCandidates
-  ) {
-    try {
-      const buyOrder =
-        await getOrder(
-          env,
-          SOL_MINT,
-          candidate.mint,
-          tradeLamports
-        );
+let prices = {};
 
-      if (!buyOrder) {
-        continue;
-      }
+try {
+prices =
+await getPrices(
+env,
+filtered.map(
+token =>
+getTokenMint(token)
+).filter(Boolean)
+);
 
-      const tokenOut =
-        buyOrder.outAmount;
+} catch (error) {
+console.error(
+"Price lookup error:",
+error?.message ||
+error
+);
+}
 
-      if (
-        !tokenOut ||
-        Number(tokenOut) <= 0
-      ) {
-        continue;
-      }
+const candidates = [];
 
-      const sellOrder =
-        await getOrder(
-          env,
-          candidate.mint,
-          SOL_MINT,
-          tokenOut
-        );
+for (const token of filtered) {
+const mint =
+getTokenMint(token);
 
-      if (!sellOrder) {
-        continue;
-      }
+if (!mint) {
+  continue;
+}
 
-      const sellSol =
-        Number(
-          sellOrder.outAmount
-        ) /
-        1_000_000_000;
+const priceData =
+  prices[mint];
 
-      const buySol =
-        Number(
-          tradeLamports
-        ) /
-        1_000_000_000;
+const price =
+  Number(
+    priceData?.usdPrice ??
+    priceData?.price ??
+    0
+  );
 
-      if (buySol <= 0) {
-        continue;
-      }
+const liquidity =
+  Number(
+    token.liquidity ??
+    token.liquidityUsd ??
+    token.liquidityUSD ??
+    0
+  );
 
-      const roundTripChange =
-        (sellSol - buySol) /
-        buySol;
+const organicScore =
+  Number(
+    token.organicScore ??
+    token.organic_score ??
+    0
+  );
 
-      if (
-        roundTripChange <
-        -MAX_ROUND_TRIP_LOSS
-      ) {
-        continue;
-      }
+const momentum =
+  Number(
+    token.momentum ??
+    token.stats5m?.priceChange ??
+    token.stats1h?.priceChange ??
+    0
+  );
 
-      candidate.roundTripChange =
-        roundTripChange;
+const score =
+  organicScore +
+  Math.log10(
+    Math.max(
+      liquidity,
+      1
+    )
+  ) +
+  momentum;
 
-      return candidate;
+candidates.push({
+  ...token,
 
-    } catch (error) {
-      if (
-        isRateLimitError(error)
-      ) {
-        throw error;
-      }
+  mint,
 
-      console.error(
-        "Candidate test error:",
-        error?.message ||
-        error
-      );
-    }
+  price,
+
+  liquidity,
+
+  organicScore,
+
+  momentum,
+
+  score
+});
+
+}
+
+candidates.sort(
+(a, b) =>
+b.score - a.score
+);
+
+// Test the strongest two with
+// actual executable Jupiter routes.
+const testCandidates =
+candidates.slice(0, 2);
+
+for (
+const candidate
+of testCandidates
+) {
+try {
+const buyOrder =
+await getOrder(
+env,
+SOL_MINT,
+candidate.mint,
+tradeLamports
+);
+
+  if (!buyOrder) {
+    continue;
   }
 
-  return null;
+  const tokenOut =
+    buyOrder.outAmount;
+
+  if (
+    !tokenOut ||
+    Number(tokenOut) <= 0
+  ) {
+    continue;
+  }
+
+  const sellOrder =
+    await getOrder(
+      env,
+      candidate.mint,
+      SOL_MINT,
+      tokenOut
+    );
+
+  if (!sellOrder) {
+    continue;
+  }
+
+  const sellSol =
+    Number(
+      sellOrder.outAmount
+    ) /
+    1_000_000_000;
+
+  const buySol =
+    Number(
+      tradeLamports
+    ) /
+    1_000_000_000;
+
+  if (buySol <= 0) {
+    continue;
+  }
+
+  const roundTripChange =
+    (sellSol - buySol) /
+    buySol;
+
+  if (
+    roundTripChange <
+    -MAX_ROUND_TRIP_LOSS
+  ) {
+    continue;
+  }
+
+  candidate.roundTripChange =
+    roundTripChange;
+
+  return candidate;
+
+} catch (error) {
+  if (
+    isRateLimitError(error)
+  ) {
+    throw error;
+  }
+
+  console.error(
+    "Candidate test error:",
+    error?.message ||
+    error
+  );
+}
+
+}
+
+return null;
 }
 
 // ===============================
@@ -1045,67 +1075,68 @@ async function selectCandidate(
 // ===============================
 
 async function getTrendingTokens(env) {
-  const endpoints = [
-    "/toptrending/5m",
-    "/toptrending/1h",
-    "/toptraded/1h"
-  ];
+const endpoints = [
+"/toptrending/5m",
+"/toptrending/1h",
+"/toptraded/1h"
+];
 
-  const all = [];
+const all = [];
 
-  for (
-    const endpoint
-    of endpoints
+for (
+const endpoint
+of endpoints
+) {
+try {
+const data =
+await jupiterFetch(
+env,
+TOKEN_API +
+endpoint
+);
+
+  if (
+    Array.isArray(data)
   ) {
-    try {
-      const data =
-        await jupiterFetch(
-          env,
-          TOKEN_API +
-            endpoint
-        );
+    all.push(...data);
 
-      if (
-        Array.isArray(data)
-      ) {
-        all.push(...data);
+  } else if (
+    Array.isArray(
+      data?.tokens
+    )
+  ) {
+    all.push(
+      ...data.tokens
+    );
 
-      } else if (
-        Array.isArray(
-          data?.tokens
-        )
-      ) {
-        all.push(
-          ...data.tokens
-        );
-
-      } else if (
-        Array.isArray(
-          data?.data
-        )
-      ) {
-        all.push(
-          ...data.data
-        );
-      }
-
-    } catch (error) {
-      if (
-        isRateLimitError(error)
-      ) {
-        throw error;
-      }
-
-      console.error(
-        "Trending endpoint error:",
-        endpoint,
-        error?.message ||
-        error
-      );
-    }
+  } else if (
+    Array.isArray(
+      data?.data
+    )
+  ) {
+    all.push(
+      ...data.data
+    );
   }
 
-  return all;
+} catch (error) {
+  if (
+    isRateLimitError(error)
+  ) {
+    throw error;
+  }
+
+  console.error(
+    "Trending endpoint error:",
+    endpoint,
+    error?.message ||
+    error
+  );
+}
+
+}
+
+return all;
 }
 
 // ===============================
@@ -1113,47 +1144,47 @@ async function getTrendingTokens(env) {
 // ===============================
 
 async function getPrices(
-  env,
-  mints
+env,
+mints
 ) {
-  if (!mints.length) {
-    return {};
-  }
+if (!mints.length) {
+return {};
+}
 
-  const ids =
-    mints.join(",");
+const ids =
+mints.join(",");
 
-  const data =
-    await jupiterFetch(
-      env,
-      `${PRICE_API}?ids=${encodeURIComponent(ids)}`
-    );
+const data =
+await jupiterFetch(
+env,
+"${PRICE_API}?ids=${encodeURIComponent(ids)}"
+);
 
-  return (
-    data?.data ||
-    data ||
-    {}
-  );
+return (
+data?.data ||
+data ||
+{}
+);
 }
 
 async function getUsdPrice(
-  env,
-  mint
+env,
+mint
 ) {
-  const prices =
-    await getPrices(
-      env,
-      [mint]
-    );
+const prices =
+await getPrices(
+env,
+[mint]
+);
 
-  const item =
-    prices[mint];
+const item =
+prices[mint];
 
-  return Number(
-    item?.usdPrice ??
-    item?.price ??
-    0
-  );
+return Number(
+item?.usdPrice ??
+item?.price ??
+0
+);
 }
 
 // ===============================
@@ -1161,28 +1192,28 @@ async function getUsdPrice(
 // ===============================
 
 async function getOrder(
-  env,
-  inputMint,
-  outputMint,
-  amount
+env,
+inputMint,
+outputMint,
+amount
 ) {
-  const url =
-    `${SWAP_API}/order` +
-    `?inputMint=${encodeURIComponent(inputMint)}` +
-    `&outputMint=${encodeURIComponent(outputMint)}` +
-    `&amount=${encodeURIComponent(amount)}` +
-    `&taker=${encodeURIComponent(WALLET_ADDRESS)}`;
+const url =
+"${SWAP_API}/order" +
+"?inputMint=${encodeURIComponent(inputMint)}" +
+"&outputMint=${encodeURIComponent(outputMint)}" +
+"&amount=${encodeURIComponent(amount)}" +
+"&taker=${encodeURIComponent(WALLET_ADDRESS)}";
 
-  return await jupiterFetch(
-    env,
-    url,
-    {
-      headers: {
-        "Content-Type":
-          "application/json"
-      }
-    }
-  );
+return await jupiterFetch(
+env,
+url,
+{
+headers: {
+"Content-Type":
+"application/json"
+}
+}
+);
 }
 
 // ===============================
@@ -1190,108 +1221,108 @@ async function getOrder(
 // ===============================
 
 async function executeOrder(
-  env,
-  order
+env,
+order
 ) {
-  const transaction =
-    order?.transaction ||
-    order?.swapTransaction;
+const transaction =
+order?.transaction ||
+order?.swapTransaction;
 
-  if (!transaction) {
-    throw new Error(
-      "Jupiter order did not contain a transaction."
-    );
-  }
+if (!transaction) {
+throw new Error(
+"Jupiter order did not contain a transaction."
+);
+}
 
-  const signer =
-    await importPrivateKey(
-      env.WALLET_PRIVATE_KEY
-    );
+const signer =
+await importPrivateKey(
+env.WALLET_PRIVATE_KEY
+);
 
-  const transactionBytes =
-    base64ToBytes(
-      transaction
-    );
+const transactionBytes =
+base64ToBytes(
+transaction
+);
 
-  const signedBytes =
-    await crypto.subtle.sign(
-      {
-        name:
-          "Ed25519"
-      },
-      signer,
-      transactionBytes
-    );
+const signedBytes =
+await crypto.subtle.sign(
+{
+name:
+"Ed25519"
+},
+signer,
+transactionBytes
+);
 
-  const signedTransaction =
-    replaceSignature(
-      transactionBytes,
-      new Uint8Array(
-        signedBytes
-      )
-    );
+const signedTransaction =
+replaceSignature(
+transactionBytes,
+new Uint8Array(
+signedBytes
+)
+);
 
-  const rpcResponse =
-    await fetch(
-      "https://mainnet.helius-rpc.com/?api-key=" +
-      encodeURIComponent(
-        env.HELIUS_API_KEY
-      ),
-      {
+const rpcResponse =
+await fetch(
+"https://mainnet.helius-rpc.com/?api-key=" +
+encodeURIComponent(
+env.HELIUS_API_KEY
+),
+{
+method:
+"POST",
+
+    headers: {
+      "Content-Type":
+        "application/json"
+    },
+
+    body:
+      JSON.stringify({
+        jsonrpc:
+          "2.0",
+
+        id: 1,
+
         method:
-          "POST",
+          "sendTransaction",
 
-        headers: {
-          "Content-Type":
-            "application/json"
-        },
+        params: [
+          bytesToBase64(
+            signedTransaction
+          ),
 
-        body:
-          JSON.stringify({
-            jsonrpc:
-              "2.0",
+          {
+            encoding:
+              "base64",
 
-            id: 1,
+            skipPreflight:
+              false,
 
-            method:
-              "sendTransaction",
-
-            params: [
-              bytesToBase64(
-                signedTransaction
-              ),
-
-              {
-                encoding:
-                  "base64",
-
-                skipPreflight:
-                  false,
-
-                maxRetries:
-                  3
-              }
-            ]
-          })
-      }
-    );
-
-  const result =
-    await rpcResponse.json();
-
-  if (result?.error) {
-    throw new Error(
-      result.error.message ||
-      JSON.stringify(
-        result.error
-      )
-    );
+            maxRetries:
+              3
+          }
+        ]
+      })
   }
+);
 
-  return {
-    signature:
-      result.result
-  };
+const result =
+await rpcResponse.json();
+
+if (result?.error) {
+throw new Error(
+result.error.message ||
+JSON.stringify(
+result.error
+)
+);
+}
+
+return {
+signature:
+result.result
+};
 }
 
 // ===============================
@@ -1299,74 +1330,76 @@ async function executeOrder(
 // ===============================
 
 async function jupiterFetch(
-  env,
-  url,
-  options = {},
-  attempt = 0
+env,
+url,
+options = {},
+attempt = 0
 ) {
-  const headers = {
-    ...(options.headers || {}),
-    "x-api-key":
-      env.JUPITER_API_KEY
-  };
+const headers = {
+...(options.headers || {}),
+"x-api-key":
+env.JUPITER_API_KEY
+};
 
-  const response =
-    await fetch(
-      url,
-      {
-        ...options,
-        headers
-      }
-    );
+const response =
+await fetch(
+url,
+{
+...options,
+headers
+}
+);
 
-  if (
-    response.status === 429
-  ) {
-    if (attempt < 2) {
-      const delay =
-        3000 *
-        Math.pow(
-          2,
-          attempt
-        );
+if (
+response.status === 429
+) {
+if (attempt < 2) {
+const delay =
+3000 *
+Math.pow(
+2,
+attempt
+);
 
-      await sleep(delay);
+  await sleep(delay);
 
-      return await jupiterFetch(
-        env,
-        url,
-        options,
-        attempt + 1
-      );
-    }
+  return await jupiterFetch(
+    env,
+    url,
+    options,
+    attempt + 1
+  );
+}
 
-    const error =
-      new Error(
-        "Jupiter API rate limit reached."
-      );
+const error =
+  new Error(
+    "Jupiter API rate limit reached."
+  );
 
-    error.status =
-      429;
+error.status =
+  429;
 
-    throw error;
-  }
+throw error;
 
-  if (!response.ok) {
-    const text =
-      await response.text();
+}
 
-    const error =
-      new Error(
-        `Jupiter API error ${response.status}: ${text}`
-      );
+if (!response.ok) {
+const text =
+await response.text();
 
-    error.status =
-      response.status;
+const error =
+  new Error(
+    `Jupiter API error ${response.status}: ${text}`
+  );
 
-    throw error;
-  }
+error.status =
+  response.status;
 
-  return await response.json();
+throw error;
+
+}
+
+return await response.json();
 }
 
 // ===============================
@@ -1374,28 +1407,28 @@ async function jupiterFetch(
 // ===============================
 
 async function getWalletInfo(
-  env
+env
 ) {
-  const data =
-    await heliusRpc(
-      env,
-      "getBalance",
-      [
-        WALLET_ADDRESS
-      ]
-    );
+const data =
+await heliusRpc(
+env,
+"getBalance",
+[
+WALLET_ADDRESS
+]
+);
 
-  const lamports =
-    Number(
-      data?.result?.value ||
-      0
-    );
+const lamports =
+Number(
+data?.result?.value ||
+0
+);
 
-  return {
-    solBalance:
-      lamports /
-      1_000_000_000
-  };
+return {
+solBalance:
+lamports /
+1_000_000_000
+};
 }
 
 // ===============================
@@ -1403,87 +1436,89 @@ async function getWalletInfo(
 // ===============================
 
 async function getTokenBalance(
-  env,
-  mint
+env,
+mint
 ) {
-  const data =
-    await heliusRpc(
-      env,
-      "getTokenAccountsByOwner",
-      [
-        WALLET_ADDRESS,
+const data =
+await heliusRpc(
+env,
+"getTokenAccountsByOwner",
+[
+WALLET_ADDRESS,
 
-        {
-          mint
-        },
+    {
+      mint
+    },
 
-        {
-          encoding:
-            "jsonParsed"
-        }
-      ]
-    );
-
-  const accounts =
-    data?.result?.value ||
-    [];
-
-  if (!accounts.length) {
-    return null;
-  }
-
-  let rawAmount = 0;
-  let decimals = 0;
-
-  for (
-    const account
-    of accounts
-  ) {
-    const info =
-      account?.account?.data
-        ?.parsed?.info;
-
-    const tokenAmount =
-      info?.tokenAmount;
-
-    if (!tokenAmount) {
-      continue;
+    {
+      encoding:
+        "jsonParsed"
     }
+  ]
+);
 
-    rawAmount +=
-      Number(
-        tokenAmount.amount ||
-        0
-      );
+const accounts =
+data?.result?.value ||
+[];
 
-    decimals =
-      Number(
-        tokenAmount.decimals ||
-        0
-      );
-  }
+if (!accounts.length) {
+return null;
+}
 
-  if (rawAmount <= 0) {
-    return null;
-  }
+let rawAmount = 0;
+let decimals = 0;
 
-  return {
-    rawAmount:
-      String(
-        Math.floor(
-          rawAmount
-        )
-      ),
+for (
+const account
+of accounts
+) {
+const info =
+account?.account?.data
+?.parsed?.info;
 
-    amount:
-      rawAmount /
-      Math.pow(
-        10,
-        decimals
-      ),
+const tokenAmount =
+  info?.tokenAmount;
 
+if (!tokenAmount) {
+  continue;
+}
+
+rawAmount +=
+  Number(
+    tokenAmount.amount ||
+    0
+  );
+
+decimals =
+  Number(
+    tokenAmount.decimals ||
+    0
+  );
+
+}
+
+if (rawAmount <= 0) {
+return null;
+}
+
+return {
+rawAmount:
+String(
+Math.floor(
+rawAmount
+)
+),
+
+amount:
+  rawAmount /
+  Math.pow(
+    10,
     decimals
-  };
+  ),
+
+decimals
+
+};
 }
 
 // ===============================
@@ -1491,58 +1526,58 @@ async function getTokenBalance(
 // ===============================
 
 async function heliusRpc(
-  env,
-  method,
-  params
+env,
+method,
+params
 ) {
-  const response =
-    await fetch(
-      "https://mainnet.helius-rpc.com/?api-key=" +
-      encodeURIComponent(
-        env.HELIUS_API_KEY
-      ),
-      {
-        method:
-          "POST",
+const response =
+await fetch(
+"https://mainnet.helius-rpc.com/?api-key=" +
+encodeURIComponent(
+env.HELIUS_API_KEY
+),
+{
+method:
+"POST",
 
-        headers: {
-          "Content-Type":
-            "application/json"
-        },
+    headers: {
+      "Content-Type":
+        "application/json"
+    },
 
-        body:
-          JSON.stringify({
-            jsonrpc:
-              "2.0",
+    body:
+      JSON.stringify({
+        jsonrpc:
+          "2.0",
 
-            id: 1,
+        id: 1,
 
-            method,
+        method,
 
-            params
-          })
-      }
-    );
-
-  if (!response.ok) {
-    throw new Error(
-      `Helius RPC HTTP ${response.status}`
-    );
+        params
+      })
   }
+);
 
-  const data =
-    await response.json();
+if (!response.ok) {
+throw new Error(
+"Helius RPC HTTP ${response.status}"
+);
+}
 
-  if (data?.error) {
-    throw new Error(
-      data.error.message ||
-      JSON.stringify(
-        data.error
-      )
-    );
-  }
+const data =
+await response.json();
 
-  return data;
+if (data?.error) {
+throw new Error(
+data.error.message ||
+JSON.stringify(
+data.error
+)
+);
+}
+
+return data;
 }
 
 // ===============================
@@ -1550,94 +1585,95 @@ async function heliusRpc(
 // ===============================
 
 async function importPrivateKey(
-  value
+value
 ) {
-  const bytes =
-    decodePrivateKey(
-      value
-    );
+const bytes =
+decodePrivateKey(
+value
+);
 
-  let secretBytes;
+let secretBytes;
 
-  if (
-    bytes.length === 64
-  ) {
-    secretBytes =
-      bytes.slice(
-        0,
-        32
-      );
+if (
+bytes.length === 64
+) {
+secretBytes =
+bytes.slice(
+0,
+32
+);
 
-  } else if (
-    bytes.length === 32
-  ) {
-    secretBytes =
-      bytes;
+} else if (
+bytes.length === 32
+) {
+secretBytes =
+bytes;
 
-  } else {
-    throw new Error(
-      "WALLET_PRIVATE_KEY must decode to 32 or 64 bytes."
-    );
-  }
+} else {
+throw new Error(
+"WALLET_PRIVATE_KEY must decode to 32 or 64 bytes."
+);
+}
 
-  return await crypto.subtle.importKey(
-    "raw",
-    secretBytes,
-    {
-      name:
-        "Ed25519"
-    },
-    false,
-    [
-      "sign"
-    ]
-  );
+return await crypto.subtle.importKey(
+"raw",
+secretBytes,
+{
+name:
+"Ed25519"
+},
+false,
+[
+"sign"
+]
+);
 }
 
 function decodePrivateKey(
-  value
+value
 ) {
-  const text =
-    String(
-      value || ""
-    ).trim();
+const text =
+String(
+value || ""
+).trim();
 
-  if (!text) {
-    throw new Error(
-      "WALLET_PRIVATE_KEY is empty."
-    );
-  }
+if (!text) {
+throw new Error(
+"WALLET_PRIVATE_KEY is empty."
+);
+}
 
-  if (
-    text.startsWith("[") &&
-    text.endsWith("]")
-  ) {
-    const array =
-      JSON.parse(text);
+if (
+text.startsWith("[") &&
+text.endsWith("]")
+) {
+const array =
+JSON.parse(text);
 
-    return new Uint8Array(
-      array
-    );
-  }
+return new Uint8Array(
+  array
+);
 
-  try {
-    const bytes =
-      base64ToBytes(
-        text
-      );
+}
 
-    if (
-      bytes.length === 32 ||
-      bytes.length === 64
-    ) {
-      return bytes;
-    }
+try {
+const bytes =
+base64ToBytes(
+text
+);
 
-  } catch (_) {}
+if (
+  bytes.length === 32 ||
+  bytes.length === 64
+) {
+  return bytes;
+}
 
-  return base58Decode(
-    text
-  );
+} catch (_) {}
+
+return base58Decode(
+text
+);
 }
 
 // ===============================
@@ -1645,92 +1681,94 @@ function decodePrivateKey(
 // ===============================
 
 function replaceSignature(
-  transaction,
-  signature
+transaction,
+signature
 ) {
-  const countInfo =
-    readShortVec(
-      transaction,
-      0
-    );
+const countInfo =
+readShortVec(
+transaction,
+0
+);
 
-  const signatureCount =
-    countInfo.value;
+const signatureCount =
+countInfo.value;
 
-  const offset =
-    countInfo.offset;
+const offset =
+countInfo.offset;
 
-  if (
-    signatureCount < 1
-  ) {
-    throw new Error(
-      "Transaction contains no signatures."
-    );
-  }
+if (
+signatureCount < 1
+) {
+throw new Error(
+"Transaction contains no signatures."
+);
+}
 
-  if (
-    signature.length !== 64
-  ) {
-    throw new Error(
-      "Invalid Ed25519 signature length."
-    );
-  }
+if (
+signature.length !== 64
+) {
+throw new Error(
+"Invalid Ed25519 signature length."
+);
+}
 
-  const result =
-    new Uint8Array(
-      transaction
-    );
+const result =
+new Uint8Array(
+transaction
+);
 
-  result.set(
-    signature,
-    offset
-  );
+result.set(
+signature,
+offset
+);
 
-  return result;
+return result;
 }
 
 function readShortVec(
-  bytes,
-  offset
+bytes,
+offset
 ) {
-  let value = 0;
-  let size = 0;
-  let shift = 0;
+let value = 0;
+let size = 0;
+let shift = 0;
 
-  while (true) {
-    const byte =
-      bytes[
-        offset + size
-      ];
+while (true) {
+const byte =
+bytes[
+offset + size
+];
 
-    value |=
-      (byte & 0x7f) <<
-      shift;
+value |=
+  (byte & 0x7f) <<
+  shift;
 
-    size++;
+size++;
 
-    if (
-      (byte & 0x80) ===
-      0
-    ) {
-      break;
-    }
+if (
+  (byte & 0x80) ===
+  0
+) {
+  break;
+}
 
-    shift += 7;
+shift += 7;
 
-    if (size > 5) {
-      throw new Error(
-        "Invalid Solana shortvec."
-      );
-    }
-  }
+if (size > 5) {
+  throw new Error(
+    "Invalid Solana shortvec."
+  );
+}
 
-  return {
-    value,
+}
 
-    offset:
-      offset + size
-  };
+return {
+value,
+
+offset:
+  offset + size
+
+};
 }
 
 // ===============================
@@ -1738,45 +1776,45 @@ function readShortVec(
 // ===============================
 
 function base64ToBytes(
-  value
+value
 ) {
-  const binary =
-    atob(value);
+const binary =
+atob(value);
 
-  const bytes =
-    new Uint8Array(
-      binary.length
-    );
+const bytes =
+new Uint8Array(
+binary.length
+);
 
-  for (
-    let i = 0;
-    i < binary.length;
-    i++
-  ) {
-    bytes[i] =
-      binary.charCodeAt(i);
-  }
+for (
+let i = 0;
+i < binary.length;
+i++
+) {
+bytes[i] =
+binary.charCodeAt(i);
+}
 
-  return bytes;
+return bytes;
 }
 
 function bytesToBase64(
-  bytes
+bytes
 ) {
-  let binary = "";
+let binary = "";
 
-  for (
-    const byte of bytes
-  ) {
-    binary +=
-      String.fromCharCode(
-        byte
-      );
-  }
+for (
+const byte of bytes
+) {
+binary +=
+String.fromCharCode(
+byte
+);
+}
 
-  return btoa(
-    binary
-  );
+return btoa(
+binary
+);
 }
 
 // ===============================
@@ -1784,64 +1822,67 @@ function bytesToBase64(
 // ===============================
 
 function base58Decode(
-  value
+value
 ) {
-  const alphabet =
-    "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const alphabet =
+"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-  let num = 0n;
+let num = 0n;
 
-  for (
-    const char of value
-  ) {
-    const index =
-      alphabet.indexOf(
-        char
-      );
+for (
+const char of value
+) {
+const index =
+alphabet.indexOf(
+char
+);
 
-    if (index < 0) {
-      throw new Error(
-        "Invalid base58 private key."
-      );
-    }
+if (index < 0) {
+  throw new Error(
+    "Invalid base58 private key."
+  );
+}
 
-    num =
-      num * 58n +
-      BigInt(index);
-  }
+num =
+  num * 58n +
+  BigInt(index);
 
-  const bytes = [];
+}
 
-  while (num > 0n) {
-    bytes.push(
-      Number(
-        num & 255n
-      )
-    );
+const bytes = [];
 
-    num >>= 8n;
-  }
+while (num > 0n) {
+bytes.push(
+Number(
+num & 255n
+)
+);
 
-  bytes.reverse();
+num >>= 8n;
 
-  let leadingZeros = 0;
+}
 
-  for (
-    let i = 0;
-    i < value.length &&
-    value[i] === "1";
-    i++
-  ) {
-    leadingZeros++;
-  }
+bytes.reverse();
 
-  return new Uint8Array([
-    ...new Array(
-      leadingZeros
-    ).fill(0),
+let leadingZeros = 0;
 
-    ...bytes
-  ]);
+for (
+let i = 0;
+i < value.length &&
+value[i] === "1";
+i++
+) {
+leadingZeros++;
+}
+
+return new Uint8Array([
+...new Array(
+leadingZeros
+).fill(0),
+
+...bytes
+
+]);
 }
 
 // ===============================
@@ -1849,130 +1890,131 @@ function base58Decode(
 // ===============================
 
 async function getPositions(
-  env
+env
 ) {
-  const positions =
-    await env.BOT_KV.get(
-      "positions",
-      "json"
-    );
+const positions =
+await env.BOT_KV.get(
+"positions",
+"json"
+);
 
-  if (
-    Array.isArray(
-      positions
-    )
-  ) {
-    return positions;
-  }
+if (
+Array.isArray(
+positions
+)
+) {
+return positions;
+}
 
-  // --------------------------------
-  // MIGRATE OLD SINGLE POSITION
-  // --------------------------------
+// --------------------------------
+// MIGRATE OLD SINGLE POSITION
+// --------------------------------
 
-  const oldPosition =
-    await env.BOT_KV.get(
-      "position",
-      "json"
-    );
+const oldPosition =
+await env.BOT_KV.get(
+"position",
+"json"
+);
 
-  if (
-    oldPosition
-  ) {
-    const converted = {
-      mint:
-        oldPosition.mint ||
-        oldPosition.tokenMint,
+if (
+oldPosition
+) {
+const converted = {
+mint:
+oldPosition.mint ||
+oldPosition.tokenMint,
 
-      symbol:
-        oldPosition.symbol ||
-        oldPosition.tokenSymbol ||
-        "UNKNOWN",
+  symbol:
+    oldPosition.symbol ||
+    oldPosition.tokenSymbol ||
+    "UNKNOWN",
 
-      name:
-        oldPosition.name ||
-        oldPosition.tokenName ||
-        oldPosition.tokenSymbol ||
-        "UNKNOWN",
+  name:
+    oldPosition.name ||
+    oldPosition.tokenName ||
+    oldPosition.tokenSymbol ||
+    "UNKNOWN",
 
-      entrySol:
-        Number(
-          oldPosition.entrySol ||
-          0
-        ),
+  entrySol:
+    Number(
+      oldPosition.entrySol ||
+      0
+    ),
 
-      entryUsd:
-        Number(
-          oldPosition.entryUsd ||
-          0
-        ),
+  entryUsd:
+    Number(
+      oldPosition.entryUsd ||
+      0
+    ),
 
-      buySignature:
-        oldPosition.buySignature ||
-        "",
+  buySignature:
+    oldPosition.buySignature ||
+    "",
 
-      createdAt:
-        oldPosition.createdAt ||
-        oldPosition.openedAt ||
-        Date.now(),
+  createdAt:
+    oldPosition.createdAt ||
+    oldPosition.openedAt ||
+    Date.now(),
 
-      selectionScore:
-        oldPosition.selectionScore ||
-        0,
+  selectionScore:
+    oldPosition.selectionScore ||
+    0,
 
-      selectionReason:
-        oldPosition.selectionReason ||
-        "Migrated existing position"
-    };
+  selectionReason:
+    oldPosition.selectionReason ||
+    "Migrated existing position"
+};
 
-    await savePositions(
-      env,
-      [converted]
-    );
+await savePositions(
+  env,
+  [converted]
+);
 
-    await env.BOT_KV.delete(
-      "position"
-    );
+await env.BOT_KV.delete(
+  "position"
+);
 
-    return [
-      converted
-    ];
-  }
+return [
+  converted
+];
 
-  return [];
+}
+
+return [];
 }
 
 async function savePositions(
-  env,
-  positions
+env,
+positions
 ) {
-  await env.BOT_KV.put(
-    "positions",
-    JSON.stringify(
-      positions
-    )
-  );
+await env.BOT_KV.put(
+"positions",
+JSON.stringify(
+positions
+)
+);
 }
 
 async function removePosition(
-  env,
-  mint
+env,
+mint
 ) {
-  const positions =
-    await getPositions(
-      env
-    );
+const positions =
+await getPositions(
+env
+);
 
-  const remaining =
-    positions.filter(
-      position =>
-        position.mint !==
-        mint
-    );
+const remaining =
+positions.filter(
+position =>
+position.mint !==
+mint
+);
 
-  await savePositions(
-    env,
-    remaining
-  );
+await savePositions(
+env,
+remaining
+);
 }
 
 // ===============================
@@ -1980,65 +2022,65 @@ async function removePosition(
 // ===============================
 
 async function setCooldown(
-  env,
-  timestamp
+env,
+timestamp
 ) {
-  const seconds =
-    Math.max(
-      1,
-      Math.ceil(
-        (
-          timestamp -
-          Date.now()
-        ) / 1000
-      )
-    );
+const seconds =
+Math.max(
+1,
+Math.ceil(
+(
+timestamp -
+Date.now()
+) / 1000
+)
+);
 
-  await env.BOT_KV.put(
-    "rate_limit_cooldown",
-    String(timestamp),
-    {
-      expirationTtl:
-        seconds
-    }
-  );
+await env.BOT_KV.put(
+"rate_limit_cooldown",
+String(timestamp),
+{
+expirationTtl:
+seconds
+}
+);
 }
 
 async function getCooldown(
-  env
+env
 ) {
-  const value =
-    await env.BOT_KV.get(
-      "rate_limit_cooldown"
-    );
+const value =
+await env.BOT_KV.get(
+"rate_limit_cooldown"
+);
 
-  return Number(
-    value || 0
-  );
+return Number(
+value || 0
+);
 }
 
 async function setLastScan(
-  env
+env
 ) {
-  await env.BOT_KV.put(
-    "last_scan",
-    String(
-      Date.now()
-    )
-  );
+await env.BOT_KV.put(
+"last_scan",
+String(
+Date.now()
+)
+);
 }
 
 async function getLastScan(
-  env
+env
 ) {
-  const value =
-    await env.BOT_KV.get(
-      "last_scan"
-    );
+const value =
+await env.BOT_KV.get(
+"last_scan"
+);
 
-  return Number(
-    value || 0
-  );
+return Number(
+value || 0
+);
 }
 
 // ===============================
@@ -2046,97 +2088,97 @@ async function getLastScan(
 // ===============================
 
 async function getStatus(
-  env
+env
 ) {
-  try {
-    const wallet =
-      await getWalletInfo(
-        env
-      );
+try {
+const wallet =
+await getWalletInfo(
+env
+);
 
-    const solPriceUsd =
-      await getUsdPrice(
-        env,
-        SOL_MINT
-      );
+const solPriceUsd =
+  await getUsdPrice(
+    env,
+    SOL_MINT
+  );
 
-    const walletValueUsd =
-      wallet.solBalance *
-      solPriceUsd;
+const walletValueUsd =
+  wallet.solBalance *
+  solPriceUsd;
 
-    const maxTradeUsd =
-      walletValueUsd >=
-      BALANCE_THRESHOLD_USD
-        ? LARGE_TRADE_CAP_USD
-        : SMALL_TRADE_CAP_USD;
+const maxTradeUsd =
+  walletValueUsd >=
+  BALANCE_THRESHOLD_USD
+    ? LARGE_TRADE_CAP_USD
+    : SMALL_TRADE_CAP_USD;
 
-    const positions =
-      await getPositions(
-        env
-      );
+const positions =
+  await getPositions(
+    env
+  );
 
-    return json({
-      ok: true,
+return json({
+  ok: true,
 
-      bot:
-        "memebott",
+  bot:
+    "memebott",
 
-      live_trading:
-        LIVE_TRADING,
+  live_trading:
+    LIVE_TRADING,
 
-      wallet:
-        WALLET_ADDRESS,
+  wallet:
+    WALLET_ADDRESS,
 
-      sol_balance:
-        wallet.solBalance,
+  sol_balance:
+    wallet.solBalance,
 
-      sol_price_usd:
-        solPriceUsd,
+  sol_price_usd:
+    solPriceUsd,
 
-      wallet_value_usd:
-        Number(
-          walletValueUsd.toFixed(4)
-        ),
+  wallet_value_usd:
+    Number(
+      walletValueUsd.toFixed(4)
+    ),
 
-      max_trade_usd:
-        maxTradeUsd,
+  max_trade_usd:
+    maxTradeUsd,
 
-      balance_threshold_usd:
-        BALANCE_THRESHOLD_USD,
+  balance_threshold_usd:
+    BALANCE_THRESHOLD_USD,
 
-      small_trade_cap_usd:
-        SMALL_TRADE_CAP_USD,
+  small_trade_cap_usd:
+    SMALL_TRADE_CAP_USD,
 
-      large_trade_cap_usd:
-        LARGE_TRADE_CAP_USD,
+  large_trade_cap_usd:
+    LARGE_TRADE_CAP_USD,
 
-      min_sol_reserve:
-        MIN_SOL_RESERVE,
+  min_sol_reserve:
+    MIN_SOL_RESERVE,
 
-      max_positions:
-        MAX_POSITIONS,
+  max_positions:
+    MAX_POSITIONS,
 
-      open_positions:
-        positions.length,
+  open_positions:
+    positions.length,
 
-      profit_target_percent:
-        PROFIT_TARGET * 100,
+  profit_target_percent:
+    PROFIT_TARGET * 100,
 
-      stop_loss_percent:
-        STOP_LOSS * 100,
+  stop_loss_percent:
+    STOP_LOSS * 100,
 
-      positions:
-        positions
-    });
+  positions:
+    positions
+});
 
-  } catch (error) {
-    return json({
-      ok: false,
-      error:
-        error?.message ||
-        String(error)
-    }, 500);
-  }
+} catch (error) {
+return json({
+ok: false,
+error:
+error?.message ||
+String(error)
+}, 500);
+}
 }
 
 // ===============================
@@ -2144,17 +2186,17 @@ async function getStatus(
 // ===============================
 
 async function responseToObject(
-  response
+response
 ) {
-  try {
-    return await response.json();
-  } catch (_) {
-    return {
-      ok: false,
-      error:
-        "Could not read response."
-    };
-  }
+try {
+return await response.json();
+} catch (_) {
+return {
+ok: false,
+error:
+"Could not read response."
+};
+}
 }
 
 // ===============================
@@ -2162,30 +2204,30 @@ async function responseToObject(
 // ===============================
 
 function validateSecrets(
-  env
+env
 ) {
-  const required = [
-    "HELIUS_API_KEY",
-    "JUPITER_API_KEY",
-    "WALLET_PRIVATE_KEY",
-    "BOT_KV"
-  ];
+const required = [
+"HELIUS_API_KEY",
+"JUPITER_API_KEY",
+"WALLET_PRIVATE_KEY",
+"BOT_KV"
+];
 
-  for (
-    const name of required
-  ) {
-    if (!env[name]) {
-      return {
-        ok: false,
-        error:
-          `Missing ${name}`
-      };
-    }
-  }
+for (
+const name of required
+) {
+if (!env[name]) {
+return {
+ok: false,
+error:
+"Missing ${name}"
+};
+}
+}
 
-  return {
-    ok: true
-  };
+return {
+ok: true
+};
 }
 
 // ===============================
@@ -2193,47 +2235,48 @@ function validateSecrets(
 // ===============================
 
 function isRateLimitError(
-  error
+error
 ) {
-  return (
-    error?.status === 429 ||
-    String(
-      error?.message || ""
-    )
-      .toLowerCase()
-      .includes(
-        "rate limit"
-      )
-  );
+return (
+error?.status === 429 ||
+String(
+error?.message || ""
+)
+.toLowerCase()
+.includes(
+"rate limit"
+)
+);
 }
 
 function sleep(ms) {
-  return new Promise(
-    resolve =>
-      setTimeout(
-        resolve,
-        ms
-      )
-  );
+return new Promise(
+resolve =>
+setTimeout(
+resolve,
+ms
+)
+);
 }
 
 function json(
-  data,
-  status = 200
+data,
+status = 200
 ) {
-  return new Response(
-    JSON.stringify(
-      data,
-      null,
-      2
-    ),
-    {
-      status,
+return new Response(
+JSON.stringify(
+data,
+null,
+2
+),
+{
+status,
 
-      headers: {
-        "Content-Type":
-          "application/json"
-      }
-    }
-  );
+  headers: {
+    "Content-Type":
+      "application/json"
+  }
 }
+
+);
+  }
