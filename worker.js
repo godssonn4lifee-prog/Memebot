@@ -6,12 +6,30 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 const LIVE_TRADING = true;
 
-const STOP_LOSS = -0.01;
-const TRAILING_STOP = 0.03;
+/*
+  PROFIT / LOSS SETTINGS
 
-const SMALL_TRADE_CAP_USD = 2;
-const LARGE_TRADE_CAP_USD = 5;
-const BALANCE_THRESHOLD_USD = 20;
+  Take profit:
+  Sell when position reaches +1%.
+
+  Stop loss:
+  Sell when position reaches -1%.
+*/
+const TAKE_PROFIT = 0.01;
+const STOP_LOSS = -0.01;
+
+/*
+  TRADE SIZE
+
+  Under $100 wallet:
+  Maximum $5 per buy.
+
+  $100+ wallet:
+  Maximum $20 per buy.
+*/
+const SMALL_TRADE_CAP_USD = 5;
+const LARGE_TRADE_CAP_USD = 20;
+const BALANCE_THRESHOLD_USD = 100;
 
 const MIN_SOL_RESERVE = 0.01;
 
@@ -52,6 +70,8 @@ export default {
           ok: true,
           bot: BOT_NAME,
           live_trading: LIVE_TRADING,
+          take_profit_percent: TAKE_PROFIT * 100,
+          stop_loss_percent: STOP_LOSS * 100,
           message: "memebott is running"
         });
       }
@@ -104,14 +124,21 @@ async function runBot(env, source) {
     source,
     live_trading: LIVE_TRADING,
     wallet: WALLET_ADDRESS,
+
     sol_balance: null,
     sol_price_usd: null,
     wallet_value_usd: null,
     max_trade_usd: null,
+
     open_positions: 0,
     max_positions: MAX_POSITIONS,
-    stop_loss_percent: STOP_LOSS * 100,
-    trailing_stop_percent: TRAILING_STOP * 100,
+
+    take_profit_percent:
+      TAKE_PROFIT * 100,
+
+    stop_loss_percent:
+      STOP_LOSS * 100,
+
     actions: [],
     positions: []
   };
@@ -119,34 +146,54 @@ async function runBot(env, source) {
   try {
     validateEnv(env);
 
-    const positions = await getPositions(env);
+    const positions =
+      await getPositions(env);
 
-    result.open_positions = positions.length;
-    result.positions = positions;
+    result.open_positions =
+      positions.length;
+
+    result.positions =
+      positions;
 
     /*
       Wallet balance.
     */
-    const solBalance = await getSolBalance(env);
+    const solBalance =
+      await getSolBalance(env);
 
     /*
       SOL price.
     */
-    const solPrice = await getSolPrice();
+    const solPrice =
+      await getSolPrice();
 
     const walletValueUsd =
       solBalance * solPrice;
 
+    /*
+      Trade size:
+      Under $100 = $5 max.
+      $100+ = $20 max.
+    */
     const maxTradeUsd =
-      walletValueUsd >= BALANCE_THRESHOLD_USD
+      walletValueUsd >=
+      BALANCE_THRESHOLD_USD
         ? LARGE_TRADE_CAP_USD
         : SMALL_TRADE_CAP_USD;
 
-    result.sol_balance = solBalance;
-    result.sol_price_usd = solPrice;
+    result.sol_balance =
+      solBalance;
+
+    result.sol_price_usd =
+      solPrice;
+
     result.wallet_value_usd =
-      Number(walletValueUsd.toFixed(4));
-    result.max_trade_usd = maxTradeUsd;
+      Number(
+        walletValueUsd.toFixed(4)
+      );
+
+    result.max_trade_usd =
+      maxTradeUsd;
 
     /*
       Manage existing positions.
@@ -159,12 +206,14 @@ async function runBot(env, source) {
         );
 
       if (management.length > 0) {
-        result.actions.push(...management);
+        result.actions.push(
+          ...management
+        );
       }
     }
 
     /*
-      Reload positions.
+      Reload positions after management.
     */
     const currentPositions =
       await getPositions(env);
@@ -213,7 +262,8 @@ async function runBot(env, source) {
       Available SOL after reserve.
     */
     const availableSol =
-      solBalance - MIN_SOL_RESERVE;
+      solBalance -
+      MIN_SOL_RESERVE;
 
     if (availableSol <= 0) {
       result.actions.push({
@@ -262,7 +312,10 @@ async function runBot(env, source) {
     result.actions.push({
       action: "ERROR",
       error:
-        String(error?.message || error)
+        String(
+          error?.message ||
+          error
+        )
     });
 
     return result;
@@ -366,6 +419,10 @@ async function findAndBuy(
 
         /*
           Trade size.
+
+          maxTradeUsd is:
+          $5 under $100 wallet
+          $20 at/above $100 wallet
         */
         const tradeUsd =
           Math.min(
@@ -464,7 +521,7 @@ async function findAndBuy(
         }
 
         /*
-          LIVE TRADING.
+          TEST MODE.
         */
         if (!LIVE_TRADING) {
           return {
@@ -516,13 +573,43 @@ async function findAndBuy(
 
         /*
           Get entry price.
-
-          If unavailable, we still retain the actual
-          successful transaction rather than pretending
-          the buy failed.
         */
-        const entryPrice =
+        let entryPrice =
           await getTokenPrice(mint);
+
+        /*
+          If Jupiter price lookup is temporarily
+          unavailable, calculate an approximate
+          entry price from the actual trade size
+          and expected token output.
+
+          This prevents new successful buys
+          from being saved with a null entry price.
+        */
+        if (
+          !Number.isFinite(
+            entryPrice
+          ) ||
+          entryPrice <= 0
+        ) {
+          const tokenAmount =
+            expectedOutput /
+            Math.pow(
+              10,
+              decimals
+            );
+
+          if (
+            Number.isFinite(
+              tokenAmount
+            ) &&
+            tokenAmount > 0
+          ) {
+            entryPrice =
+              tradeUsd /
+              tokenAmount;
+          }
+        }
 
         const position = {
           mint,
@@ -540,14 +627,14 @@ async function findAndBuy(
           entry_price_usd:
             Number.isFinite(
               entryPrice
-            )
+            ) &&
+            entryPrice > 0
               ? entryPrice
               : null,
 
           /*
-            Start highest profit at 0%.
-            The position management code will update
-            this whenever a new high is reached.
+            Profit tracking retained for
+            position information.
           */
           highest_profit_percent: 0,
 
@@ -646,9 +733,6 @@ async function findAndBuy(
 ========================================================= */
 
 async function getTrendingTokens() {
-  /*
-    ONE endpoint only.
-  */
   const response =
     await fetch(
       `${TOKENS_API}/toptrending/24h`,
@@ -759,10 +843,6 @@ async function getTokenPrice(mint) {
       return null;
     }
 
-    /*
-      Jupiter Price API can return the mint
-      directly OR under data.
-    */
     const item =
       data?.data?.[mint] ||
       data?.[mint] ||
@@ -831,26 +911,6 @@ async function getSolPrice() {
     );
   }
 
-  /*
-    IMPORTANT:
-    Support both Jupiter response forms:
-
-    {
-      "So111...": {
-        "usdPrice": ...
-      }
-    }
-
-    and:
-
-    {
-      "data": {
-        "So111...": {
-          "usdPrice": ...
-        }
-      }
-    }
-  */
   const item =
     data?.data?.[SOL_MINT] ||
     data?.[SOL_MINT] ||
@@ -888,7 +948,7 @@ async function getSolPrice() {
 
 
 /* =========================================================
-   JUPITER ORDER
+   JUPITER BUY ORDER
 ========================================================= */
 
 async function getOrder(
@@ -1119,7 +1179,7 @@ async function managePositions(
   const actions = [];
 
   /*
-    Do not make unnecessary price calls.
+    Check every open position.
   */
   for (const position of positions) {
     try {
@@ -1132,6 +1192,15 @@ async function managePositions(
           position.mint
         );
 
+      /*
+        Entry price is required to calculate
+        profit/loss.
+
+        Existing positions that already have
+        a null entry price will remain protected
+        from automatic selling rather than using
+        an invented entry price.
+      */
       if (
         !Number.isFinite(
           currentPrice
@@ -1145,8 +1214,11 @@ async function managePositions(
           action: "HOLD",
           token:
             position.mint,
+          symbol:
+            position.symbol ||
+            null,
           reason:
-            "Current price unavailable"
+            "Entry price unavailable; position not automatically sold"
         });
 
         continue;
@@ -1161,10 +1233,6 @@ async function managePositions(
 
       /*
         Highest profit tracking.
-
-        Older positions may not have this field.
-        In that case, start it at the current
-        profit if the position is profitable.
       */
       const previousHighest =
         Number.isFinite(
@@ -1204,7 +1272,8 @@ async function managePositions(
       }
 
       /*
-        Hard stop-loss remains -1%.
+        HARD STOP LOSS
+        Sell at -1% or worse.
       */
       if (
         change <=
@@ -1222,61 +1291,65 @@ async function managePositions(
       }
 
       /*
-        Once the position has reached profit,
-        sell if it falls 3 percentage points
-        below its highest profit.
+        TAKE PROFIT
+        Sell at +1% or better.
+
+        This replaces the old 3%
+        trailing-stop behavior.
       */
       if (
-        highestProfit > 0 &&
-        change <=
-          highestProfit -
-          TRAILING_STOP
+        change >=
+        TAKE_PROFIT
       ) {
         actions.push(
           await sellPosition(
             env,
             position,
-            "TRAILING_STOP"
+            "TAKE_PROFIT"
           )
         );
 
         continue;
       }
 
+      /*
+        Still holding.
+      */
       actions.push({
         action: "HOLD",
+
         token:
           position.mint,
+
         symbol:
           position.symbol ||
           null,
+
         current_price_usd:
           currentPrice,
+
         entry_price_usd:
           position.entry_price_usd,
+
         change_percent:
           Number(
             (
               change * 100
             ).toFixed(3)
           ),
+
         highest_profit_percent:
           Number(
             (
               highestProfit * 100
             ).toFixed(3)
           ),
-        trailing_sell_percent:
-          highestProfit > 0
-            ? Number(
-                (
-                  (
-                    highestProfit -
-                    TRAILING_STOP
-                  ) * 100
-                ).toFixed(3)
-              )
-            : null
+
+        take_profit_percent:
+          TAKE_PROFIT * 100,
+
+        stop_loss_percent:
+          STOP_LOSS * 100
       });
 
     } catch (error) {
@@ -1326,8 +1399,10 @@ async function sellPosition(
       return {
         action:
           "SELL_CLEANUP",
+
         token:
           position.mint,
+
         reason:
           "No token balance found"
       };
@@ -1342,8 +1417,10 @@ async function sellPosition(
     if (!order) {
       return {
         action: "ERROR",
+
         token:
           position.mint,
+
         error:
           "No Jupiter sell route"
       };
@@ -1353,8 +1430,10 @@ async function sellPosition(
       return {
         action:
           "TEST_SELL",
+
         token:
           position.mint,
+
         reason
       };
     }
@@ -1368,8 +1447,10 @@ async function sellPosition(
     if (!execution.success) {
       return {
         action: "ERROR",
+
         token:
           position.mint,
+
         error:
           `SELL EXECUTION FAILED: ${
             execution.error ||
@@ -1378,6 +1459,10 @@ async function sellPosition(
       };
     }
 
+    /*
+      Only remove the position after
+      successful execution.
+    */
     await removePosition(
       env,
       position.mint
@@ -1387,12 +1472,16 @@ async function sellPosition(
 
     return {
       action: "SELL",
+
       token:
         position.mint,
+
       symbol:
         position.symbol ||
         null,
+
       reason,
+
       signature:
         execution.signature ||
         null
@@ -1401,9 +1490,11 @@ async function sellPosition(
   } catch (error) {
     return {
       action: "ERROR",
+
       token:
         position?.mint ||
         null,
+
       error:
         `SELL ERROR: ${
           error?.message ||
@@ -1549,49 +1640,70 @@ async function testBot(env) {
 
     return {
       ok: true,
+
       bot: BOT_NAME,
+
       live_trading:
         LIVE_TRADING,
+
       wallet:
         WALLET_ADDRESS,
+
       sol_balance:
         solBalance,
+
       sol_price_usd:
         solPrice,
+
       wallet_value_usd:
         Number(
           walletValueUsd.toFixed(4)
         ),
+
       max_trade_usd:
         maxTradeUsd,
+
       balance_threshold_usd:
         BALANCE_THRESHOLD_USD,
+
       small_trade_cap_usd:
         SMALL_TRADE_CAP_USD,
+
       large_trade_cap_usd:
         LARGE_TRADE_CAP_USD,
+
       min_sol_reserve:
         MIN_SOL_RESERVE,
+
       max_positions:
         MAX_POSITIONS,
+
       open_positions:
         positions.length,
+
+      take_profit_percent:
+        TAKE_PROFIT * 100,
+
       stop_loss_percent:
         STOP_LOSS * 100,
-      trailing_stop_percent:
-        TRAILING_STOP * 100,
+
       cooldown_active:
         cooldown.active,
+
       positions,
+
       candidate_limit:
         MAX_CANDIDATES,
+
       trending_candidates:
         candidates.slice(
           0,
           MAX_CANDIDATES
         ),
+
       trending_error:
         trendingError,
+
       message:
         "TEST NEVER BUYS OR SELLS"
     };
@@ -1599,7 +1711,9 @@ async function testBot(env) {
   } catch (error) {
     return {
       ok: false,
+
       bot: BOT_NAME,
+
       error:
         String(
           error?.message ||
@@ -1642,46 +1756,65 @@ async function status(env) {
 
     return {
       ok: true,
+
       bot: BOT_NAME,
+
       live_trading:
         LIVE_TRADING,
+
       wallet:
         WALLET_ADDRESS,
+
       sol_balance:
         solBalance,
+
       sol_price_usd:
         solPrice,
+
       wallet_value_usd:
         Number(
           walletValueUsd.toFixed(4)
         ),
+
       max_trade_usd:
         maxTradeUsd,
+
       balance_threshold_usd:
         BALANCE_THRESHOLD_USD,
+
       small_trade_cap_usd:
         SMALL_TRADE_CAP_USD,
+
       large_trade_cap_usd:
         LARGE_TRADE_CAP_USD,
+
       min_sol_reserve:
         MIN_SOL_RESERVE,
+
       max_positions:
         MAX_POSITIONS,
+
       open_positions:
         positions.length,
+
+      take_profit_percent:
+        TAKE_PROFIT * 100,
+
       stop_loss_percent:
         STOP_LOSS * 100,
-      trailing_stop_percent:
-        TRAILING_STOP * 100,
+
       cooldown_active:
         cooldown.active,
+
       positions
     };
 
   } catch (error) {
     return {
       ok: false,
+
       bot: BOT_NAME,
+
       error:
         String(
           error?.message ||
@@ -1730,9 +1863,11 @@ async function getTokenBalance(
       "getTokenAccountsByOwner",
       [
         WALLET_ADDRESS,
+
         {
           mint
         },
+
         {
           encoding:
             "jsonParsed"
@@ -1823,10 +1958,12 @@ async function heliusRpc(
       url,
       {
         method: "POST",
+
         headers: {
           "content-type":
             "application/json"
         },
+
         body:
           JSON.stringify({
             jsonrpc: "2.0",
@@ -2441,12 +2578,14 @@ function json(
     ),
     {
       status,
+
       headers: {
         "content-type":
           "application/json; charset=utf-8",
+
         "cache-control":
           "no-store"
       }
     }
   );
-          }
+    }
