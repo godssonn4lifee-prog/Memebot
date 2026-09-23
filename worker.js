@@ -10,12 +10,12 @@ const LIVE_TRADING = true;
   PROFIT / LOSS SETTINGS
 
   Take profit:
-  Sell when position reaches +1%.
+  Sell when position reaches +1.5%.
 
   Stop loss:
   Sell when position reaches -1%.
 */
-const TAKE_PROFIT = 0.01;
+const TAKE_PROFIT = 0.015;
 const STOP_LOSS = -0.01;
 
 /*
@@ -50,9 +50,6 @@ const SWAP_API = `${JUPITER_API}/swap/v2`;
 
 const HELIUS_RPC_BASE = "https://mainnet.helius-rpc.com";
 
-/*
-  Keep candidate discovery deliberately small.
-*/
 const MAX_CANDIDATES = 3;
 
 
@@ -155,26 +152,15 @@ async function runBot(env, source) {
     result.positions =
       positions;
 
-    /*
-      Wallet balance.
-    */
     const solBalance =
       await getSolBalance(env);
 
-    /*
-      SOL price.
-    */
     const solPrice =
       await getSolPrice();
 
     const walletValueUsd =
       solBalance * solPrice;
 
-    /*
-      Trade size:
-      Under $100 = $5 max.
-      $100+ = $20 max.
-    */
     const maxTradeUsd =
       walletValueUsd >=
       BALANCE_THRESHOLD_USD
@@ -224,9 +210,6 @@ async function runBot(env, source) {
     result.positions =
       currentPositions;
 
-    /*
-      Maximum positions.
-    */
     if (
       currentPositions.length >=
       MAX_POSITIONS
@@ -240,9 +223,6 @@ async function runBot(env, source) {
       return result;
     }
 
-    /*
-      Cooldown.
-    */
     const cooldown =
       await getCooldown(env);
 
@@ -258,9 +238,6 @@ async function runBot(env, source) {
       return result;
     }
 
-    /*
-      Available SOL after reserve.
-    */
     const availableSol =
       solBalance -
       MIN_SOL_RESERVE;
@@ -277,9 +254,6 @@ async function runBot(env, source) {
       return result;
     }
 
-    /*
-      Find and buy.
-    */
     const buyResult =
       await findAndBuy(
         env,
@@ -336,9 +310,6 @@ async function findAndBuy(
   positions
 ) {
   try {
-    /*
-      ONE trending request.
-    */
     const candidates =
       await getTrendingTokens();
 
@@ -352,18 +323,12 @@ async function findAndBuy(
       };
     }
 
-    /*
-      Never inspect more than 3 candidates.
-    */
     const limitedCandidates =
       candidates.slice(
         0,
         MAX_CANDIDATES
       );
 
-    /*
-      Tokens already held.
-    */
     const heldMints =
       new Set(
         positions.map(
@@ -392,17 +357,11 @@ async function findAndBuy(
       };
     }
 
-    /*
-      Try a maximum of 3 candidates.
-    */
     for (const candidate of filtered) {
       const mint =
         candidate.address;
 
       try {
-        /*
-          Token decimals.
-        */
         const decimals =
           await getTokenDecimals(
             env,
@@ -417,13 +376,6 @@ async function findAndBuy(
           continue;
         }
 
-        /*
-          Trade size.
-
-          maxTradeUsd is:
-          $5 under $100 wallet
-          $20 at/above $100 wallet
-        */
         const tradeUsd =
           Math.min(
             maxTradeUsd,
@@ -434,15 +386,9 @@ async function findAndBuy(
           continue;
         }
 
-        /*
-          USD -> SOL.
-        */
         const tradeSol =
           tradeUsd / solPrice;
 
-        /*
-          Preserve reserve.
-        */
         const maximumSpendableSol =
           Math.max(
             0,
@@ -460,9 +406,6 @@ async function findAndBuy(
           continue;
         }
 
-        /*
-          SOL -> lamports.
-        */
         const lamports =
           Math.floor(
             actualTradeSol *
@@ -473,9 +416,6 @@ async function findAndBuy(
           continue;
         }
 
-        /*
-          Jupiter buy order.
-        */
         const order =
           await getOrder(
             mint,
@@ -504,9 +444,6 @@ async function findAndBuy(
           continue;
         }
 
-        /*
-          Immediate loss filter.
-        */
         const priceImpact =
           Number(
             order.priceImpactPct || 0
@@ -520,9 +457,6 @@ async function findAndBuy(
           continue;
         }
 
-        /*
-          TEST MODE.
-        */
         if (!LIVE_TRADING) {
           return {
             action: {
@@ -545,9 +479,6 @@ async function findAndBuy(
           };
         }
 
-        /*
-          ACTUAL JUPITER EXECUTION.
-        */
         const execution =
           await executeOrder(
             env,
@@ -578,13 +509,8 @@ async function findAndBuy(
           await getTokenPrice(mint);
 
         /*
-          If Jupiter price lookup is temporarily
-          unavailable, calculate an approximate
-          entry price from the actual trade size
-          and expected token output.
-
-          This prevents new successful buys
-          from being saved with a null entry price.
+          Fallback entry price if Jupiter price
+          lookup is temporarily unavailable.
         */
         if (
           !Number.isFinite(
@@ -632,10 +558,6 @@ async function findAndBuy(
               ? entryPrice
               : null,
 
-          /*
-            Profit tracking retained for
-            position information.
-          */
           highest_profit_percent: 0,
 
           amount_raw:
@@ -1178,13 +1100,72 @@ async function managePositions(
 ) {
   const actions = [];
 
-  /*
-    Check every open position.
-  */
   for (const position of positions) {
     try {
       if (!position?.mint) {
         continue;
+      }
+
+      /*
+        FIX FOR EXISTING POSITIONS WITH NULL
+        ENTRY PRICE.
+
+        We do not delete the position and we do
+        not clear BOT_KV.
+
+        If the original position has a stored
+        trade_usd amount and token amount, use
+        those values to reconstruct an approximate
+        entry price.
+
+        This is only used when entry_price_usd
+        is missing.
+      */
+      if (
+        !Number.isFinite(
+          Number(position.entry_price_usd)
+        ) ||
+        Number(position.entry_price_usd) <= 0
+      ) {
+        const storedTradeUsd =
+          Number(
+            position.trade_usd
+          );
+
+        const storedAmount =
+          Number(
+            position.amount
+          );
+
+        if (
+          Number.isFinite(
+            storedTradeUsd
+          ) &&
+          storedTradeUsd > 0 &&
+          Number.isFinite(
+            storedAmount
+          ) &&
+          storedAmount > 0
+        ) {
+          const recoveredEntryPrice =
+            storedTradeUsd /
+            storedAmount;
+
+          if (
+            Number.isFinite(
+              recoveredEntryPrice
+            ) &&
+            recoveredEntryPrice > 0
+          ) {
+            position.entry_price_usd =
+              recoveredEntryPrice;
+
+            await savePosition(
+              env,
+              position
+            );
+          }
+        }
       }
 
       const currentPrice =
@@ -1196,10 +1177,8 @@ async function managePositions(
         Entry price is required to calculate
         profit/loss.
 
-        Existing positions that already have
-        a null entry price will remain protected
-        from automatic selling rather than using
-        an invented entry price.
+        If it still cannot be recovered,
+        hold the position rather than guessing.
       */
       if (
         !Number.isFinite(
@@ -1231,9 +1210,6 @@ async function managePositions(
         ) /
         position.entry_price_usd;
 
-      /*
-        Highest profit tracking.
-      */
       const previousHighest =
         Number.isFinite(
           Number(
@@ -1251,9 +1227,6 @@ async function managePositions(
           change
         );
 
-      /*
-        Save a new highest profit.
-      */
       if (
         highestProfit >
         previousHighest
@@ -1292,10 +1265,7 @@ async function managePositions(
 
       /*
         TAKE PROFIT
-        Sell at +1% or better.
-
-        This replaces the old 3%
-        trailing-stop behavior.
+        Sell at +1.5% or better.
       */
       if (
         change >=
@@ -1312,9 +1282,6 @@ async function managePositions(
         continue;
       }
 
-      /*
-        Still holding.
-      */
       actions.push({
         action: "HOLD",
 
@@ -1459,10 +1426,6 @@ async function sellPosition(
       };
     }
 
-    /*
-      Only remove the position after
-      successful execution.
-    */
     await removePosition(
       env,
       position.mint
@@ -2588,4 +2551,4 @@ function json(
       }
     }
   );
-    }
+      }
