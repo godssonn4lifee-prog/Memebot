@@ -14,2340 +14,1363 @@ const LIVE_TRADING = true;
   Hard stop: -2%
 
   Trailing profit:
-  - Activates at +3%
-  - Tracks the highest price reached
-  - Sells when price falls 1.25%
-    from that highest price
+  Activates: +3%
+  Distance: 1.25%
 */
-const STOP_LOSS = -0.02;
 
-const TRAILING_ACTIVATION = 0.03;
-const TRAILING_DISTANCE = 0.0125;
+const HARD_STOP_PCT = -0.02;
+const TRAILING_ACTIVATE_PCT = 0.03;
+const TRAILING_DISTANCE_PCT = 0.0125;
 
 /*
   TRADE SIZE
 
-  Under $100 wallet: $5 maximum
-  $100+ wallet:      $20 maximum
+  Wallet under $100:
+    $5 maximum trade
+
+  Wallet $100 or more:
+    $20 maximum trade
 */
-const SMALL_TRADE_CAP_USD = 5;
-const LARGE_TRADE_CAP_USD = 20;
-const BALANCE_THRESHOLD_USD = 100;
 
-const MIN_SOL_RESERVE = 0.01;
+const SMALL_WALLET_LIMIT_USD = 100;
+const SMALL_TRADE_USD = 5;
+const LARGE_TRADE_USD = 20;
 
+/*
+  SAFETY
+*/
+
+const SOL_RESERVE = 0.01;
 const MAX_POSITIONS = 10;
-
-const IMMEDIATE_LOSS_FILTER = 0.005;
 
 const SLIPPAGE_BPS = 50;
 
-const POSITION_KEY = "POSITIONS";
-const COOLDOWN_KEY = "TRADE_COOLDOWN";
 const COOLDOWN_SECONDS = 30;
-
-/*
-  Trending-token cache.
-*/
-const TRENDING_CACHE_KEY =
-  "JUPITER_TRENDING_CACHE";
-
-const TRENDING_CACHE_SECONDS = 120;
-
-const TRENDING_BACKOFF_KEY =
-  "JUPITER_TRENDING_BACKOFF";
-
-const TRENDING_BACKOFF_SECONDS = 120;
-
-const JUPITER_API =
-  "https://api.jup.ag";
-
-const PRICE_API =
-  `${JUPITER_API}/price/v3`;
-
-const TOKENS_API =
-  `${JUPITER_API}/tokens/v2`;
-
-const SWAP_API =
-  `${JUPITER_API}/swap/v2`;
-
-const HELIUS_RPC_BASE =
-  "https://mainnet.helius-rpc.com";
 
 const MAX_CANDIDATES = 3;
 
+const TRENDING_CACHE_SECONDS = 120;
+const TRENDING_BACKOFF_SECONDS = 120;
 
-/* =========================================================
-   ROUTES
-========================================================= */
+const IMMEDIATE_LOSS_FILTER = 0.005;
+
+/*
+  KV KEYS
+*/
+
+const POSITIONS_KEY = "POSITIONS";
+const COOLDOWN_KEY = "TRADE_COOLDOWN";
+const TRENDING_CACHE_KEY = "JUPITER_TRENDING_CACHE";
+const TRENDING_BACKOFF_KEY = "JUPITER_TRENDING_BACKOFF";
+
+/*
+  ENTRY POINT
+*/
 
 export default {
   async fetch(request, env) {
-    try {
-      const url = new URL(request.url);
+    const url = new URL(request.url);
 
+    try {
       if (url.pathname === "/") {
         return json({
           ok: true,
           bot: BOT_NAME,
-          live_trading: LIVE_TRADING,
-          trailing_activation_percent:
-            TRAILING_ACTIVATION * 100,
-          trailing_distance_percent:
-            TRAILING_DISTANCE * 100,
-          stop_loss_percent:
-            STOP_LOSS * 100,
+          liveTrading: LIVE_TRADING,
           message: "memebott is running"
         });
       }
 
       if (url.pathname === "/status") {
-        return json(await status(env));
+        return await handleStatus(env);
       }
 
       if (url.pathname === "/test") {
-        return json(await testBot(env));
+        return await handleTest(env);
       }
 
-      /*
-        SAFE REPAIR ROUTE.
-
-        This repairs missing entry prices in KV.
-        It NEVER buys and NEVER sells.
-      */
       if (url.pathname === "/repair") {
-        return json(await repairPositions(env));
+        return await handleRepair(env);
       }
 
       if (url.pathname === "/run") {
-        return json(await runBot(env, "manual"));
+        const result = await runBot(env, "manual");
+        return json(result);
       }
 
-      return json(
-        {
-          ok: false,
-          error: "Not found",
-          routes: [
-            "/",
-            "/status",
-            "/test",
-            "/repair",
-            "/run"
-          ]
-        },
-        404
-      );
+      return json({
+        ok: false,
+        error: "Unknown endpoint"
+      }, 404);
 
     } catch (error) {
-      return json(
-        {
-          ok: false,
-          bot: BOT_NAME,
-          error: String(
-            error?.message || error
-          )
-        },
-        500
-      );
+      console.error(error);
+
+      return json({
+        ok: false,
+        error: error?.message || String(error)
+      }, 500);
     }
   },
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       runBot(env, "cron").catch(error => {
-        console.error("CRON ERROR:", error);
+        console.error("Scheduled bot error:", error);
       })
     );
   }
 };
 
 
-/* =========================================================
-   MAIN BOT
-========================================================= */
+/*
+  MAIN BOT
+*/
 
 async function runBot(env, source) {
-  const result = {
+  validateEnv(env);
+
+  console.log(`memebott ${source} run started`);
+
+  await repairPositions(env);
+
+  let positions = await loadPositions(env);
+
+  const solBalance = await getSolBalance(env);
+  const solPrice = await getSolPrice(env);
+
+  const walletUsd = solBalance * solPrice;
+
+  console.log("SOL balance:", solBalance);
+  console.log("SOL price:", solPrice);
+  console.log("Wallet USD:", walletUsd);
+  console.log("Positions:", positions.length);
+
+  /*
+    ALWAYS MANAGE EXISTING POSITIONS FIRST
+  */
+
+  if (positions.length > 0) {
+    for (const position of [...positions]) {
+      try {
+        await managePosition(env, position);
+      } catch (error) {
+        console.error(
+          `Position management failed for ${position.mint}:`,
+          error
+        );
+      }
+    }
+  }
+
+  positions = await loadPositions(env);
+
+  /*
+    MAX POSITION CHECK
+  */
+
+  if (positions.length >= MAX_POSITIONS) {
+    console.log("Maximum positions reached.");
+
+    return {
+      ok: true,
+      action: "hold",
+      reason: "max_positions",
+      positions: positions.length
+    };
+  }
+
+  /*
+    COOLDOWN
+  */
+
+  const cooldown = await getCooldown(env);
+
+  if (cooldown > Date.now()) {
+    return {
+      ok: true,
+      action: "hold",
+      reason: "cooldown",
+      cooldownUntil: cooldown
+    };
+  }
+
+  /*
+    RESERVE SOL
+  */
+
+  const availableSol = solBalance - SOL_RESERVE;
+
+  if (availableSol <= 0) {
+    return {
+      ok: true,
+      action: "hold",
+      reason: "insufficient_sol_reserve",
+      solBalance
+    };
+  }
+
+  /*
+    DETERMINE TRADE SIZE
+  */
+
+  const tradeUsd =
+    walletUsd < SMALL_WALLET_LIMIT_USD
+      ? SMALL_TRADE_USD
+      : LARGE_TRADE_USD;
+
+  const actualTradeUsd = Math.min(
+    tradeUsd,
+    availableSol * solPrice
+  );
+
+  if (actualTradeUsd <= 0) {
+    return {
+      ok: true,
+      action: "hold",
+      reason: "trade_size_zero"
+    };
+  }
+
+  /*
+    FIND CANDIDATE
+  */
+
+  const candidate = await findCandidate(env, positions);
+
+  if (!candidate) {
+    return {
+      ok: true,
+      action: "hold",
+      reason: "no_candidate"
+    };
+  }
+
+  console.log("Candidate:", candidate);
+
+  /*
+    BUY
+  */
+
+  const result = await buyToken(
+    env,
+    candidate,
+    actualTradeUsd,
+    solPrice
+  );
+
+  return result;
+}
+
+
+/*
+  ENVIRONMENT VALIDATION
+
+  IMPORTANT:
+  Uses BOT_PRIVATE_KEY to match the
+  Cloudflare secret from the existing setup.
+*/
+
+function validateEnv(env) {
+  const required = [
+    "BOT_KV",
+    "BOT_PRIVATE_KEY",
+    "HELIUS_API_KEY"
+  ];
+
+  const missing = required.filter(key => !env[key]);
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing Cloudflare binding/secret: ${missing.join(", ")}`
+    );
+  }
+}
+
+
+/*
+  STATUS
+*/
+
+async function handleStatus(env) {
+  validateEnv(env);
+
+  const positions = await loadPositions(env);
+  const solBalance = await getSolBalance(env);
+  const solPrice = await getSolPrice(env);
+
+  return json({
     ok: true,
     bot: BOT_NAME,
-    source,
-    live_trading: LIVE_TRADING,
+    liveTrading: LIVE_TRADING,
     wallet: WALLET_ADDRESS,
-
-    sol_balance: null,
-    sol_price_usd: null,
-    wallet_value_usd: null,
-    max_trade_usd: null,
-
-    open_positions: 0,
-    max_positions: MAX_POSITIONS,
-
-    trailing_activation_percent:
-      TRAILING_ACTIVATION * 100,
-
-    trailing_distance_percent:
-      TRAILING_DISTANCE * 100,
-
-    stop_loss_percent:
-      STOP_LOSS * 100,
-
-    actions: [],
-    positions: []
-  };
-
-  try {
-    validateEnv(env);
-
-    /*
-      Repair missing entry prices BEFORE
-      management evaluates positions.
-    */
-    const repair =
-      await repairMissingEntryPrices(env);
-
-    if (repair.repaired.length > 0) {
-      result.actions.push({
-        action: "POSITION_REPAIR",
-        repaired: repair.repaired
-      });
+    solBalance,
+    solPrice,
+    walletUsd: solBalance * solPrice,
+    positions,
+    settings: {
+      hardStopPct: HARD_STOP_PCT,
+      trailingActivatePct: TRAILING_ACTIVATE_PCT,
+      trailingDistancePct: TRAILING_DISTANCE_PCT,
+      smallWalletLimitUsd: SMALL_WALLET_LIMIT_USD,
+      smallTradeUsd: SMALL_TRADE_USD,
+      largeTradeUsd: LARGE_TRADE_USD,
+      solReserve: SOL_RESERVE,
+      maxPositions: MAX_POSITIONS,
+      slippageBps: SLIPPAGE_BPS,
+      cooldownSeconds: COOLDOWN_SECONDS
     }
-
-    let positions =
-      await getPositions(env);
-
-    result.open_positions =
-      positions.length;
-
-    result.positions =
-      positions;
-
-    const solBalance =
-      await getSolBalance(env);
-
-    const solPrice =
-      await getSolPrice();
-
-    const walletValueUsd =
-      solBalance * solPrice;
-
-    const maxTradeUsd =
-      walletValueUsd >= BALANCE_THRESHOLD_USD
-        ? LARGE_TRADE_CAP_USD
-        : SMALL_TRADE_CAP_USD;
-
-    result.sol_balance =
-      solBalance;
-
-    result.sol_price_usd =
-      solPrice;
-
-    result.wallet_value_usd =
-      Number(walletValueUsd.toFixed(4));
-
-    result.max_trade_usd =
-      maxTradeUsd;
-
-    /*
-      Manage existing positions FIRST.
-    */
-    if (positions.length > 0) {
-      const management =
-        await managePositions(
-          env,
-          positions
-        );
-
-      if (management.length > 0) {
-        result.actions.push(
-          ...management
-        );
-      }
-    }
-
-    /*
-      Reload after management.
-    */
-    const currentPositions =
-      await getPositions(env);
-
-    result.open_positions =
-      currentPositions.length;
-
-    result.positions =
-      currentPositions;
-
-    if (
-      currentPositions.length >=
-      MAX_POSITIONS
-    ) {
-      result.actions.push({
-        action: "HOLD",
-        reason:
-          "Maximum positions reached"
-      });
-
-      return result;
-    }
-
-    const cooldown =
-      await getCooldown(env);
-
-    if (cooldown.active) {
-      result.actions.push({
-        action: "HOLD",
-        reason:
-          "Trade cooldown active",
-        seconds_remaining:
-          cooldown.seconds_remaining
-      });
-
-      return result;
-    }
-
-    const availableSol =
-      solBalance -
-      MIN_SOL_RESERVE;
-
-    if (availableSol <= 0) {
-      result.actions.push({
-        action: "NO_TRADE",
-        reason:
-          "Insufficient SOL after reserve",
-        min_sol_reserve:
-          MIN_SOL_RESERVE
-      });
-
-      return result;
-    }
-
-    const buyResult =
-      await findAndBuy(
-        env,
-        solBalance,
-        solPrice,
-        walletValueUsd,
-        maxTradeUsd,
-        currentPositions
-      );
-
-    if (buyResult.action) {
-      result.actions.push(
-        buyResult.action
-      );
-    }
-
-    if (buyResult.position) {
-      result.positions = [
-        ...currentPositions,
-        buyResult.position
-      ];
-
-      result.open_positions =
-        result.positions.length;
-    }
-
-    return result;
-
-  } catch (error) {
-    result.ok = false;
-
-    result.actions.push({
-      action: "ERROR",
-      error: String(
-        error?.message || error
-      )
-    });
-
-    return result;
-  }
+  });
 }
 
 
-/* =========================================================
-   FIND AND BUY
-========================================================= */
+/*
+  TEST
 
-async function findAndBuy(
-  env,
-  solBalance,
-  solPrice,
-  walletValueUsd,
-  maxTradeUsd,
-  positions
-) {
+  NEVER BUYS OR SELLS
+*/
+
+async function handleTest(env) {
+  validateEnv(env);
+
+  const solBalance = await getSolBalance(env);
+  const solPrice = await getSolPrice(env);
+  const positions = await loadPositions(env);
+
+  let candidates = [];
+
   try {
-    const candidates =
-      await getTrendingTokens(env);
-
-    if (!candidates.length) {
-      return {
-        action: {
-          action: "NO_TRADE",
-          reason:
-            "No trending candidates available"
-        }
-      };
-    }
-
-    const limitedCandidates =
-      candidates.slice(
-        0,
-        MAX_CANDIDATES
-      );
-
-    const heldMints =
-      new Set(
-        positions.map(
-          position =>
-            position.mint
-        )
-      );
-
-    const filtered =
-      limitedCandidates.filter(
-        candidate =>
-          candidate &&
-          candidate.address &&
-          candidate.address !== SOL_MINT &&
-          !heldMints.has(
-            candidate.address
-          )
-      );
-
-    if (!filtered.length) {
-      return {
-        action: {
-          action: "NO_TRADE",
-          reason:
-            "No eligible new candidates"
-        }
-      };
-    }
-
-    for (const candidate of filtered) {
-      const mint =
-        candidate.address;
-
-      try {
-        const decimals =
-          await getTokenDecimals(
-            env,
-            mint
-          );
-
-        if (
-          !Number.isInteger(decimals) ||
-          decimals < 0 ||
-          decimals > 18
-        ) {
-          continue;
-        }
-
-        const tradeUsd =
-          Math.min(
-            maxTradeUsd,
-            walletValueUsd
-          );
-
-        if (tradeUsd <= 0) {
-          continue;
-        }
-
-        const tradeSol =
-          tradeUsd / solPrice;
-
-        const maximumSpendableSol =
-          Math.max(
-            0,
-            solBalance -
-              MIN_SOL_RESERVE
-          );
-
-        const actualTradeSol =
-          Math.min(
-            tradeSol,
-            maximumSpendableSol
-          );
-
-        if (actualTradeSol <= 0) {
-          continue;
-        }
-
-        const lamports =
-          Math.floor(
-            actualTradeSol *
-              1_000_000_000
-          );
-
-        if (lamports <= 0) {
-          continue;
-        }
-
-        const order =
-          await getOrder(
-            mint,
-            String(lamports)
-          );
-
-        if (
-          !order ||
-          !order.transaction ||
-          !order.requestId
-        ) {
-          continue;
-        }
-
-        const expectedOutput =
-          Number(
-            order.outAmount || 0
-          );
-
-        if (
-          !Number.isFinite(
-            expectedOutput
-          ) ||
-          expectedOutput <= 0
-        ) {
-          continue;
-        }
-
-        const priceImpact =
-          Number(
-            order.priceImpactPct || 0
-          );
-
-        if (
-          Number.isFinite(priceImpact) &&
-          priceImpact >
-            IMMEDIATE_LOSS_FILTER
-        ) {
-          continue;
-        }
-
-        if (!LIVE_TRADING) {
-          return {
-            action: {
-              action: "TEST_BUY",
-              token: mint,
-              symbol:
-                candidate.symbol || null,
-              trade_usd:
-                Number(
-                  tradeUsd.toFixed(2)
-                ),
-              trade_sol:
-                actualTradeSol,
-              expected_output:
-                expectedOutput,
-              message:
-                "LIVE_TRADING is false; no transaction submitted"
-            }
-          };
-        }
-
-        const execution =
-          await executeOrder(
-            env,
-            order
-          );
-
-        if (!execution.success) {
-          return {
-            action: {
-              action: "ERROR",
-              error:
-                `BUY EXECUTION FAILED: ${
-                  execution.error ||
-                  "Unknown Jupiter execution error"
-                }`,
-              token: mint,
-              request_id:
-                order.requestId || null
-            }
-          };
-        }
-
-        let entryPrice =
-          await getTokenPrice(mint);
-
-        if (
-          !Number.isFinite(entryPrice) ||
-          entryPrice <= 0
-        ) {
-          const tokenAmount =
-            expectedOutput /
-            Math.pow(
-              10,
-              decimals
-            );
-
-          if (
-            Number.isFinite(tokenAmount) &&
-            tokenAmount > 0
-          ) {
-            entryPrice =
-              tradeUsd /
-              tokenAmount;
-          }
-        }
-
-        const position = {
-          mint,
-
-          symbol:
-            candidate.symbol || null,
-
-          name:
-            candidate.name || null,
-
-          decimals,
-
-          entry_price_usd:
-            Number.isFinite(entryPrice) &&
-            entryPrice > 0
-              ? entryPrice
-              : null,
-
-          /*
-            Highest price begins at entry.
-            Trailing is NOT active until +3%.
-          */
-          highest_price_usd:
-            Number.isFinite(entryPrice) &&
-            entryPrice > 0
-              ? entryPrice
-              : null,
-
-          highest_profit_percent: 0,
-
-          trailing_active: false,
-
-          amount_raw:
-            String(expectedOutput),
-
-          amount:
-            expectedOutput /
-            Math.pow(
-              10,
-              decimals
-            ),
-
-          trade_usd:
-            Number(
-              tradeUsd.toFixed(2)
-            ),
-
-          trade_sol:
-            actualTradeSol,
-
-          opened_at:
-            Date.now(),
-
-          signature:
-            execution.signature || null
-        };
-
-        await savePosition(
-          env,
-          position
-        );
-
-        await setCooldown(env);
-
-        return {
-          action: {
-            action: "BUY",
-            token: mint,
-            symbol:
-              candidate.symbol || null,
-            trade_usd:
-              Number(
-                tradeUsd.toFixed(2)
-              ),
-            trade_sol:
-              actualTradeSol,
-            signature:
-              execution.signature || null,
-            request_id:
-              order.requestId || null
-          },
-
-          position
-        };
-
-      } catch (candidateError) {
-        console.error(
-          "CANDIDATE ERROR:",
-          mint,
-          candidateError
-        );
-      }
-    }
-
-    return {
-      action: {
-        action: "NO_TRADE",
-        reason:
-          "No candidate produced a valid Jupiter trade route"
-      }
-    };
-
+    candidates = await getTrendingTokens(env);
   } catch (error) {
-    return {
-      action: {
-        action: "NO_TRADE",
-        reason:
-          String(
-            error?.message || error
-          )
-      }
-    };
+    console.error("Candidate test failed:", error);
   }
+
+  return json({
+    ok: true,
+    trading: false,
+    message: "TEST MODE ONLY. No buy or sell was performed.",
+    wallet: WALLET_ADDRESS,
+    solBalance,
+    solPrice,
+    walletUsd: solBalance * solPrice,
+    positions,
+    candidateCount: candidates.length,
+    candidates: candidates.slice(0, MAX_CANDIDATES)
+  });
 }
 
 
-/* =========================================================
-   TRENDING TOKENS
-========================================================= */
+/*
+  REPAIR ENDPOINT
 
-async function getTrendingTokens(env) {
-  const backoff =
-    await getTrendingBackoff(env);
+  NEVER BUYS OR SELLS
+*/
 
-  if (backoff.active) {
-    const cached =
-      await getTrendingCache(env);
+async function handleRepair(env) {
+  validateEnv(env);
 
-    if (cached.length > 0) {
-      return cached;
-    }
+  const repaired = await repairPositions(env);
 
+  return json({
+    ok: true,
+    trading: false,
+    message: "Position repair completed. No buy or sell was performed.",
+    repaired
+  });
+}
+
+
+/*
+  POSITION STORAGE
+*/
+
+async function loadPositions(env) {
+  const raw = await env.BOT_KV.get(POSITIONS_KEY);
+
+  if (!raw) {
     return [];
   }
 
-  const cached =
-    await getTrendingCache(env);
-
-  if (cached.length > 0) {
-    return cached;
-  }
-
-  const response =
-    await fetch(
-      `${TOKENS_API}/toptrending/24h`,
-      {
-        method: "GET",
-        headers: {
-          accept:
-            "application/json"
-        }
-      }
-    );
-
-  const text =
-    await response.text();
-
-  if (response.status === 429) {
-    console.error(
-      "JUPITER TRENDING 429:",
-      text
-    );
-
-    await setTrendingBackoff(env);
-
-    return await getTrendingCache(
-      env,
-      true
-    );
-  }
-
-  if (!response.ok) {
-    throw new Error(
-      `Jupiter trending HTTP ${
-        response.status
-      }: ${text.slice(0, 300)}`
-    );
-  }
-
-  let data;
-
   try {
-    data =
-      JSON.parse(text);
+    const parsed = JSON.parse(raw);
+
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed;
   } catch {
-    throw new Error(
-      "Invalid Jupiter trending response"
-    );
-  }
-
-  let list = [];
-
-  if (Array.isArray(data)) {
-    list = data;
-  } else if (
-    Array.isArray(data?.tokens)
-  ) {
-    list = data.tokens;
-  } else if (
-    Array.isArray(data?.data)
-  ) {
-    list = data.data;
-  } else if (
-    Array.isArray(data?.results)
-  ) {
-    list = data.results;
-  }
-
-  const normalized =
-    list
-      .map(item => ({
-        address:
-          item.address ||
-          item.mint ||
-          item.id ||
-          null,
-
-        symbol:
-          item.symbol || null,
-
-        name:
-          item.name || null
-      }))
-      .filter(
-        item => item.address
-      );
-
-  if (normalized.length > 0) {
-    await saveTrendingCache(
-      env,
-      normalized
-    );
-  }
-
-  return normalized;
-}
-
-
-/* =========================================================
-   TRENDING CACHE
-========================================================= */
-
-async function getTrendingCache(
-  env,
-  allowStale = false
-) {
-  try {
-    if (!env.BOT_KV) {
-      return [];
-    }
-
-    const value =
-      await env.BOT_KV.get(
-        TRENDING_CACHE_KEY
-      );
-
-    if (!value) {
-      return [];
-    }
-
-    const data =
-      JSON.parse(value);
-
-    if (
-      !Array.isArray(data?.tokens)
-    ) {
-      return [];
-    }
-
-    const timestamp =
-      Number(data.timestamp);
-
-    if (
-      !Number.isFinite(timestamp)
-    ) {
-      return [];
-    }
-
-    const ageSeconds =
-      (Date.now() - timestamp) /
-      1000;
-
-    if (
-      !allowStale &&
-      ageSeconds >
-        TRENDING_CACHE_SECONDS
-    ) {
-      return [];
-    }
-
-    return data.tokens;
-
-  } catch {
+    console.error("Invalid POSITIONS KV data.");
     return [];
   }
 }
 
 
-async function saveTrendingCache(
-  env,
-  tokens
-) {
-  try {
-    await env.BOT_KV.put(
-      TRENDING_CACHE_KEY,
-      JSON.stringify({
-        timestamp: Date.now(),
-        tokens
-      })
-    );
-  } catch (error) {
-    console.error(
-      "TRENDING CACHE SAVE ERROR:",
-      error
-    );
-  }
-}
-
-
-async function getTrendingBackoff(env) {
-  try {
-    const value =
-      await env.BOT_KV.get(
-        TRENDING_BACKOFF_KEY
-      );
-
-    if (!value) {
-      return {
-        active: false,
-        seconds_remaining: 0
-      };
-    }
-
-    const timestamp =
-      Number(value);
-
-    if (
-      !Number.isFinite(timestamp)
-    ) {
-      return {
-        active: false,
-        seconds_remaining: 0
-      };
-    }
-
-    const elapsed =
-      (Date.now() - timestamp) /
-      1000;
-
-    const remaining =
-      TRENDING_BACKOFF_SECONDS -
-      elapsed;
-
-    if (remaining <= 0) {
-      await env.BOT_KV.delete(
-        TRENDING_BACKOFF_KEY
-      );
-
-      return {
-        active: false,
-        seconds_remaining: 0
-      };
-    }
-
-    return {
-      active: true,
-      seconds_remaining:
-        Math.ceil(remaining)
-    };
-
-  } catch {
-    return {
-      active: false,
-      seconds_remaining: 0
-    };
-  }
-}
-
-
-async function setTrendingBackoff(env) {
+async function savePositions(env, positions) {
   await env.BOT_KV.put(
-    TRENDING_BACKOFF_KEY,
-    String(Date.now())
+    POSITIONS_KEY,
+    JSON.stringify(positions)
   );
 }
 
 
-/* =========================================================
-   TOKEN PRICE
-========================================================= */
+/*
+  SAFE REPAIR
 
-async function getTokenPrice(mint) {
-  try {
-    const response =
-      await fetch(
-        `${PRICE_API}?ids=${encodeURIComponent(
-          mint
-        )}`,
-        {
-          method: "GET",
-          headers: {
-            accept:
-              "application/json"
-          }
-        }
-      );
+  Adds missing entry prices when possible.
+*/
 
-    if (!response.ok) {
-      return null;
-    }
+async function repairPositions(env) {
+  const positions = await loadPositions(env);
 
-    const text =
-      await response.text();
-
-    let data;
-
-    try {
-      data =
-        JSON.parse(text);
-    } catch {
-      return null;
-    }
-
-    const item =
-      data?.data?.[mint] ||
-      data?.[mint] ||
-      null;
-
-    if (!item) {
-      return null;
-    }
-
-    const price =
-      Number(
-        item.usdPrice ??
-        item.price ??
-        null
-      );
-
-    return Number.isFinite(price) &&
-      price > 0
-      ? price
-      : null;
-
-  } catch {
-    return null;
+  if (!positions.length) {
+    return 0;
   }
+
+  let repaired = 0;
+  let changed = false;
+
+  for (const position of positions) {
+    if (
+      !position.entryPrice ||
+      !Number.isFinite(Number(position.entryPrice)) ||
+      Number(position.entryPrice) <= 0
+    ) {
+      const amount = Number(position.amount);
+      const tradeUsd = Number(position.trade_usd);
+
+      if (
+        Number.isFinite(amount) &&
+        amount > 0 &&
+        Number.isFinite(tradeUsd) &&
+        tradeUsd > 0
+      ) {
+        position.entryPrice = tradeUsd / amount;
+        repaired++;
+        changed = true;
+      }
+    }
+
+    if (
+      !position.highestPrice &&
+      position.entryPrice
+    ) {
+      position.highestPrice = Number(position.entryPrice);
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    await savePositions(env, positions);
+  }
+
+  return repaired;
 }
 
 
-/* =========================================================
-   SOL PRICE
-========================================================= */
+/*
+  COOLDOWN
+*/
 
-async function getSolPrice() {
-  const response =
-    await fetch(
-      `${PRICE_API}?ids=${SOL_MINT}`,
-      {
-        method: "GET",
-        headers: {
-          accept:
-            "application/json"
-        }
-      }
-    );
+async function getCooldown(env) {
+  const raw = await env.BOT_KV.get(COOLDOWN_KEY);
 
-  const text =
-    await response.text();
-
-  if (!response.ok) {
-    throw new Error(
-      `SOL price HTTP ${
-        response.status
-      }: ${text.slice(0, 500)}`
-    );
+  if (!raw) {
+    return 0;
   }
 
-  let data;
+  const value = Number(raw);
 
-  try {
-    data =
-      JSON.parse(text);
-  } catch {
-    throw new Error(
-      `Invalid SOL price JSON: ${
-        text.slice(0, 500)
-      }`
-    );
+  if (!Number.isFinite(value)) {
+    return 0;
   }
 
-  const item =
-    data?.data?.[SOL_MINT] ||
-    data?.[SOL_MINT] ||
-    null;
+  return value;
+}
 
-  if (!item) {
-    throw new Error(
-      `SOL price not found in Jupiter response: ${
-        text.slice(0, 500)
-      }`
-    );
-  }
 
-  const price =
-    Number(
-      item.usdPrice ??
-      item.price ??
-      item.usd ??
-      null
-    );
+async function setCooldown(env) {
+  const until =
+    Date.now() +
+    COOLDOWN_SECONDS * 1000;
 
-  if (
-    !Number.isFinite(price) ||
-    price <= 0
-  ) {
-    throw new Error(
-      `Invalid SOL price value from Jupiter: ${
-        text.slice(0, 500)
-      }`
-    );
+  await env.BOT_KV.put(
+    COOLDOWN_KEY,
+    String(until)
+  );
+}
+
+
+/*
+  SOL BALANCE
+*/
+
+async function getSolBalance(env) {
+  const result = await heliusRpc(
+    env,
+    "getBalance",
+    [WALLET_ADDRESS]
+  );
+
+  const lamports =
+    result?.result?.value ?? 0;
+
+  return Number(lamports) / 1e9;
+}
+
+
+/*
+  SOL PRICE
+*/
+
+async function getSolPrice(env) {
+  const price = await getTokenPrice(
+    env,
+    SOL_MINT
+  );
+
+  if (!Number.isFinite(price) || price <= 0) {
+    throw new Error("Unable to obtain SOL price.");
   }
 
   return price;
 }
 
 
-/* =========================================================
-   JUPITER BUY ORDER
-========================================================= */
+/*
+  TOKEN PRICE
+*/
 
-async function getOrder(
-  outputMint,
-  amount
-) {
+async function getTokenPrice(env, mint) {
   const url =
-    new URL(
-      `${SWAP_API}/order`
-    );
+    `https://api.jup.ag/price/v3?ids=${encodeURIComponent(mint)}`;
 
-  url.searchParams.set(
-    "inputMint",
-    SOL_MINT
-  );
-
-  url.searchParams.set(
-    "outputMint",
-    outputMint
-  );
-
-  url.searchParams.set(
-    "amount",
-    amount
-  );
-
-  url.searchParams.set(
-    "taker",
-    WALLET_ADDRESS
-  );
-
-  url.searchParams.set(
-    "slippageBps",
-    String(SLIPPAGE_BPS)
-  );
-
-  const response =
-    await fetch(
-      url.toString(),
-      {
-        method: "GET",
-        headers: {
-          accept:
-            "application/json"
-        }
-      }
-    );
-
-  const text =
-    await response.text();
+  const response = await fetch(url);
 
   if (!response.ok) {
-    console.error(
-      "JUPITER ORDER ERROR:",
-      response.status,
-      text
-    );
-
     throw new Error(
-      `Jupiter order HTTP ${
-        response.status
-      }`
+      `Jupiter price request failed: ${response.status}`
     );
   }
 
-  let data;
+  const data = await response.json();
+
+  const item = data?.[mint];
+
+  if (!item) {
+    return 0;
+  }
+
+  const price = Number(item.usdPrice);
+
+  if (!Number.isFinite(price)) {
+    return 0;
+  }
+
+  return price;
+}
+
+
+/*
+  TRENDING TOKENS
+*/
+
+async function getTrendingTokens(env) {
+  const now = Date.now();
+
+  /*
+    BACKOFF
+  */
+
+  const backoffRaw =
+    await env.BOT_KV.get(TRENDING_BACKOFF_KEY);
+
+  if (backoffRaw) {
+    const backoffUntil = Number(backoffRaw);
+
+    if (
+      Number.isFinite(backoffUntil) &&
+      now < backoffUntil
+    ) {
+      const cached =
+        await env.BOT_KV.get(TRENDING_CACHE_KEY);
+
+      if (cached) {
+        try {
+          return JSON.parse(cached);
+        } catch {
+          return [];
+        }
+      }
+
+      return [];
+    }
+  }
+
+  /*
+    CACHE
+  */
+
+  const cachedRaw =
+    await env.BOT_KV.get(TRENDING_CACHE_KEY);
+
+  if (cachedRaw) {
+    try {
+      const cached = JSON.parse(cachedRaw);
+
+      if (
+        cached &&
+        Number(cached.timestamp) +
+          TRENDING_CACHE_SECONDS * 1000 >
+          now
+      ) {
+        return Array.isArray(cached.tokens)
+          ? cached.tokens
+          : [];
+      }
+    } catch {
+      // Ignore bad cache.
+    }
+  }
+
+  /*
+    FETCH JUPITER TRENDING
+  */
+
+  const url =
+    "https://api.jup.ag/tokens/v2/toptrending/24h";
+
+  let response;
 
   try {
-    data =
-      JSON.parse(text);
-  } catch {
+    response = await fetch(url);
+  } catch (error) {
+    await setTrendingBackoff(env);
+    throw error;
+  }
+
+  if (!response.ok) {
+    await setTrendingBackoff(env);
+
     throw new Error(
-      "Invalid Jupiter order response"
+      `Jupiter trending request failed: ${response.status}`
     );
   }
+
+  const data = await response.json();
+
+  const list =
+    Array.isArray(data)
+      ? data
+      : Array.isArray(data?.tokens)
+        ? data.tokens
+        : [];
+
+  const tokens = list
+    .filter(token => {
+      const address =
+        token?.id ||
+        token?.address ||
+        token?.mint;
+
+      return (
+        address &&
+        address !== SOL_MINT
+      );
+    })
+    .slice(0, MAX_CANDIDATES);
+
+  await env.BOT_KV.put(
+    TRENDING_CACHE_KEY,
+    JSON.stringify({
+      timestamp: now,
+      tokens
+    })
+  );
+
+  await env.BOT_KV.delete(
+    TRENDING_BACKOFF_KEY
+  );
+
+  return tokens;
+}
+
+
+async function setTrendingBackoff(env) {
+  const until =
+    Date.now() +
+    TRENDING_BACKOFF_SECONDS * 1000;
+
+  await env.BOT_KV.put(
+    TRENDING_BACKOFF_KEY,
+    String(until)
+  );
+}
+
+
+/*
+  FIND BUY CANDIDATE
+*/
+
+async function findCandidate(env, positions) {
+  const trending =
+    await getTrendingTokens(env);
+
+  const held = new Set(
+    positions.map(position => position.mint)
+  );
+
+  for (const token of trending) {
+    const mint =
+      token?.id ||
+      token?.address ||
+      token?.mint;
+
+    if (!mint) {
+      continue;
+    }
+
+    if (mint === SOL_MINT) {
+      continue;
+    }
+
+    if (held.has(mint)) {
+      continue;
+    }
+
+    return {
+      mint,
+      symbol:
+        token?.symbol ||
+        token?.name ||
+        "UNKNOWN",
+      decimals:
+        Number.isFinite(Number(token?.decimals))
+          ? Number(token.decimals)
+          : 0
+    };
+  }
+
+  return null;
+}
+
+
+/*
+  BUY TOKEN
+*/
+
+async function buyToken(
+  env,
+  candidate,
+  tradeUsd,
+  solPrice
+) {
+  const amountSol =
+    tradeUsd / solPrice;
+
+  const amountLamports =
+    Math.floor(amountSol * 1e9);
+
+  if (amountLamports <= 0) {
+    throw new Error("Buy amount is too small.");
+  }
+
+  console.log(
+    `Buying ${candidate.symbol} with $${tradeUsd}`
+  );
+
+  const order = await getJupiterOrder(
+    env,
+    SOL_MINT,
+    candidate.mint,
+    amountLamports,
+    true
+  );
+
+  if (!order) {
+    throw new Error("Jupiter returned no buy order.");
+  }
+
+  /*
+    IMMEDIATE LOSS FILTER
+
+    If Jupiter reports price impact above
+    the configured threshold, do not buy.
+  */
+
+  const priceImpact =
+    Number(order.priceImpactPct);
 
   if (
-    !data?.transaction ||
-    !data?.requestId
+    Number.isFinite(priceImpact) &&
+    priceImpact > IMMEDIATE_LOSS_FILTER
   ) {
-    return null;
+    return {
+      ok: true,
+      action: "hold",
+      reason: "price_impact_too_high",
+      mint: candidate.mint,
+      symbol: candidate.symbol,
+      priceImpact
+    };
   }
 
-  return data;
-}
-
-
-/* =========================================================
-   JUPITER EXECUTION
-========================================================= */
-
-async function executeOrder(
-  env,
-  order
-) {
-  try {
-    if (!env.WALLET_PRIVATE_KEY) {
-      throw new Error(
-        "WALLET_PRIVATE_KEY secret is missing"
-      );
-    }
-
-    const transaction =
-      base64ToBytes(
-        order.transaction
-      );
-
-    const signedTransaction =
-      await signSolanaTransaction(
-        transaction,
-        env.WALLET_PRIVATE_KEY
-      );
-
-    const response =
-      await fetch(
-        `${SWAP_API}/execute`,
-        {
-          method: "POST",
-
-          headers: {
-            "content-type":
-              "application/json",
-
-            "accept":
-              "application/json"
-          },
-
-          body:
-            JSON.stringify({
-              signedTransaction:
-                bytesToBase64(
-                  signedTransaction
-                ),
-
-              requestId:
-                order.requestId
-            })
-        }
-      );
-
-    const text =
-      await response.text();
-
-    let data;
-
-    try {
-      data =
-        JSON.parse(text);
-    } catch {
-      data = {
-        raw: text
-      };
-    }
-
-    if (!response.ok) {
-      console.error(
-        "JUPITER EXECUTE HTTP ERROR:",
-        response.status,
-        data
-      );
-
-      return {
-        success: false,
-        error:
-          data?.error ||
-          data?.message ||
-          `HTTP ${response.status}`
-      };
-    }
-
-    const status =
-      String(
-        data?.status || ""
-      ).toLowerCase();
-
-    const success =
-      status === "success" ||
-      Boolean(
-        data?.signature &&
-        !data?.error
-      );
-
-    if (!success) {
-      return {
-        success: false,
-        error:
-          data?.error ||
-          data?.message ||
-          data?.status ||
-          "Jupiter execution was not successful"
-      };
-    }
-
+  if (!LIVE_TRADING) {
     return {
-      success: true,
-
-      signature:
-        data?.signature ||
-        data?.txid ||
-        data?.transactionSignature ||
-        null,
-
-      raw: data
+      ok: true,
+      action: "paper_buy",
+      mint: candidate.mint,
+      symbol: candidate.symbol,
+      tradeUsd
     };
+  }
 
-  } catch (error) {
-    console.error(
-      "EXECUTE ERROR:",
-      error
+  const execution =
+    await executeJupiterOrder(env, order);
+
+  if (!execution.success) {
+    throw new Error(
+      execution.error ||
+      "Jupiter buy execution failed."
+    );
+  }
+
+  const outRaw =
+    Number(order.outAmount);
+
+  const decimals =
+    Number.isFinite(Number(candidate.decimals))
+      ? Number(candidate.decimals)
+      : 0;
+
+  const tokenAmount =
+    outRaw > 0
+      ? outRaw / Math.pow(10, decimals)
+      : 0;
+
+  if (tokenAmount <= 0) {
+    throw new Error(
+      "Buy succeeded but token amount could not be determined."
+    );
+  }
+
+  let entryPrice =
+    await getTokenPrice(
+      env,
+      candidate.mint
     );
 
-    return {
-      success: false,
-      error:
-        String(
-          error?.message ||
-          error
-        )
-    };
-  }
-}
-
-
-/* =========================================================
-   POSITION MANAGEMENT
-========================================================= */
-
-async function managePositions(
-  env,
-  positions
-) {
-  const actions = [];
-
-  for (
-    const originalPosition of positions
+  if (
+    !Number.isFinite(entryPrice) ||
+    entryPrice <= 0
   ) {
-    try {
-      if (!originalPosition?.mint) {
-        continue;
-      }
-
-      const position = {
-        ...originalPosition
-      };
-
-      /*
-        Recover missing entry price.
-      */
-      if (
-        !Number.isFinite(
-          Number(
-            position.entry_price_usd
-          )
-        ) ||
-        Number(
-          position.entry_price_usd
-        ) <= 0
-      ) {
-        const storedTradeUsd =
-          Number(
-            position.trade_usd
-          );
-
-        const storedAmount =
-          Number(
-            position.amount
-          );
-
-        if (
-          Number.isFinite(
-            storedTradeUsd
-          ) &&
-          storedTradeUsd > 0 &&
-          Number.isFinite(
-            storedAmount
-          ) &&
-          storedAmount > 0
-        ) {
-          const recoveredEntryPrice =
-            storedTradeUsd /
-            storedAmount;
-
-          if (
-            Number.isFinite(
-              recoveredEntryPrice
-            ) &&
-            recoveredEntryPrice > 0
-          ) {
-            position.entry_price_usd =
-              recoveredEntryPrice;
-
-            await savePosition(
-              env,
-              position
-            );
-          }
-        }
-      }
-
-      const entryPrice =
-        Number(
-          position.entry_price_usd
-        );
-
-      const currentPrice =
-        await getTokenPrice(
-          position.mint
-        );
-
-      if (
-        !Number.isFinite(
-          currentPrice
-        ) ||
-        currentPrice <= 0 ||
-        !Number.isFinite(
-          entryPrice
-        ) ||
-        entryPrice <= 0
-      ) {
-        actions.push({
-          action: "HOLD",
-          token:
-            position.mint,
-          symbol:
-            position.symbol || null,
-          reason:
-            "Entry or current price unavailable; position not automatically sold"
-        });
-
-        continue;
-      }
-
-      /*
-        Current profit/loss relative to entry.
-      */
-      const change =
-        (
-          currentPrice -
-          entryPrice
-        ) /
-        entryPrice;
-
-      /*
-        Recover or initialize highest price.
-      */
-      let highestPrice =
-        Number(
-          position.highest_price_usd
-        );
-
-      if (
-        !Number.isFinite(
-          highestPrice
-        ) ||
-        highestPrice <= 0
-      ) {
-        highestPrice =
-          entryPrice;
-      }
-
-      /*
-        Update highest price whenever
-        the token makes a new high.
-      */
-      if (
-        currentPrice >
-        highestPrice
-      ) {
-        highestPrice =
-          currentPrice;
-      }
-
-      /*
-        Highest profit is retained for
-        status/debugging.
-      */
-      const highestProfit =
-        (
-          highestPrice -
-          entryPrice
-        ) /
-        entryPrice;
-
-      position.highest_price_usd =
-        highestPrice;
-
-      position.highest_profit_percent =
-        Number(
-          (
-            highestProfit *
-            100
-          ).toFixed(3)
-        );
-
-      /*
-        Trailing activates once the position
-        has reached +3%.
-      */
-      let trailingActive =
-        Boolean(
-          position.trailing_active
-        );
-
-      if (
-        highestProfit >=
-        TRAILING_ACTIVATION
-      ) {
-        trailingActive = true;
-      }
-
-      position.trailing_active =
-        trailingActive;
-
-      /*
-        Save the updated high/trailing state.
-      */
-      await savePosition(
-        env,
-        position
-      );
-
-      /*
-        HARD STOP: -2%
-
-        This is checked regardless of
-        whether trailing has activated.
-      */
-      if (
-        change <=
-        STOP_LOSS
-      ) {
-        actions.push(
-          await sellPosition(
-            env,
-            position,
-            "STOP_LOSS"
-          )
-        );
-
-        continue;
-      }
-
-      /*
-        TRAILING STOP
-
-        Once +3% has been reached, the bot
-        sells only if the current price has
-        fallen 1.25% from the highest price.
-      */
-      if (
-        trailingActive
-      ) {
-        const trailingSellPrice =
-          highestPrice *
-          (
-            1 -
-            TRAILING_DISTANCE
-          );
-
-        if (
-          currentPrice <=
-          trailingSellPrice
-        ) {
-          actions.push(
-            await sellPosition(
-              env,
-              position,
-              "TRAILING_STOP"
-            )
-          );
-
-          continue;
-        }
-      }
-
-      actions.push({
-        action: "HOLD",
-
-        token:
-          position.mint,
-
-        symbol:
-          position.symbol || null,
-
-        current_price_usd:
-          currentPrice,
-
-        entry_price_usd:
-          entryPrice,
-
-        change_percent:
-          Number(
-            (
-              change *
-              100
-            ).toFixed(3)
-          ),
-
-        highest_price_usd:
-          highestPrice,
-
-        highest_profit_percent:
-          Number(
-            (
-              highestProfit *
-              100
-            ).toFixed(3)
-          ),
-
-        trailing_active:
-          trailingActive,
-
-        trailing_activation_percent:
-          TRAILING_ACTIVATION *
-          100,
-
-        trailing_distance_percent:
-          TRAILING_DISTANCE *
-          100,
-
-        trailing_sell_price_usd:
-          trailingActive
-            ? Number(
-                (
-                  highestPrice *
-                  (
-                    1 -
-                    TRAILING_DISTANCE
-                  )
-                ).toFixed(10)
-              )
-            : null,
-
-        stop_loss_percent:
-          STOP_LOSS * 100
-      });
-
-    } catch (error) {
-      actions.push({
-        action: "ERROR",
-
-        token:
-          originalPosition?.mint ||
-          null,
-
-        error:
-          `POSITION ERROR: ${
-            error?.message ||
-            error
-          }`
-      });
-    }
+    entryPrice =
+      tradeUsd / tokenAmount;
   }
 
-  return actions;
-}
-
-
-/* =========================================================
-   SAFE POSITION REPAIR
-========================================================= */
-
-async function repairMissingEntryPrices(
-  env
-) {
   const positions =
-    await getPositions(env);
+    await loadPositions(env);
 
-  const repaired = [];
+  positions.push({
+    mint: candidate.mint,
+    symbol: candidate.symbol,
+    decimals,
+    amount: tokenAmount,
+    amount_raw: String(order.outAmount),
+    trade_usd: tradeUsd,
+    entryPrice,
+    highestPrice: entryPrice,
+    boughtAt: Date.now(),
+    txid:
+      execution.signature ||
+      execution.txid ||
+      null
+  });
 
-  let changed = false;
+  await savePositions(env, positions);
+  await setCooldown(env);
 
-  for (
-    const originalPosition of positions
-  ) {
-    const position = {
-      ...originalPosition
-    };
-
-    if (!position?.mint) {
-      continue;
-    }
-
-    const existingEntry =
-      Number(
-        position.entry_price_usd
-      );
-
-    if (
-      Number.isFinite(existingEntry) &&
-      existingEntry > 0
-    ) {
-      continue;
-    }
-
-    const tradeUsd =
-      Number(
-        position.trade_usd
-      );
-
-    const amount =
-      Number(
-        position.amount
-      );
-
-    if (
-      !Number.isFinite(tradeUsd) ||
-      tradeUsd <= 0 ||
-      !Number.isFinite(amount) ||
-      amount <= 0
-    ) {
-      continue;
-    }
-
-    const recovered =
-      tradeUsd / amount;
-
-    if (
-      !Number.isFinite(recovered) ||
-      recovered <= 0
-    ) {
-      continue;
-    }
-
-    position.entry_price_usd =
-      recovered;
-
-    /*
-      Initialize the highest price
-      from the recovered entry.
-    */
-    position.highest_price_usd =
-      recovered;
-
-    position.highest_profit_percent =
-      0;
-
-    position.trailing_active =
-      false;
-
-    changed = true;
-
-    repaired.push({
-      mint:
-        position.mint,
-
-      symbol:
-        position.symbol || null,
-
-      entry_price_usd:
-        recovered,
-
-      method:
-        "trade_usd divided by stored token amount",
-
-      note:
-        "Approximate recovery from stored position data"
-    });
-
-    const index =
-      positions.findIndex(
-        p =>
-          p.mint ===
-          position.mint
-      );
-
-    if (index >= 0) {
-      positions[index] =
-        position;
-    }
-  }
-
-  if (changed) {
-    await env.BOT_KV.put(
-      POSITION_KEY,
-      JSON.stringify(
-        positions
-      )
-    );
-  }
+  console.log(
+    `BUY COMPLETE ${candidate.symbol} ${candidate.mint}`
+  );
 
   return {
-    repaired
+    ok: true,
+    action: "buy",
+    mint: candidate.mint,
+    symbol: candidate.symbol,
+    tradeUsd,
+    tokenAmount,
+    entryPrice,
+    txid:
+      execution.signature ||
+      execution.txid ||
+      null
   };
 }
 
 
-async function repairPositions(env) {
-  try {
-    validateEnv(env);
+/*
+  MANAGE POSITION
+*/
 
-    const repair =
-      await repairMissingEntryPrices(
-        env
-      );
+async function managePosition(env, position) {
+  const mint = position.mint;
+
+  if (!mint) {
+    return;
+  }
+
+  /*
+    GET ACTUAL TOKEN BALANCE
+  */
+
+  const actualRaw =
+    await getTokenBalanceRaw(
+      env,
+      mint
+    );
+
+  if (actualRaw <= 0) {
+    console.log(
+      `No token balance found for ${mint}. Removing position.`
+    );
 
     const positions =
-      await getPositions(env);
+      await loadPositions(env);
 
-    return {
-      ok: true,
-
-      bot:
-        BOT_NAME,
-
-      live_trading:
-        LIVE_TRADING,
-
-      trades_executed:
-        0,
-
-      sells_executed:
-        0,
-
-      repaired_count:
-        repair.repaired.length,
-
-      repaired:
-        repair.repaired,
-
-      positions,
-
-      message:
-        "Repair completed. This route never buys or sells."
-    };
-
-  } catch (error) {
-    return {
-      ok: false,
-
-      bot:
-        BOT_NAME,
-
-      error:
-        String(
-          error?.message ||
-          error
-        )
-    };
-  }
-}
-
-
-/* =========================================================
-   SELL
-========================================================= */
-
-async function sellPosition(
-  env,
-  position,
-  reason
-) {
-  try {
-    const balance =
-      await getTokenBalance(
-        env,
-        position.mint
+    const remaining =
+      positions.filter(
+        item => item.mint !== mint
       );
+
+    await savePositions(
+      env,
+      remaining
+    );
+
+    return;
+  }
+
+  const decimals =
+    Number.isFinite(Number(position.decimals))
+      ? Number(position.decimals)
+      : 0;
+
+  const actualAmount =
+    actualRaw /
+    Math.pow(10, decimals);
+
+  position.amount = actualAmount;
+  position.amount_raw = String(actualRaw);
+
+  /*
+    PRICE
+  */
+
+  const currentPrice =
+    await getTokenPrice(
+      env,
+      mint
+    );
+
+  if (
+    !Number.isFinite(currentPrice) ||
+    currentPrice <= 0
+  ) {
+    console.log(
+      `Unable to get price for ${mint}.`
+    );
+
+    return;
+  }
+
+  /*
+    ENTRY PRICE
+  */
+
+  let entryPrice =
+    Number(position.entryPrice);
+
+  if (
+    !Number.isFinite(entryPrice) ||
+    entryPrice <= 0
+  ) {
+    const tradeUsd =
+      Number(position.trade_usd);
 
     if (
-      !balance ||
-      balance <= 0
+      Number.isFinite(tradeUsd) &&
+      tradeUsd > 0 &&
+      actualAmount > 0
     ) {
-      await removePosition(
-        env,
-        position.mint
+      entryPrice =
+        tradeUsd / actualAmount;
+
+      position.entryPrice =
+        entryPrice;
+    } else {
+      console.log(
+        `Cannot determine entry price for ${mint}.`
       );
 
-      return {
-        action:
-          "SELL_CLEANUP",
-
-        token:
-          position.mint,
-
-        reason:
-          "No token balance found"
-      };
+      return;
     }
+  }
 
-    const order =
-      await getSellOrder(
-        position.mint,
-        String(balance)
-      );
+  /*
+    CURRENT PROFIT
+  */
 
-    if (!order) {
-      return {
-        action: "ERROR",
+  const change =
+    (currentPrice - entryPrice) /
+    entryPrice;
 
-        token:
-          position.mint,
+  /*
+    HIGHEST PRICE
+  */
 
-        error:
-          "No Jupiter sell route"
-      };
+  let highestPrice =
+    Number(position.highestPrice);
+
+  if (
+    !Number.isFinite(highestPrice) ||
+    highestPrice <= 0
+  ) {
+    highestPrice = entryPrice;
+  }
+
+  if (currentPrice > highestPrice) {
+    highestPrice = currentPrice;
+    position.highestPrice = highestPrice;
+  }
+
+  /*
+    TRAILING ACTIVATION
+  */
+
+  const highestProfit =
+    (highestPrice - entryPrice) /
+    entryPrice;
+
+  let shouldSell = false;
+  let reason = "";
+
+  /*
+    HARD STOP
+  */
+
+  if (change <= HARD_STOP_PCT) {
+    shouldSell = true;
+    reason = "hard_stop";
+  }
+
+  /*
+    TRAILING STOP
+  */
+
+  if (
+    !shouldSell &&
+    highestProfit >= TRAILING_ACTIVATE_PCT
+  ) {
+    const trailingStop =
+      highestPrice *
+      (1 - TRAILING_DISTANCE_PCT);
+
+    if (currentPrice <= trailingStop) {
+      shouldSell = true;
+      reason = "trailing_stop";
     }
+  }
 
-    if (!LIVE_TRADING) {
-      return {
-        action: "TEST_SELL",
+  console.log(
+    `Position ${position.symbol || mint}:`,
+    `change=${(change * 100).toFixed(2)}%`,
+    `highest=${(highestProfit * 100).toFixed(2)}%`,
+    `sell=${shouldSell}`,
+    `reason=${reason}`
+  );
 
-        token:
-          position.mint,
+  /*
+    SAVE UPDATED HIGH
+  */
 
-        reason
-      };
-    }
+  const allPositions =
+    await loadPositions(env);
 
-    const execution =
-      await executeOrder(
-        env,
-        order
-      );
-
-    if (!execution.success) {
-      return {
-        action: "ERROR",
-
-        token:
-          position.mint,
-
-        error:
-          `SELL EXECUTION FAILED: ${
-            execution.error ||
-            "Unknown error"
-          }`
-      };
-    }
-
-    await removePosition(
-      env,
-      position.mint
+  const index =
+    allPositions.findIndex(
+      item => item.mint === mint
     );
 
-    await setCooldown(env);
-
-    return {
-      action: "SELL",
-
-      token:
-        position.mint,
-
-      symbol:
-        position.symbol || null,
-
-      reason,
-
-      signature:
-        execution.signature || null
-    };
-
-  } catch (error) {
-    return {
-      action: "ERROR",
-
-      token:
-        position?.mint || null,
-
-      error:
-        `SELL ERROR: ${
-          error?.message ||
-          error
-        }`
-    };
+  if (index >= 0) {
+    allPositions[index] = position;
+    await savePositions(
+      env,
+      allPositions
+    );
   }
+
+  /*
+    SELL
+  */
+
+  if (!shouldSell) {
+    return;
+  }
+
+  await sellToken(
+    env,
+    position,
+    actualRaw,
+    reason
+  );
 }
 
 
-/* =========================================================
-   SELL ORDER
-========================================================= */
+/*
+  SELL TOKEN
+*/
 
-async function getSellOrder(
-  tokenMint,
-  amount
+async function sellToken(
+  env,
+  position,
+  rawAmount,
+  reason
 ) {
-  const url =
-    new URL(
-      `${SWAP_API}/order`
+  console.log(
+    `Selling ${position.symbol || position.mint}: ${reason}`
+  );
+
+  const order =
+    await getJupiterOrder(
+      env,
+      position.mint,
+      SOL_MINT,
+      rawAmount,
+      false
     );
 
-  url.searchParams.set(
-    "inputMint",
-    tokenMint
+  if (!order) {
+    throw new Error("Jupiter returned no sell order.");
+  }
+
+  if (!LIVE_TRADING) {
+    return {
+      ok: true,
+      action: "paper_sell",
+      mint: position.mint,
+      reason
+    };
+  }
+
+  const execution =
+    await executeJupiterOrder(
+      env,
+      order
+    );
+
+  if (!execution.success) {
+    throw new Error(
+      execution.error ||
+      "Jupiter sell execution failed."
+    );
+  }
+
+  const positions =
+    await loadPositions(env);
+
+  const remaining =
+    positions.filter(
+      item => item.mint !== position.mint
+    );
+
+  await savePositions(
+    env,
+    remaining
   );
 
-  url.searchParams.set(
-    "outputMint",
-    SOL_MINT
+  await setCooldown(env);
+
+  console.log(
+    `SELL COMPLETE ${position.symbol || position.mint}`
   );
 
-  url.searchParams.set(
-    "amount",
-    amount
-  );
+  return {
+    ok: true,
+    action: "sell",
+    mint: position.mint,
+    reason,
+    txid:
+      execution.signature ||
+      execution.txid ||
+      null
+  };
+}
 
-  url.searchParams.set(
+
+/*
+  JUPITER ORDER
+
+  Jupiter Swap API v2
+*/
+
+async function getJupiterOrder(
+  env,
+  inputMint,
+  outputMint,
+  amount,
+  exactIn
+) {
+  const params = new URLSearchParams();
+
+  params.set("inputMint", inputMint);
+  params.set("outputMint", outputMint);
+  params.set("amount", String(amount));
+  params.set(
     "taker",
     WALLET_ADDRESS
   );
-
-  url.searchParams.set(
+  params.set(
     "slippageBps",
     String(SLIPPAGE_BPS)
   );
 
+  if (!exactIn) {
+    params.set(
+      "swapMode",
+      "ExactIn"
+    );
+  }
+
   const response =
     await fetch(
-      url.toString(),
-      {
-        method: "GET",
-        headers: {
-          accept:
-            "application/json"
-        }
-      }
+      `https://api.jup.ag/swap/v2/order?${params.toString()}`
     );
-
-  const text =
-    await response.text();
 
   if (!response.ok) {
-    console.error(
-      "SELL ORDER ERROR:",
-      response.status,
-      text
-    );
+    const text =
+      await response.text();
 
     throw new Error(
-      `Jupiter sell order HTTP ${
-        response.status
-      }`
+      `Jupiter order failed: ${response.status} ${text}`
     );
   }
 
-  let data;
+  const data =
+    await response.json();
 
-  try {
-    data =
-      JSON.parse(text);
-  } catch {
+  if (data?.error) {
     throw new Error(
-      "Invalid Jupiter sell response"
+      data.error
     );
-  }
-
-  if (
-    !data?.transaction ||
-    !data?.requestId
-  ) {
-    return null;
   }
 
   return data;
 }
 
 
-/* =========================================================
-   TEST
-========================================================= */
+/*
+  EXECUTE JUPITER ORDER
+*/
 
-async function testBot(env) {
-  try {
-    validateEnv(env);
-
-    const solBalance =
-      await getSolBalance(env);
-
-    const solPrice =
-      await getSolPrice();
-
-    const walletValueUsd =
-      solBalance * solPrice;
-
-    const maxTradeUsd =
-      walletValueUsd >=
-      BALANCE_THRESHOLD_USD
-        ? LARGE_TRADE_CAP_USD
-        : SMALL_TRADE_CAP_USD;
-
-    const positions =
-      await getPositions(env);
-
-    const cooldown =
-      await getCooldown(env);
-
-    const trendingBackoff =
-      await getTrendingBackoff(env);
-
-    const cachedCandidates =
-      await getTrendingCache(env);
-
-    return {
-      ok: true,
-
-      bot:
-        BOT_NAME,
-
-      live_trading:
-        LIVE_TRADING,
-
-      wallet:
-        WALLET_ADDRESS,
-
-      sol_balance:
-        solBalance,
-
-      sol_price_usd:
-        solPrice,
-
-      wallet_value_usd:
-        Number(
-          walletValueUsd.toFixed(4)
-        ),
-
-      max_trade_usd:
-        maxTradeUsd,
-
-      balance_threshold_usd:
-        BALANCE_THRESHOLD_USD,
-
-      small_trade_cap_usd:
-        SMALL_TRADE_CAP_USD,
-
-      large_trade_cap_usd:
-        LARGE_TRADE_CAP_USD,
-
-      min_sol_reserve:
-        MIN_SOL_RESERVE,
-
-      max_positions:
-        MAX_POSITIONS,
-
-      open_positions:
-        positions.length,
-
-      trailing_activation_percent:
-        TRAILING_ACTIVATION * 100,
-
-      trailing_distance_percent:
-        TRAILING_DISTANCE * 100,
-
-      stop_loss_percent:
-        STOP_LOSS * 100,
-
-      cooldown_active:
-        cooldown.active,
-
-      trending_backoff_active:
-        trendingBackoff.active,
-
-      trending_backoff_seconds:
-        trendingBackoff.seconds_remaining,
-
-      cached_candidates:
-        cachedCandidates.slice(
-          0,
-          MAX_CANDIDATES
-        ),
-
-      positions,
-
-      message:
-        "TEST NEVER BUYS OR SELLS and does not request Jupiter trending data"
-    };
-
-  } catch (error) {
-    return {
-      ok: false,
-
-      bot:
-        BOT_NAME,
-
-      error:
-        String(
-          error?.message ||
-          error
-        )
-    };
+async function executeJupiterOrder(
+  env,
+  order
+) {
+  if (!env.BOT_PRIVATE_KEY) {
+    throw new Error(
+      "BOT_PRIVATE_KEY secret is missing"
+    );
   }
-}
 
+  const transaction =
+    order?.transaction;
 
-/* =========================================================
-   STATUS
-========================================================= */
+  const requestId =
+    order?.requestId;
 
-async function status(env) {
-  try {
-    validateEnv(env);
-
-    const solBalance =
-      await getSolBalance(env);
-
-    const solPrice =
-      await getSolPrice();
-
-    const walletValueUsd =
-      solBalance * solPrice;
-
-    const maxTradeUsd =
-      walletValueUsd >=
-      BALANCE_THRESHOLD_USD
-        ? LARGE_TRADE_CAP_USD
-        : SMALL_TRADE_CAP_USD;
-
-    const positions =
-      await getPositions(env);
-
-    const cooldown =
-      await getCooldown(env);
-
-    const trendingBackoff =
-      await getTrendingBackoff(env);
-
-    return {
-      ok: true,
-
-      bot:
-        BOT_NAME,
-
-      live_trading:
-        LIVE_TRADING,
-
-      wallet:
-        WALLET_ADDRESS,
-
-      sol_balance:
-        solBalance,
-
-      sol_price_usd:
-        solPrice,
-
-      wallet_value_usd:
-        Number(
-          walletValueUsd.toFixed(4)
-        ),
-
-      max_trade_usd:
-        maxTradeUsd,
-
-      balance_threshold_usd:
-        BALANCE_THRESHOLD_USD,
-
-      small_trade_cap_usd:
-        SMALL_TRADE_CAP_USD,
-
-      large_trade_cap_usd:
-        LARGE_TRADE_CAP_USD,
-
-      min_sol_reserve:
-        MIN_SOL_RESERVE,
-
-      max_positions:
-        MAX_POSITIONS,
-
-      open_positions:
-        positions.length,
-
-      trailing_activation_percent:
-        TRAILING_ACTIVATION * 100,
-
-      trailing_distance_percent:
-        TRAILING_DISTANCE * 100,
-
-      stop_loss_percent:
-        STOP_LOSS * 100,
-
-      cooldown_active:
-        cooldown.active,
-
-      trending_backoff_active:
-        trendingBackoff.active,
-
-      trending_backoff_seconds:
-        trendingBackoff.seconds_remaining,
-
-      positions
-    };
-
-  } catch (error) {
-    return {
-      ok: false,
-
-      bot:
-        BOT_NAME,
-
-      error:
-        String(
-          error?.message ||
-          error
-        )
-    };
+  if (!transaction) {
+    throw new Error(
+      "Jupiter order did not contain a transaction."
+    );
   }
-}
 
+  if (!requestId) {
+    throw new Error(
+      "Jupiter order did not contain a requestId."
+    );
+  }
 
-/* =========================================================
-   SOL BALANCE
-========================================================= */
-
-async function getSolBalance(env) {
-  const result =
-    await heliusRpc(
-      env,
-      "getBalance",
-      [
-        WALLET_ADDRESS
-      ]
+  const signedTransaction =
+    await signSolanaTransaction(
+      transaction,
+      env.BOT_PRIVATE_KEY
     );
 
-  const lamports =
-    Number(
-      result?.value || 0
+  const response =
+    await fetch(
+      "https://api.jup.ag/swap/v2/execute",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type":
+            "application/json"
+        },
+        body: JSON.stringify({
+          signedTransaction,
+          requestId
+        })
+      }
     );
 
-  return (
-    lamports /
-    1_000_000_000
-  );
+  const data =
+    await response.json();
+
+  if (!response.ok) {
+    return {
+      success: false,
+      error:
+        data?.error ||
+        `Jupiter execute failed: ${response.status}`
+    };
+  }
+
+  return {
+    success:
+      data?.status === "Success" ||
+      data?.code === 0 ||
+      data?.signature ||
+      data?.txid
+        ? true
+        : false,
+
+    signature:
+      data?.signature ||
+      data?.txid ||
+      data?.transactionId ||
+      null,
+
+    txid:
+      data?.txid ||
+      data?.signature ||
+      data?.transactionId ||
+      null,
+
+    error:
+      data?.error ||
+      null
+  };
 }
 
 
-/* =========================================================
-   TOKEN BALANCE
-========================================================= */
+/*
+  TOKEN BALANCE
 
-async function getTokenBalance(
+  Uses Helius RPC.
+*/
+
+async function getTokenBalanceRaw(
   env,
   mint
 ) {
@@ -2357,34 +1380,24 @@ async function getTokenBalance(
       "getTokenAccountsByOwner",
       [
         WALLET_ADDRESS,
-
         {
           mint
         },
-
         {
-          encoding:
-            "jsonParsed"
+          encoding: "jsonParsed"
         }
       ]
     );
 
   const accounts =
-    result?.value || [];
+    result?.result?.value || [];
 
   let total = 0;
 
-  for (
-    const account of accounts
-  ) {
+  for (const account of accounts) {
     const amount =
-      account
-        ?.account
-        ?.data
-        ?.parsed
-        ?.info
-        ?.tokenAmount
-        ?.amount;
+      account?.account?.data?.parsed?.info
+        ?.tokenAmount?.amount;
 
     if (amount) {
       total += Number(amount);
@@ -2395,53 +1408,17 @@ async function getTokenBalance(
 }
 
 
-/* =========================================================
-   TOKEN DECIMALS
-========================================================= */
-
-async function getTokenDecimals(
-  env,
-  mint
-) {
-  const result =
-    await heliusRpc(
-      env,
-      "getTokenSupply",
-      [mint]
-    );
-
-  const decimals =
-    result?.value?.decimals;
-
-  if (
-    !Number.isInteger(decimals)
-  ) {
-    throw new Error(
-      `Could not determine token decimals for ${mint}`
-    );
-  }
-
-  return decimals;
-}
-
-
-/* =========================================================
-   HELIUS RPC
-========================================================= */
+/*
+  HELIUS RPC
+*/
 
 async function heliusRpc(
   env,
   method,
   params
 ) {
-  if (!env.HELIUS_API_KEY) {
-    throw new Error(
-      "HELIUS_API_KEY secret is missing"
-    );
-  }
-
   const url =
-    `${HELIUS_RPC_BASE}/?api-key=${encodeURIComponent(
+    `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(
       env.HELIUS_API_KEY
     )}`;
 
@@ -2450,370 +1427,229 @@ async function heliusRpc(
       url,
       {
         method: "POST",
-
         headers: {
-          "content-type":
+          "Content-Type":
             "application/json"
         },
-
-        body:
-          JSON.stringify({
-            jsonrpc:
-              "2.0",
-
-            id: 1,
-
-            method,
-
-            params
-          })
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: Date.now(),
+          method,
+          params
+        })
       }
     );
 
-  const text =
-    await response.text();
-
   if (!response.ok) {
+    const text =
+      await response.text();
+
     throw new Error(
-      `Helius HTTP ${
-        response.status
-      }: ${text}`
+      `Helius RPC failed: ${response.status} ${text}`
     );
   }
 
-  let data;
+  const data =
+    await response.json();
 
-  try {
-    data =
-      JSON.parse(text);
-  } catch {
-    throw new Error(
-      "Invalid Helius response"
-    );
-  }
-
-  if (data.error) {
+  if (data?.error) {
     throw new Error(
       data.error.message ||
-      "Helius RPC error"
+      JSON.stringify(data.error)
     );
   }
 
-  return data.result;
+  return data;
 }
 
 
-/* =========================================================
-   KV POSITIONS
-========================================================= */
-
-async function getPositions(env) {
-  if (!env.BOT_KV) {
-    throw new Error(
-      "BOT_KV binding is missing"
-    );
-  }
-
-  const value =
-    await env.BOT_KV.get(
-      POSITION_KEY
-    );
-
-  if (!value) {
-    return [];
-  }
-
-  try {
-    const positions =
-      JSON.parse(value);
-
-    return Array.isArray(positions)
-      ? positions
-      : [];
-
-  } catch {
-    return [];
-  }
-}
-
-
-async function savePosition(
-  env,
-  position
-) {
-  const positions =
-    await getPositions(env);
-
-  const existingIndex =
-    positions.findIndex(
-      p =>
-        p.mint ===
-        position.mint
-    );
-
-  if (existingIndex >= 0) {
-    positions[
-      existingIndex
-    ] = position;
-  } else {
-    positions.push(position);
-  }
-
-  await env.BOT_KV.put(
-    POSITION_KEY,
-    JSON.stringify(positions)
-  );
-}
-
-
-async function removePosition(
-  env,
-  mint
-) {
-  const positions =
-    await getPositions(env);
-
-  const remaining =
-    positions.filter(
-      p =>
-        p.mint !==
-        mint
-    );
-
-  await env.BOT_KV.put(
-    POSITION_KEY,
-    JSON.stringify(remaining)
-  );
-}
-
-
-/* =========================================================
-   COOLDOWN
-========================================================= */
-
-async function getCooldown(env) {
-  const value =
-    await env.BOT_KV.get(
-      COOLDOWN_KEY
-    );
-
-  if (!value) {
-    return {
-      active: false,
-      seconds_remaining: 0
-    };
-  }
-
-  const timestamp =
-    Number(value);
-
-  if (!Number.isFinite(timestamp)) {
-    return {
-      active: false,
-      seconds_remaining: 0
-    };
-  }
-
-  const elapsed =
-    Math.floor(
-      (
-        Date.now() -
-        timestamp
-      ) / 1000
-    );
-
-  const remaining =
-    COOLDOWN_SECONDS -
-    elapsed;
-
-  if (remaining <= 0) {
-    return {
-      active: false,
-      seconds_remaining: 0
-    };
-  }
-
-  return {
-    active: true,
-    seconds_remaining:
-      remaining
-  };
-}
-
-
-async function setCooldown(env) {
-  await env.BOT_KV.put(
-    COOLDOWN_KEY,
-    String(Date.now())
-  );
-}
-
-
-/* =========================================================
-   PRIVATE KEY / SOLANA SIGNING
-========================================================= */
+/*
+  SOLANA TRANSACTION SIGNING
+*/
 
 async function signSolanaTransaction(
-  transaction,
+  transactionBase64,
   privateKeyValue
 ) {
-  let offset = 0;
+  const transaction =
+    base64ToBytes(
+      transactionBase64
+    );
 
-  const decoded =
-    decodeShortVec(
-      transaction,
-      offset
+  const privateKeyBytes =
+    decodePrivateKey(
+      privateKeyValue
     );
 
   const signatureCount =
-    decoded.value;
+    decodeShortVec(
+      transaction,
+      0
+    );
 
-  offset =
-    decoded.offset;
+  const signatureOffset =
+    signatureCount.offset;
 
-  if (signatureCount <= 0) {
+  const count =
+    signatureCount.value;
+
+  if (count < 1) {
     throw new Error(
-      "Transaction has no signature slots"
+      "Transaction contains no signature slots."
     );
   }
 
-  const signaturesStart =
-    offset;
-
-  const messageStart =
-    signaturesStart +
-    signatureCount *
-      64;
+  const messageOffset =
+    signatureOffset +
+    count * 64;
 
   if (
-    messageStart >=
+    messageOffset >
     transaction.length
   ) {
     throw new Error(
-      "Invalid Solana transaction"
+      "Invalid Solana transaction."
     );
   }
 
   const message =
     transaction.slice(
-      messageStart
+      messageOffset
     );
 
-  const privateKey =
-    await importPrivateKey(
-      privateKeyValue
+  const cryptoKey =
+    await importEd25519PrivateKey(
+      privateKeyBytes
     );
 
   const signature =
-    new Uint8Array(
-      await crypto.subtle.sign(
-        {
-          name: "Ed25519"
-        },
-        privateKey,
-        message
-      )
+    await crypto.subtle.sign(
+      "Ed25519",
+      cryptoKey,
+      message
     );
 
-  if (signature.length !== 64) {
-    throw new Error(
-      "Invalid Ed25519 signature length"
-    );
-  }
+  const signatureBytes =
+    new Uint8Array(signature);
 
-  const signed =
-    new Uint8Array(
-      transaction
-    );
-
-  signed.set(
-    signature,
-    signaturesStart
+  transaction.set(
+    signatureBytes,
+    signatureOffset
   );
 
-  return signed;
+  return bytesToBase64(
+    transaction
+  );
 }
 
 
-/* =========================================================
-   PRIVATE KEY IMPORT
-========================================================= */
+/*
+  PRIVATE KEY DECODER
+*/
 
-async function importPrivateKey(value) {
-  let bytes;
-
+function decodePrivateKey(value) {
   const trimmed =
     String(value).trim();
 
+  /*
+    JSON ARRAY FORMAT
+  */
+
   if (trimmed.startsWith("[")) {
-    let array;
+    let parsed;
 
     try {
-      array =
-        JSON.parse(trimmed);
+      parsed = JSON.parse(trimmed);
     } catch {
       throw new Error(
-        "WALLET_PRIVATE_KEY JSON is invalid"
+        "BOT_PRIVATE_KEY JSON is invalid."
       );
     }
 
-    if (!Array.isArray(array)) {
+    if (!Array.isArray(parsed)) {
       throw new Error(
-        "WALLET_PRIVATE_KEY must be an array"
+        "BOT_PRIVATE_KEY must be an array or base58 key."
       );
     }
 
-    bytes =
-      new Uint8Array(array);
+    const bytes =
+      new Uint8Array(parsed);
 
-  } else {
-    bytes =
-      base58ToBytes(trimmed);
+    if (
+      bytes.length !== 32 &&
+      bytes.length !== 64
+    ) {
+      throw new Error(
+        "BOT_PRIVATE_KEY must contain 32 or 64 bytes."
+      );
+    }
+
+    return bytes.length === 64
+      ? bytes.slice(0, 32)
+      : bytes;
   }
 
-  if (bytes.length === 64) {
-    bytes =
-      bytes.slice(0, 32);
-  }
+  /*
+    BASE58 FORMAT
+  */
 
-  if (bytes.length !== 32) {
+  const decoded =
+    base58Decode(trimmed);
+
+  if (
+    decoded.length !== 32 &&
+    decoded.length !== 64
+  ) {
     throw new Error(
-      `WALLET_PRIVATE_KEY must decode to 32 or 64 bytes; got ${bytes.length}`
+      "BOT_PRIVATE_KEY must decode to 32 or 64 bytes."
     );
   }
 
-  const pkcs8Prefix =
+  return decoded.length === 64
+    ? decoded.slice(0, 32)
+    : decoded;
+}
+
+
+/*
+  ED25519 PKCS8 IMPORT
+*/
+
+async function importEd25519PrivateKey(
+  rawPrivateKey
+) {
+  if (rawPrivateKey.length !== 32) {
+    throw new Error(
+      "Ed25519 private key must be 32 bytes."
+    );
+  }
+
+  const prefix =
     new Uint8Array([
       0x30, 0x2e,
-      0x02, 0x01,
-      0x00,
+      0x02, 0x01, 0x00,
       0x30, 0x05,
       0x06, 0x03,
-      0x2b, 0x65,
-      0x70,
+      0x2b, 0x65, 0x70,
       0x04, 0x22,
       0x04, 0x20
     ]);
 
-  const keyBytes =
+  const pkcs8 =
     new Uint8Array(
-      pkcs8Prefix.length +
-      bytes.length
+      prefix.length +
+      rawPrivateKey.length
     );
 
-  keyBytes.set(
-    pkcs8Prefix,
-    0
-  );
-
-  keyBytes.set(
-    bytes,
-    pkcs8Prefix.length
+  pkcs8.set(prefix, 0);
+  pkcs8.set(
+    rawPrivateKey,
+    prefix.length
   );
 
   return crypto.subtle.importKey(
     "pkcs8",
-    keyBytes,
+    pkcs8,
     {
       name: "Ed25519"
     },
@@ -2823,15 +1659,15 @@ async function importPrivateKey(value) {
 }
 
 
-/* =========================================================
-   BASE58
-========================================================= */
+/*
+  BASE58 DECODER
+*/
 
-function base58ToBytes(value) {
+function base58Decode(value) {
   const alphabet =
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-  let num = 0n;
+  let bytes = [0];
 
   for (const char of value) {
     const index =
@@ -2839,31 +1675,36 @@ function base58ToBytes(value) {
 
     if (index < 0) {
       throw new Error(
-        "Invalid base58 private key"
+        "Invalid base58 character in BOT_PRIVATE_KEY."
       );
     }
 
-    num =
-      num *
-      58n +
-      BigInt(index);
+    let carry = index;
+
+    for (
+      let i = 0;
+      i < bytes.length;
+      i++
+    ) {
+      const x =
+        bytes[i] * 58 +
+        carry;
+
+      bytes[i] =
+        x & 0xff;
+
+      carry =
+        x >> 8;
+    }
+
+    while (carry > 0) {
+      bytes.push(
+        carry & 0xff
+      );
+
+      carry >>= 8;
+    }
   }
-
-  const bytes = [];
-
-  while (num > 0n) {
-    bytes.push(
-      Number(
-        num & 255n
-      )
-    );
-
-    num >>= 8n;
-  }
-
-  bytes.reverse();
-
-  let leadingZeros = 0;
 
   for (
     let i = 0;
@@ -2871,26 +1712,67 @@ function base58ToBytes(value) {
     value[i] === "1";
     i++
   ) {
-    leadingZeros++;
+    bytes.push(0);
   }
 
-  return new Uint8Array([
-    ...new Array(
-      leadingZeros
-    ).fill(0),
-
-    ...bytes
-  ]);
+  return new Uint8Array(
+    bytes.reverse()
+  );
 }
 
 
-/* =========================================================
-   BASE64
-========================================================= */
+/*
+  SHORTVEC DECODER
+*/
 
-function base64ToBytes(base64) {
+function decodeShortVec(
+  bytes,
+  offset
+) {
+  let value = 0;
+  let shift = 0;
+  let position = offset;
+
+  while (true) {
+    if (position >= bytes.length) {
+      throw new Error(
+        "Invalid shortvec."
+      );
+    }
+
+    const byte =
+      bytes[position++];
+
+    value |=
+      (byte & 0x7f) << shift;
+
+    if ((byte & 0x80) === 0) {
+      break;
+    }
+
+    shift += 7;
+
+    if (shift > 35) {
+      throw new Error(
+        "Invalid shortvec."
+      );
+    }
+  }
+
+  return {
+    value,
+    offset: position
+  };
+}
+
+
+/*
+  BASE64
+*/
+
+function base64ToBytes(value) {
   const binary =
-    atob(base64);
+    atob(value);
 
   const bytes =
     new Uint8Array(
@@ -2913,111 +1795,30 @@ function base64ToBytes(base64) {
 function bytesToBase64(bytes) {
   let binary = "";
 
-  const chunkSize =
-    0x8000;
+  const chunkSize = 0x8000;
 
   for (
     let i = 0;
     i < bytes.length;
     i += chunkSize
   ) {
-    binary +=
-      String.fromCharCode(
-        ...bytes.slice(
-          i,
-          i + chunkSize
-        )
-      );
+    binary += String.fromCharCode(
+      ...bytes.slice(
+        i,
+        i + chunkSize
+      )
+    );
   }
 
   return btoa(binary);
 }
 
 
-/* =========================================================
-   SHORTVEC
-========================================================= */
+/*
+  JSON RESPONSE
+*/
 
-function decodeShortVec(
-  bytes,
-  offset
-) {
-  let value = 0;
-  let shift = 0;
-
-  while (true) {
-    if (
-      offset >=
-      bytes.length
-    ) {
-      throw new Error(
-        "Invalid shortvec encoding"
-      );
-    }
-
-    const byte =
-      bytes[offset++];
-
-    value |=
-      (byte & 0x7f) <<
-      shift;
-
-    if (
-      (byte & 0x80) ===
-      0
-    ) {
-      break;
-    }
-
-    shift += 7;
-
-    if (shift > 28) {
-      throw new Error(
-        "Shortvec value too large"
-      );
-    }
-  }
-
-  return {
-    value,
-    offset
-  };
-}
-
-
-/* =========================================================
-   VALIDATION
-========================================================= */
-
-function validateEnv(env) {
-  if (!env.BOT_KV) {
-    throw new Error(
-      "BOT_KV binding is missing"
-    );
-  }
-
-  if (!env.HELIUS_API_KEY) {
-    throw new Error(
-      "HELIUS_API_KEY secret is missing"
-    );
-  }
-
-  if (!env.WALLET_PRIVATE_KEY) {
-    throw new Error(
-      "WALLET_PRIVATE_KEY secret is missing"
-    );
-  }
-}
-
-
-/* =========================================================
-   JSON RESPONSE
-========================================================= */
-
-function json(
-  data,
-  status = 200
-) {
+function json(data, status = 200) {
   return new Response(
     JSON.stringify(
       data,
@@ -3026,14 +1827,10 @@ function json(
     ),
     {
       status,
-
       headers: {
-        "content-type":
-          "application/json; charset=utf-8",
-
-        "cache-control":
-          "no-store"
+        "Content-Type":
+          "application/json"
       }
     }
   );
-              }
+    }
