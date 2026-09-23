@@ -6,8 +6,8 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 const LIVE_TRADING = true;
 
-const PROFIT_TARGET = 0.025;
 const STOP_LOSS = -0.01;
+const TRAILING_STOP = 0.03;
 
 const SMALL_TRADE_CAP_USD = 2;
 const LARGE_TRADE_CAP_USD = 5;
@@ -110,8 +110,8 @@ async function runBot(env, source) {
     max_trade_usd: null,
     open_positions: 0,
     max_positions: MAX_POSITIONS,
-    profit_target_percent: PROFIT_TARGET * 100,
     stop_loss_percent: STOP_LOSS * 100,
+    trailing_stop_percent: TRAILING_STOP * 100,
     actions: [],
     positions: []
   };
@@ -543,6 +543,13 @@ async function findAndBuy(
             )
               ? entryPrice
               : null,
+
+          /*
+            Start highest profit at 0%.
+            The position management code will update
+            this whenever a new high is reached.
+          */
+          highest_profit_percent: 0,
 
           amount_raw:
             String(
@@ -1152,21 +1159,53 @@ async function managePositions(
         ) /
         position.entry_price_usd;
 
-      if (
-        change >=
-        PROFIT_TARGET
-      ) {
-        actions.push(
-          await sellPosition(
-            env,
-            position,
-            "PROFIT_TARGET"
+      /*
+        Highest profit tracking.
+
+        Older positions may not have this field.
+        In that case, start it at the current
+        profit if the position is profitable.
+      */
+      const previousHighest =
+        Number.isFinite(
+          Number(
+            position.highest_profit_percent
           )
+        )
+          ? Number(
+              position.highest_profit_percent
+            ) / 100
+          : 0;
+
+      const highestProfit =
+        Math.max(
+          previousHighest,
+          change
         );
 
-        continue;
+      /*
+        Save a new highest profit.
+      */
+      if (
+        highestProfit >
+        previousHighest
+      ) {
+        position.highest_profit_percent =
+          Number(
+            (
+              highestProfit * 100
+            ).toFixed(3)
+          );
+
+        await savePosition(
+          env,
+          position
+        );
       }
 
+      /*
+        Hard stop-loss remains -1%.
+      */
       if (
         change <=
         STOP_LOSS
@@ -1176,6 +1215,28 @@ async function managePositions(
             env,
             position,
             "STOP_LOSS"
+          )
+        );
+
+        continue;
+      }
+
+      /*
+        Once the position has reached profit,
+        sell if it falls 3 percentage points
+        below its highest profit.
+      */
+      if (
+        highestProfit > 0 &&
+        change <=
+          highestProfit -
+          TRAILING_STOP
+      ) {
+        actions.push(
+          await sellPosition(
+            env,
+            position,
+            "TRAILING_STOP"
           )
         );
 
@@ -1198,7 +1259,24 @@ async function managePositions(
             (
               change * 100
             ).toFixed(3)
-          )
+          ),
+        highest_profit_percent:
+          Number(
+            (
+              highestProfit * 100
+            ).toFixed(3)
+          ),
+        trailing_sell_percent:
+          highestProfit > 0
+            ? Number(
+                (
+                  (
+                    highestProfit -
+                    TRAILING_STOP
+                  ) * 100
+                ).toFixed(3)
+              )
+            : null
       });
 
     } catch (error) {
@@ -1498,10 +1576,10 @@ async function testBot(env) {
         MAX_POSITIONS,
       open_positions:
         positions.length,
-      profit_target_percent:
-        PROFIT_TARGET * 100,
       stop_loss_percent:
         STOP_LOSS * 100,
+      trailing_stop_percent:
+        TRAILING_STOP * 100,
       cooldown_active:
         cooldown.active,
       positions,
@@ -1591,10 +1669,10 @@ async function status(env) {
         MAX_POSITIONS,
       open_positions:
         positions.length,
-      profit_target_percent:
-        PROFIT_TARGET * 100,
       stop_loss_percent:
         STOP_LOSS * 100,
+      trailing_stop_percent:
+        TRAILING_STOP * 100,
       cooldown_active:
         cooldown.active,
       positions
@@ -2371,4 +2449,4 @@ function json(
       }
     }
   );
-}
+          }
