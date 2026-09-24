@@ -34,7 +34,13 @@ PAPER ACCOUNT
 ============================================================
 */
 
-const PAPER_SCHEMA_VERSION = 2;
+/*
+UPDATED:
+Schema 3 forces the old paper-account state to be
+reinitialized so the unexplained ~$0.099 old loss is removed.
+*/
+
+const PAPER_SCHEMA_VERSION = 3;
 
 const PAPER_STARTING_CASH_USD = 100;
 const PAPER_MIN_CASH_RESERVE_USD = 10;
@@ -177,11 +183,21 @@ const HOURLY_SELL_RATIO = 1.43;
 ============================================================
 ENTRY SCORE
 ============================================================
+
+UPDATED:
+The previous 50 score requirement produced several
+risk-passing candidates but no eligible entries.
+
+45 allows more qualified setups through while keeping
+the other risk and chase protections intact.
+
+Momentum minimum reduced from 5 to 4 for the same reason.
+============================================================
 */
 
-const MIN_ENTRY_SCORE = 50;
+const MIN_ENTRY_SCORE = 45;
 
-const MIN_MOMENTUM_SCORE = 5;
+const MIN_MOMENTUM_SCORE = 4;
 
 /*
 ============================================================
@@ -2151,9 +2167,8 @@ async function buildCandidates(
 
   /*
   IMPORTANT:
-  GeckoTerminal candidates are now included
-  in DEX hydration instead of merely being
-  counted as a separate source.
+  GeckoTerminal candidates are included
+  in DEX hydration.
   */
 
   const dexCandidates = [
@@ -2493,10 +2508,6 @@ async function openPaperPosition(
     };
   }
 
-  /*
-  Calculate current equity BEFORE buying.
-  */
-
   const positionValue =
     portfolio.open_positions.reduce(
       (sum, position) =>
@@ -2757,18 +2768,6 @@ function updatePosition(
     };
   }
 
-  /*
-  ==========================================================
-  REVERSAL CONFIRMATION
-  ==========================================================
-
-  Count ONE reversal signal per monitoring cycle.
-
-  Previously, short-term and hourly selling could
-  both increment the counter during the same cycle.
-  ==========================================================
-  */
-
   const buyPressure5 =
     calculateBuyPressure5m(
       candidate
@@ -2790,6 +2789,10 @@ function updatePosition(
       1 +
       PROFIT_REVERSAL_SELL_RATIO
     );
+
+  /*
+  Count ONE reversal signal per monitoring cycle.
+  */
 
   const reversalSignal =
     shortTermSelling ||
@@ -3701,6 +3704,12 @@ async function getStatus(
 
       max_entry_24h_percent:
         MAX_ENTRY_24H_PERCENT,
+
+      min_entry_score:
+        MIN_ENTRY_SCORE,
+
+      min_momentum_score:
+        MIN_MOMENTUM_SCORE,
 
       paper_mode:
         PAPER_MODE
