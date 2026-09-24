@@ -5,12 +5,14 @@ const BOT_NAME = "memebott";
   MEMEBOTT — PAPER TRADING ONLY
   ============================================================
 
-  IMPORTANT:
-  - No private key
-  - No wallet signing
-  - No real transactions
-  - No real-money trading
-  - All buys/sells are simulated
+  Storage revision:
+  - Scans can run every minute.
+  - No KV write for ordinary no-trade scans.
+  - Portfolio persists on actual trades.
+  - Important position-state changes may persist.
+  - Periodic checkpoint protects state.
+  - last_scan is NOT persisted.
+  - Errors are logged instead of creating another KV write.
 */
 
 const PAPER_MODE = true;
@@ -21,16 +23,24 @@ const PAPER_SCHEMA_VERSION = 3;
    ============================================================ */
 
 const STARTING_CASH_USD = 100;
-
 const MIN_CASH_RESERVE_USD = 10;
-
 const MAX_POSITIONS = 7;
-
 const MAX_NEW_BUYS_PER_RUN = 1;
-
 const MAX_PAPER_POSITION_USD = 40;
-
 const COOLDOWN_SECONDS = 60;
+
+/*
+  KV protection.
+
+  The scanner remains one-minute, but portfolio persistence
+  is deliberately throttled so the bot does not burn through
+  Cloudflare KV writes when nothing meaningful happened.
+
+  120 seconds means a theoretical maximum of about 720
+  bot-generated persistence writes/day.
+*/
+const MIN_PERSIST_INTERVAL_SECONDS = 120;
+const CHECKPOINT_INTERVAL_SECONDS = 300;
 
 /* Progressive paper position sizing */
 const POSITION_SIZE_TIERS = [
@@ -47,28 +57,16 @@ const POSITION_SIZE_TIERS = [
    ============================================================ */
 
 const STOP_LOSS = -0.01;
-
 const TRAILING_ACTIVATION = 0.01;
-
 const TRAILING_STOP = 0.03;
-
 const REVERSAL_CONFIRMATIONS_REQUIRED = 2;
-
 const PROFIT_REVERSAL_SELL_RATIO = 1.20;
 
 /* ============================================================
    ENTRY SETTINGS
    ============================================================ */
 
-/*
-  Controlled adjustment:
-  - Overall score: 45
-  - Momentum requirement: 5
-
-  Safety filters remain active.
-*/
 const MIN_ENTRY_SCORE = 45;
-
 const MIN_MOMENTUM_SCORE = 5;
 
 /* ============================================================
@@ -76,11 +74,8 @@ const MIN_MOMENTUM_SCORE = 5;
    ============================================================ */
 
 const MIN_TOKEN_PRICE = 0.00000001;
-
 const MIN_LIQUIDITY_USD = 15000;
-
 const MIN_VOLUME_24H_USD = 10000;
-
 const MIN_VOLUME_1H_USD = 1000;
 
 /* ============================================================
@@ -88,11 +83,8 @@ const MIN_VOLUME_1H_USD = 1000;
    ============================================================ */
 
 const MAX_5M_GAIN = 0.15;
-
 const MAX_1H_GAIN = 0.45;
-
 const MAX_6H_GAIN = 1.00;
-
 const MAX_24H_GAIN = 5.00;
 
 /* ============================================================
@@ -100,7 +92,6 @@ const MAX_24H_GAIN = 5.00;
    ============================================================ */
 
 const NEW_TOKEN_MAX_AGE_DAYS = 1;
-
 const NEW_TOKEN_MIN_LIQUIDITY_USD = 25000;
 
 /* ============================================================
@@ -108,15 +99,10 @@ const NEW_TOKEN_MIN_LIQUIDITY_USD = 25000;
    ============================================================ */
 
 const EXTREME_1H_MOVE = 0.50;
-
 const STRONG_NEGATIVE_6H = -0.15;
-
 const STRONG_NEGATIVE_5M = -0.03;
-
 const BOUNCE_5M = 0.07;
-
 const SHORT_TERM_SELL_RATIO = 1.50;
-
 const HOURLY_SELL_RATIO = 1.43;
 
 /* ============================================================
@@ -124,11 +110,8 @@ const HOURLY_SELL_RATIO = 1.43;
    ============================================================ */
 
 const MAX_CANDIDATES = 30;
-
 const MAX_DEX_TOKENS_ANALYZED = 40;
-
 const MAX_GECKO_POOLS_ANALYZED = 20;
-
 const MAX_JUPITER_PRICE_CHECKS = 20;
 
 /* ============================================================
@@ -136,11 +119,8 @@ const MAX_JUPITER_PRICE_CHECKS = 20;
    ============================================================ */
 
 const DEX_BASE = "https://api.dexscreener.com";
-
 const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
-
-const JUPITER_PRICE_API =
-  "https://api.jup.ag/price/v3";
+const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";
 
 /* ============================================================
    UTILITY FUNCTIONS
@@ -172,14 +152,22 @@ function unique(items) {
   return [...new Set(items.filter(Boolean))];
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 function errorText(error) {
   return error instanceof Error
     ? error.message
     : String(error);
+}
+
+function cloneObject(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function restoreObject(target, snapshot) {
+  for (const key of Object.keys(target)) {
+    delete target[key];
+  }
+
+  Object.assign(target, snapshot);
 }
 
 /* ============================================================
@@ -211,36 +199,57 @@ async function fetchJson(url, options = {}) {
 function createEmptyPortfolio() {
   return {
     schema_version: PAPER_SCHEMA_VERSION,
-    starting_cash_usd: STARTING_CASH_USD,
-    cash_usd: STARTING_CASH_USD,
+
+    starting_cash_usd:
+      STARTING_CASH_USD,
+
+    cash_usd:
+      STARTING_CASH_USD,
+
     realized_pnl_usd: 0,
+
     positions: [],
+
     history: [],
+
     cooldowns: {},
-    last_scan: null,
-    created_at: nowIso(),
-    updated_at: nowIso()
+
+    created_at:
+      nowIso(),
+
+    updated_at:
+      nowIso(),
+
+    last_persist_at:
+      0,
+
+    last_persist_reason:
+      null
   };
 }
 
 async function loadPortfolio(env) {
-  const raw = await env.BOT_KV.get("PAPER_PORTFOLIO");
+  const raw =
+    await env.BOT_KV.get(
+      "PAPER_PORTFOLIO"
+    );
 
   if (!raw) {
     return createEmptyPortfolio();
   }
 
   try {
-    const portfolio = JSON.parse(raw);
+    const portfolio =
+      JSON.parse(raw);
 
     /*
-      Schema mismatch intentionally starts a clean paper
-      portfolio so stale state from an older bot version
-      cannot contaminate the new engine.
+      Keep schema version 3 so the existing paper account
+      is not intentionally wiped.
     */
     if (
-      safeNumber(portfolio.schema_version) !==
-      PAPER_SCHEMA_VERSION
+      safeNumber(
+        portfolio.schema_version
+      ) !== PAPER_SCHEMA_VERSION
     ) {
       return createEmptyPortfolio();
     }
@@ -248,13 +257,31 @@ async function loadPortfolio(env) {
     portfolio.positions ||= [];
     portfolio.history ||= [];
     portfolio.cooldowns ||= {};
-    portfolio.cash_usd = safeNumber(
-      portfolio.cash_usd,
-      STARTING_CASH_USD
-    );
-    portfolio.realized_pnl_usd = safeNumber(
-      portfolio.realized_pnl_usd
-    );
+
+    portfolio.cash_usd =
+      safeNumber(
+        portfolio.cash_usd,
+        STARTING_CASH_USD
+      );
+
+    portfolio.realized_pnl_usd =
+      safeNumber(
+        portfolio.realized_pnl_usd
+      );
+
+    portfolio.last_persist_at =
+      safeNumber(
+        portfolio.last_persist_at
+      );
+
+    portfolio.last_persist_reason ||=
+      null;
+
+    /*
+      Legacy versions stored the entire scan here.
+      Never carry that large object forward.
+    */
+    delete portfolio.last_scan;
 
     return portfolio;
   } catch {
@@ -262,26 +289,124 @@ async function loadPortfolio(env) {
   }
 }
 
-async function savePortfolio(env, portfolio) {
-  portfolio.updated_at = nowIso();
+/* ============================================================
+   PERSISTENCE CONTROL
+   ============================================================ */
+
+function persistenceAgeMs(portfolio) {
+  const last =
+    safeNumber(
+      portfolio.last_persist_at
+    );
+
+  if (!last) {
+    return Infinity;
+  }
+
+  return Date.now() - last;
+}
+
+function canPersistNow(portfolio) {
+  return (
+    persistenceAgeMs(portfolio) >=
+    MIN_PERSIST_INTERVAL_SECONDS * 1000
+  );
+}
+
+function checkpointDue(portfolio) {
+  return (
+    persistenceAgeMs(portfolio) >=
+    CHECKPOINT_INTERVAL_SECONDS * 1000
+  );
+}
+
+async function savePortfolio(
+  env,
+  portfolio,
+  reason = "UNKNOWN",
+  options = {}
+) {
+  const force =
+    options.force === true;
+
+  if (
+    !force &&
+    !canPersistNow(portfolio)
+  ) {
+    return {
+      saved: false,
+      throttled: true,
+      reason
+    };
+  }
+
+  const persistedAt =
+    Date.now();
+
+  const payload =
+    cloneObject(portfolio);
+
+  /*
+    Never persist scan diagnostics.
+  */
+  delete payload.last_scan;
+
+  payload.updated_at =
+    new Date(
+      persistedAt
+    ).toISOString();
+
+  payload.last_persist_at =
+    persistedAt;
+
+  payload.last_persist_reason =
+    reason;
 
   await env.BOT_KV.put(
     "PAPER_PORTFOLIO",
-    JSON.stringify(portfolio)
+    JSON.stringify(payload)
   );
+
+  /*
+    Only update the live object after KV confirms success.
+  */
+  portfolio.updated_at =
+    payload.updated_at;
+
+  portfolio.last_persist_at =
+    persistedAt;
+
+  portfolio.last_persist_reason =
+    reason;
+
+  delete portfolio.last_scan;
+
+  return {
+    saved: true,
+    throttled: false,
+    reason,
+    time:
+      payload.updated_at
+  };
 }
 
 /* ============================================================
    HISTORY
    ============================================================ */
 
-function addHistory(portfolio, event) {
+function addHistory(
+  portfolio,
+  event
+) {
   portfolio.history.push({
     time: nowIso(),
     ...event
   });
 
-  if (portfolio.history.length > 500) {
+  if (
+    portfolio.history.length >
+    500
+  ) {
     portfolio.history =
       portfolio.history.slice(-500);
   }
@@ -292,11 +417,17 @@ function addHistory(portfolio, event) {
    ============================================================ */
 
 function getPositionSize(equity) {
-  let amount = POSITION_SIZE_TIERS[0].amount;
+  let amount =
+    POSITION_SIZE_TIERS[0].amount;
 
-  for (const tier of POSITION_SIZE_TIERS) {
-    if (equity >= tier.equity) {
-      amount = tier.amount;
+  for (
+    const tier of POSITION_SIZE_TIERS
+  ) {
+    if (
+      equity >= tier.equity
+    ) {
+      amount =
+        tier.amount;
     }
   }
 
@@ -320,29 +451,43 @@ async function getDexDiscovery() {
 
   for (const url of urls) {
     try {
-      const data = await fetchJson(url);
+      const data =
+        await fetchJson(url);
 
-      if (Array.isArray(data)) {
-        for (const item of data) {
+      if (
+        Array.isArray(data)
+      ) {
+        for (
+          const item of data
+        ) {
           const chainId =
-            String(item.chainId || "").toLowerCase();
+            String(
+              item.chainId || ""
+            ).toLowerCase();
 
-          if (chainId !== "solana") continue;
+          if (
+            chainId !== "solana"
+          ) {
+            continue;
+          }
 
           const mint =
             item.tokenAddress ||
             item.address;
 
-          if (!mint) continue;
+          if (!mint) {
+            continue;
+          }
 
           results.push({
             mint,
-            source: "DEXSCREENER"
+            source:
+              "DEXSCREENER"
           });
         }
       }
     } catch {
-      /* Continue with other sources */
+      /* Continue */
     }
   }
 
@@ -365,15 +510,23 @@ async function getDexSearch() {
 
   const results = [];
 
-  for (const query of queries) {
+  for (
+    const query of queries
+  ) {
     try {
-      const data = await fetchJson(
-        `${DEX_BASE}/latest/dex/search?q=${encodeURIComponent(query)}`
-      );
+      const data =
+        await fetchJson(
+          `${DEX_BASE}/latest/dex/search?q=${encodeURIComponent(query)}`
+        );
 
-      for (const pair of data.pairs || []) {
+      for (
+        const pair of
+        data.pairs || []
+      ) {
         if (
-          String(pair.chainId || "").toLowerCase() !==
+          String(
+            pair.chainId || ""
+          ).toLowerCase() !==
           "solana"
         ) {
           continue;
@@ -382,11 +535,14 @@ async function getDexSearch() {
         const mint =
           pair.baseToken?.address;
 
-        if (!mint) continue;
+        if (!mint) {
+          continue;
+        }
 
         results.push({
           mint,
-          source: "DEXSCREENER_SEARCH"
+          source:
+            "DEXSCREENER_SEARCH"
         });
       }
     } catch {
@@ -405,37 +561,47 @@ async function getDexSearch() {
    ============================================================ */
 
 async function getGeckoCandidates() {
-  const mints = new Set();
+  const mints =
+    new Set();
 
   try {
-    const trending = await fetchJson(
-      `${GECKO_BASE}/networks/solana/trending_pools?page=1`
-    );
+    const trending =
+      await fetchJson(
+        `${GECKO_BASE}/networks/solana/trending_pools?page=1`
+      );
 
     for (
-      const item of trending.data || []
+      const item of
+      trending.data || []
     ) {
       const address =
-        item.relationships?.base_token?.data?.id;
+        item.relationships
+          ?.base_token
+          ?.data
+          ?.id;
 
-      if (!address) continue;
+      if (!address) {
+        continue;
+      }
 
-      /*
-        Gecko token IDs commonly look like:
-        solana_<mint>
-      */
-      const mint = String(address)
-        .replace(/^solana_/, "");
+      const mint =
+        String(address)
+          .replace(
+            /^solana_/,
+            ""
+          );
 
       if (mint) {
         mints.add(mint);
       }
     }
   } catch {
-    /* Gecko is supplemental */
+    /* Supplemental source */
   }
 
-  return [...mints].slice(
+  return [
+    ...mints
+  ].slice(
     0,
     MAX_GECKO_POOLS_ANALYZED
   );
@@ -445,23 +611,33 @@ async function getGeckoCandidates() {
    BEST DEX PAIR
    ============================================================ */
 
-async function getBestDexPair(mint) {
+async function getBestDexPair(
+  mint
+) {
   try {
-    const data = await fetchJson(
-      `${DEX_BASE}/latest/dex/tokens/${encodeURIComponent(mint)}`
-    );
-
-    const pairs = (data.pairs || [])
-      .filter(
-        pair =>
-          String(pair.chainId || "").toLowerCase() ===
-          "solana"
-      )
-      .sort(
-        (a, b) =>
-          safeNumber(b.liquidity?.usd) -
-          safeNumber(a.liquidity?.usd)
+    const data =
+      await fetchJson(
+        `${DEX_BASE}/latest/dex/tokens/${encodeURIComponent(mint)}`
       );
+
+    const pairs =
+      (data.pairs || [])
+        .filter(
+          pair =>
+            String(
+              pair.chainId || ""
+            ).toLowerCase() ===
+            "solana"
+        )
+        .sort(
+          (a, b) =>
+            safeNumber(
+              b.liquidity?.usd
+            ) -
+            safeNumber(
+              a.liquidity?.usd
+            )
+        );
 
     return pairs[0] || null;
   } catch {
@@ -473,20 +649,33 @@ async function getBestDexPair(mint) {
    NORMALIZE DEX DATA
    ============================================================ */
 
-function normalizeDexPair(pair, mint) {
-  if (!pair) return null;
+function normalizeDexPair(
+  pair,
+  mint
+) {
+  if (!pair) {
+    return null;
+  }
 
   const price =
-    safeNumber(pair.priceUsd);
+    safeNumber(
+      pair.priceUsd
+    );
 
   const liquidity =
-    safeNumber(pair.liquidity?.usd);
+    safeNumber(
+      pair.liquidity?.usd
+    );
 
   const volume24h =
-    safeNumber(pair.volume?.h24);
+    safeNumber(
+      pair.volume?.h24
+    );
 
   const volume1h =
-    safeNumber(pair.volume?.h1);
+    safeNumber(
+      pair.volume?.h1
+    );
 
   const tx5m =
     pair.txns?.m5 || {};
@@ -495,22 +684,32 @@ function normalizeDexPair(pair, mint) {
     pair.txns?.h1 || {};
 
   const buys5m =
-    safeNumber(tx5m.buys);
+    safeNumber(
+      tx5m.buys
+    );
 
   const sells5m =
-    safeNumber(tx5m.sells);
+    safeNumber(
+      tx5m.sells
+    );
 
   const buys1h =
-    safeNumber(tx1h.buys);
+    safeNumber(
+      tx1h.buys
+    );
 
   const sells1h =
-    safeNumber(tx1h.sells);
+    safeNumber(
+      tx1h.sells
+    );
 
   const total5m =
-    buys5m + sells5m;
+    buys5m +
+    sells5m;
 
   const total1h =
-    buys1h + sells1h;
+    buys1h +
+    sells1h;
 
   const sellRatio5m =
     sells5m > 0
@@ -530,13 +729,18 @@ function normalizeDexPair(pair, mint) {
       : 0;
 
   const createdAt =
-    safeNumber(pair.pairCreatedAt);
+    safeNumber(
+      pair.pairCreatedAt
+    );
 
   let ageDays = null;
 
   if (createdAt > 0) {
     ageDays =
-      (Date.now() - createdAt) /
+      (
+        Date.now() -
+        createdAt
+      ) /
       86400000;
   }
 
@@ -557,35 +761,46 @@ function normalizeDexPair(pair, mint) {
 
     price,
 
-    liquidity_usd: liquidity,
+    liquidity_usd:
+      liquidity,
 
-    volume_24h_usd: volume24h,
+    volume_24h_usd:
+      volume24h,
 
-    volume_1h_usd: volume1h,
+    volume_1h_usd:
+      volume1h,
 
-    change_5m: safeNumber(
-      priceChange.m5
-    ) / 100,
+    change_5m:
+      safeNumber(
+        priceChange.m5
+      ) / 100,
 
-    change_1h: safeNumber(
-      priceChange.h1
-    ) / 100,
+    change_1h:
+      safeNumber(
+        priceChange.h1
+      ) / 100,
 
-    change_6h: safeNumber(
-      priceChange.h6
-    ) / 100,
+    change_6h:
+      safeNumber(
+        priceChange.h6
+      ) / 100,
 
-    change_24h: safeNumber(
-      priceChange.h24
-    ) / 100,
+    change_24h:
+      safeNumber(
+        priceChange.h24
+      ) / 100,
 
-    buys_5m: buys5m,
+    buys_5m:
+      buys5m,
 
-    sells_5m: sells5m,
+    sells_5m:
+      sells5m,
 
-    buys_1h: buys1h,
+    buys_1h:
+      buys1h,
 
-    sells_1h: sells1h,
+    sells_1h:
+      sells1h,
 
     buy_pressure_5m:
       buyPressure5m,
@@ -600,13 +815,16 @@ function normalizeDexPair(pair, mint) {
       ageDays,
 
     pair_address:
-      pair.pairAddress || null,
+      pair.pairAddress ||
+      null,
 
     dex_id:
-      pair.dexId || null,
+      pair.dexId ||
+      null,
 
     url:
-      pair.url || null
+      pair.url ||
+      null
   };
 }
 
@@ -614,17 +832,22 @@ function normalizeDexPair(pair, mint) {
    JUPITER SUPPLEMENTAL PRICE CHECK
    ============================================================ */
 
-async function getJupiterPrices(mints, env) {
-  const result = new Map();
+async function getJupiterPrices(
+  mints,
+  env
+) {
+  const result =
+    new Map();
 
   if (!mints.length) {
     return result;
   }
 
-  const batch = mints.slice(
-    0,
-    MAX_JUPITER_PRICE_CHECKS
-  );
+  const batch =
+    mints.slice(
+      0,
+      MAX_JUPITER_PRICE_CHECKS
+    );
 
   try {
     const url =
@@ -632,33 +855,43 @@ async function getJupiterPrices(mints, env) {
 
     const headers = {};
 
-    if (env.JUPITER_API_KEY) {
+    if (
+      env.JUPITER_API_KEY
+    ) {
       headers["x-api-key"] =
         env.JUPITER_API_KEY;
     }
 
-    const data = await fetchJson(url, {
-      headers
-    });
+    const data =
+      await fetchJson(
+        url,
+        { headers }
+      );
 
-    for (const mint of batch) {
+    for (
+      const mint of batch
+    ) {
       const item =
         data?.data?.[mint];
 
-      if (!item) continue;
+      if (!item) {
+        continue;
+      }
 
       const price =
-        safeNumber(item.usdPrice);
+        safeNumber(
+          item.usdPrice
+        );
 
       if (price > 0) {
-        result.set(mint, price);
+        result.set(
+          mint,
+          price
+        );
       }
     }
   } catch {
-    /*
-      Jupiter is supplemental. A failure here must not
-      disable the entire scanner.
-    */
+    /* Supplemental only */
   }
 
   return result;
@@ -690,7 +923,9 @@ function addJupiterConfirmation(
     candidate.price;
 
   return {
-    confirmed: difference <= 0.15,
+    confirmed:
+      difference <= 0.15,
+
     difference
   };
 }
@@ -699,7 +934,9 @@ function addJupiterConfirmation(
    MARKET SHAPE
    ============================================================ */
 
-function analyzeMarketShape(candidate) {
+function analyzeMarketShape(
+  candidate
+) {
   const reasons = [];
 
   let penalty = 0;
@@ -709,32 +946,45 @@ function analyzeMarketShape(candidate) {
     EXTREME_1H_MOVE
   ) {
     penalty += 10;
-    reasons.push("EXTREME_1H_MOVE");
+
+    reasons.push(
+      "EXTREME_1H_MOVE"
+    );
   }
 
+  /*
+    NOTE:
+    The existing strategy intentionally remains unchanged
+    in this storage revision.
+  */
   if (
     candidate.change_1h >=
     EXTREME_1H_MOVE
   ) {
     penalty += 8;
+
     reasons.push(
       "EXTREME_1H_ACCELERATION"
     );
   }
 
   if (
-    candidate.change_6h >= 1.00
+    candidate.change_6h >=
+    1.00
   ) {
     penalty += 8;
+
     reasons.push(
       "EXTREME_6H_MOVE"
     );
   }
 
   if (
-    candidate.change_5m >= 0.15
+    candidate.change_5m >=
+    0.15
   ) {
     penalty += 8;
+
     reasons.push(
       "EXTREME_5M_MOVE"
     );
@@ -745,6 +995,7 @@ function analyzeMarketShape(candidate) {
     STRONG_NEGATIVE_6H
   ) {
     penalty += 10;
+
     reasons.push(
       "STRONG_NEGATIVE_6H"
     );
@@ -755,25 +1006,31 @@ function analyzeMarketShape(candidate) {
     STRONG_NEGATIVE_5M
   ) {
     penalty += 8;
+
     reasons.push(
       "STRONG_NEGATIVE_5M"
     );
   }
 
-  /*
-    Bounce can offset some concern when the token has
-    recently recovered from a short-term decline.
-  */
   if (
-    candidate.change_5m >= BOUNCE_5M &&
+    candidate.change_5m >=
+      BOUNCE_5M &&
     candidate.change_1h < 0
   ) {
     penalty -= 4;
-    reasons.push("BOUNCE_ATTEMPT");
+
+    reasons.push(
+      "BOUNCE_ATTEMPT"
+    );
   }
 
   return {
-    penalty: Math.max(0, penalty),
+    penalty:
+      Math.max(
+        0,
+        penalty
+      ),
+
     reasons
   };
 }
@@ -782,38 +1039,49 @@ function analyzeMarketShape(candidate) {
    SCORE CANDIDATE
    ============================================================ */
 
-function scoreCandidate(candidate) {
+function scoreCandidate(
+  candidate
+) {
   let score = 0;
 
   const breakdown = {};
 
-  /* Momentum: max 20 */
   let momentum = 0;
 
-  if (candidate.change_5m > 0) {
+  if (
+    candidate.change_5m > 0
+  ) {
     momentum += 5;
   }
 
-  if (candidate.change_1h > 0) {
+  if (
+    candidate.change_1h > 0
+  ) {
     momentum += 5;
   }
 
-  if (candidate.change_6h > 0) {
+  if (
+    candidate.change_6h > 0
+  ) {
     momentum += 5;
   }
 
-  if (candidate.change_24h > 0) {
+  if (
+    candidate.change_24h > 0
+  ) {
     momentum += 5;
   }
 
-  /*
-    Avoid rewarding extreme acceleration too heavily.
-  */
-  momentum = clamp(momentum, 0, 20);
+  momentum =
+    clamp(
+      momentum,
+      0,
+      20
+    );
 
-  breakdown.momentum = momentum;
+  breakdown.momentum =
+    momentum;
 
-  /* Volume: max 17 */
   let volume = 0;
 
   if (
@@ -851,11 +1119,16 @@ function scoreCandidate(candidate) {
     volume += 2;
   }
 
-  volume = clamp(volume, 0, 17);
+  volume =
+    clamp(
+      volume,
+      0,
+      17
+    );
 
-  breakdown.volume = volume;
+  breakdown.volume =
+    volume;
 
-  /* Liquidity: max 15 */
   let liquidity = 0;
 
   if (
@@ -886,16 +1159,16 @@ function scoreCandidate(candidate) {
     liquidity += 3;
   }
 
-  liquidity = clamp(
-    liquidity,
-    0,
-    15
-  );
+  liquidity =
+    clamp(
+      liquidity,
+      0,
+      15
+    );
 
   breakdown.liquidity =
     liquidity;
 
-  /* Buy pressure: max 15 */
   let buyPressure = 0;
 
   if (
@@ -926,16 +1199,16 @@ function scoreCandidate(candidate) {
     buyPressure += 3;
   }
 
-  buyPressure = clamp(
-    buyPressure,
-    0,
-    15
-  );
+  buyPressure =
+    clamp(
+      buyPressure,
+      0,
+      15
+    );
 
   breakdown.buy_pressure =
     buyPressure;
 
-  /* Acceleration: max 9 */
   let acceleration = 0;
 
   if (
@@ -966,35 +1239,42 @@ function scoreCandidate(candidate) {
     acceleration += 2;
   }
 
-  acceleration = clamp(
-    acceleration,
-    0,
-    9
-  );
+  acceleration =
+    clamp(
+      acceleration,
+      0,
+      9
+    );
 
   breakdown.acceleration =
     acceleration;
 
-  /* Cross-source confirmation: max 10 */
   let crossSource = 0;
 
-  if (candidate.dex_confirmed) {
+  if (
+    candidate.dex_confirmed
+  ) {
     crossSource += 5;
   }
 
-  if (candidate.gecko_confirmed) {
+  if (
+    candidate.gecko_confirmed
+  ) {
     crossSource += 3;
   }
 
-  if (candidate.jupiter_confirmed) {
+  if (
+    candidate.jupiter_confirmed
+  ) {
     crossSource += 2;
   }
 
-  crossSource = clamp(
-    crossSource,
-    0,
-    10
-  );
+  crossSource =
+    clamp(
+      crossSource,
+      0,
+      10
+    );
 
   breakdown.cross_source =
     crossSource;
@@ -1016,19 +1296,28 @@ function scoreCandidate(candidate) {
     crossSource -
     shape.penalty;
 
-  score = clamp(
-    score,
-    0,
-    100
-  );
+  score =
+    clamp(
+      score,
+      0,
+      100
+    );
 
   return {
-    score: round(score, 2),
-    momentum_score: round(
-      momentum,
-      2
-    ),
+    score:
+      round(
+        score,
+        2
+      ),
+
+    momentum_score:
+      round(
+        momentum,
+        2
+      ),
+
     breakdown,
+
     market_shape_reasons:
       shape.reasons
   };
@@ -1121,7 +1410,8 @@ function evaluateEntryQuality(
     NEW_TOKEN_MAX_AGE_DAYS
   ) {
     if (
-      candidate.change_1h >= 0.25
+      candidate.change_1h >=
+      0.25
     ) {
       reasons.push(
         "NEW_TOKEN_PARABOLIC_MOVE"
@@ -1141,6 +1431,7 @@ function evaluateEntryQuality(
   return {
     eligible:
       reasons.length === 0,
+
     reasons
   };
 }
@@ -1149,11 +1440,15 @@ function evaluateEntryQuality(
    RISK ASSESSMENT
    ============================================================ */
 
-function assessRisk(candidate) {
+function assessRisk(
+  candidate
+) {
   const reasons = [];
 
   if (
-    !Number.isFinite(candidate.price) ||
+    !Number.isFinite(
+      candidate.price
+    ) ||
     candidate.price <
     MIN_TOKEN_PRICE
   ) {
@@ -1222,6 +1517,7 @@ function assessRisk(candidate) {
   return {
     pass:
       reasons.length === 0,
+
     reasons
   };
 }
@@ -1230,7 +1526,9 @@ function assessRisk(candidate) {
    BUILD CANDIDATES
    ============================================================ */
 
-async function buildCandidates(env) {
+async function buildCandidates(
+  env
+) {
   const sourceCounts = {
     dexscreener_discovery: 0,
     dexscreener_search: 0,
@@ -1262,35 +1560,44 @@ async function buildCandidates(env) {
   sourceCounts.gecko_confirmed_tokens =
     geckoMints.length;
 
-  const allMints = unique([
-    ...dexDiscovery.map(x => x.mint),
-    ...dexSearch.map(x => x.mint),
-    ...geckoMints
-  ]);
-
   const dexCandidates = [
     ...dexDiscovery,
     ...dexSearch,
     ...geckoMints.map(
       mint => ({
         mint,
-        source: "GECKOTERMINAL"
+        source:
+          "GECKOTERMINAL"
       })
     )
   ];
 
   const limited = [];
 
-  const seen = new Set();
+  const seen =
+    new Set();
 
-  for (const item of dexCandidates) {
-    if (!item.mint) continue;
+  for (
+    const item of
+    dexCandidates
+  ) {
+    if (!item.mint) {
+      continue;
+    }
 
-    if (seen.has(item.mint)) continue;
+    if (
+      seen.has(item.mint)
+    ) {
+      continue;
+    }
 
-    seen.add(item.mint);
+    seen.add(
+      item.mint
+    );
 
-    limited.push(item);
+    limited.push(
+      item
+    );
 
     if (
       limited.length >=
@@ -1302,13 +1609,17 @@ async function buildCandidates(env) {
 
   const candidates = [];
 
-  for (const item of limited) {
+  for (
+    const item of limited
+  ) {
     const pair =
       await getBestDexPair(
         item.mint
       );
 
-    if (!pair) continue;
+    if (!pair) {
+      continue;
+    }
 
     const candidate =
       normalizeDexPair(
@@ -1316,23 +1627,31 @@ async function buildCandidates(env) {
         item.mint
       );
 
-    if (!candidate) continue;
+    if (!candidate) {
+      continue;
+    }
 
-    candidate.sources = unique([
-      item.source,
-      ...(dexDiscovery.some(
-        x => x.mint === item.mint
-      )
-        ? ["DEXSCREENER"]
-        : []),
-      ...(geckoMints.includes(
-        item.mint
-      )
-        ? ["GECKOTERMINAL"]
-        : [])
-    ]);
+    candidate.sources =
+      unique([
+        item.source,
 
-    candidate.dex_confirmed = true;
+        ...(dexDiscovery.some(
+          x =>
+            x.mint ===
+            item.mint
+        )
+          ? ["DEXSCREENER"]
+          : []),
+
+        ...(geckoMints.includes(
+          item.mint
+        )
+          ? ["GECKOTERMINAL"]
+          : [])
+      ]);
+
+    candidate.dex_confirmed =
+      true;
 
     candidate.gecko_confirmed =
       geckoMints.includes(
@@ -1346,16 +1665,15 @@ async function buildCandidates(env) {
     );
   }
 
-  /*
-    Supplemental Jupiter confirmation.
-  */
   const jupiterMints =
     candidates
       .slice(
         0,
         MAX_JUPITER_PRICE_CHECKS
       )
-      .map(x => x.mint);
+      .map(
+        x => x.mint
+      );
 
   sourceCounts.jupiter_price_checked =
     jupiterMints.length;
@@ -1369,14 +1687,18 @@ async function buildCandidates(env) {
   sourceCounts.jupiter_price_confirmed =
     jupiterPrices.size;
 
-  for (const candidate of candidates) {
+  for (
+    const candidate of
+    candidates
+  ) {
     const jupiterPrice =
       jupiterPrices.get(
         candidate.mint
       );
 
     candidate.jupiter_price =
-      jupiterPrice || null;
+      jupiterPrice ||
+      null;
 
     const confirmation =
       addJupiterConfirmation(
@@ -1391,10 +1713,10 @@ async function buildCandidates(env) {
       confirmation.difference;
   }
 
-  /*
-    Score and risk-assess every hydrated candidate.
-  */
-  for (const candidate of candidates) {
+  for (
+    const candidate of
+    candidates
+  ) {
     const scoring =
       scoreCandidate(
         candidate
@@ -1437,7 +1759,8 @@ async function buildCandidates(env) {
 
   candidates.sort(
     (a, b) =>
-      b.score - a.score
+      b.score -
+      a.score
   );
 
   return {
@@ -1461,13 +1784,19 @@ function countReasons(
 ) {
   const counts = {};
 
-  for (const candidate of candidates) {
+  for (
+    const candidate of
+    candidates
+  ) {
     for (
       const reason of
       candidate[field] || []
     ) {
       counts[reason] =
-        (counts[reason] || 0) + 1;
+        (
+          counts[reason] ||
+          0
+        ) + 1;
     }
   }
 
@@ -1475,7 +1804,8 @@ function countReasons(
     Object.entries(counts)
       .sort(
         (a, b) =>
-          b[1] - a[1]
+          b[1] -
+          a[1]
       )
   );
 }
@@ -1485,7 +1815,8 @@ function buildRejectionDiagnostics(
 ) {
   const riskRejected =
     candidates.filter(
-      x => !x.risk_pass
+      x =>
+        !x.risk_pass
     );
 
   const entryRejected =
@@ -1536,7 +1867,9 @@ function isOnCooldown(
 ) {
   const timestamp =
     safeNumber(
-      portfolio.cooldowns?.[mint]
+      portfolio.cooldowns?.[
+        mint
+      ]
     );
 
   if (!timestamp) {
@@ -1579,7 +1912,8 @@ function paperBuy(
   ) {
     return {
       ok: false,
-      reason: "MAX_POSITIONS"
+      reason:
+        "MAX_POSITIONS"
     };
   }
 
@@ -1593,19 +1927,22 @@ function paperBuy(
   ) {
     return {
       ok: false,
-      reason: "INSUFFICIENT_CASH"
+      reason:
+        "INSUFFICIENT_CASH"
     };
   }
 
   if (
     portfolio.positions.some(
       p =>
-        p.mint === candidate.mint
+        p.mint ===
+        candidate.mint
     )
   ) {
     return {
       ok: false,
-      reason: "ALREADY_HOLDING"
+      reason:
+        "ALREADY_HOLDING"
     };
   }
 
@@ -1640,9 +1977,11 @@ function paperBuy(
     peak_price:
       candidate.price,
 
-    pnl_percent: 0,
+    pnl_percent:
+      0,
 
-    pnl_usd: 0,
+    pnl_usd:
+      0,
 
     trailing_active:
       false,
@@ -1681,7 +2020,8 @@ function paperBuy(
   addHistory(
     portfolio,
     {
-      type: "PAPER_BUY",
+      type:
+        "PAPER_BUY",
 
       mint:
         candidate.mint,
@@ -1753,7 +2093,8 @@ function paperSell(
   portfolio.positions =
     portfolio.positions.filter(
       p =>
-        p.id !== position.id
+        p.id !==
+        position.id
     );
 
   setCooldown(
@@ -1764,7 +2105,8 @@ function paperSell(
   addHistory(
     portfolio,
     {
-      type: "PAPER_SELL",
+      type:
+        "PAPER_SELL",
 
       mint:
         position.mint,
@@ -1819,6 +2161,14 @@ function updatePosition(
   position,
   candidate
 ) {
+  const beforeTrailing =
+    position.trailing_active;
+
+  const beforeReversal =
+    safeNumber(
+      position.reversal_confirmations
+    );
+
   const price =
     candidate.price;
 
@@ -1852,21 +2202,19 @@ function updatePosition(
       price;
   }
 
-  /*
-    Hard stop.
-  */
   if (
-    pnl <= STOP_LOSS
+    pnl <=
+    STOP_LOSS
   ) {
     return {
       sell: true,
-      reason: "HARD_STOP"
+      reason:
+        "HARD_STOP",
+      important_state_change:
+        true
     };
   }
 
-  /*
-    Activate trailing protection.
-  */
   if (
     pnl >=
     TRAILING_ACTIVATION
@@ -1875,9 +2223,6 @@ function updatePosition(
       true;
   }
 
-  /*
-    Trailing stop.
-  */
   if (
     position.trailing_active &&
     position.peak_price > 0
@@ -1896,21 +2241,21 @@ function updatePosition(
       return {
         sell: true,
         reason:
-          "TRAILING_STOP"
+          "TRAILING_STOP",
+        important_state_change:
+          true
       };
     }
   }
 
-  /*
-    Reversal detection.
-  */
   const shortTermSelling =
     candidate.sell_ratio_5m <=
     SHORT_TERM_SELL_RATIO;
 
   const hourlySelling =
     candidate.buy_pressure_1h <
-    1 / HOURLY_SELL_RATIO;
+    1 /
+      HOURLY_SELL_RATIO;
 
   const reversalSignal =
     shortTermSelling ||
@@ -1925,13 +2270,13 @@ function updatePosition(
       safeNumber(
         position.reversal_confirmations
       ) + 1;
-  } else if (!reversalSignal) {
-    position.reversal_confirmations = 0;
+  } else if (
+    !reversalSignal
+  ) {
+    position.reversal_confirmations =
+      0;
   }
 
-  /*
-    Require multiple confirmations.
-  */
   if (
     position.trailing_active &&
     pnl > 0 &&
@@ -1949,14 +2294,26 @@ function updatePosition(
       return {
         sell: true,
         reason:
-          "PROFIT_REVERSAL"
+          "PROFIT_REVERSAL",
+        important_state_change:
+          true
       };
     }
   }
 
+  const importantStateChange =
+    beforeTrailing !==
+      position.trailing_active ||
+    beforeReversal !==
+      safeNumber(
+        position.reversal_confirmations
+      );
+
   return {
     sell: false,
-    reason: null
+    reason: null,
+    important_state_change:
+      importantStateChange
   };
 }
 
@@ -1986,21 +2343,32 @@ function calculateAccountingCheck(
     openInvested;
 
   const difference =
-    actual - expected;
+    actual -
+    expected;
 
   return {
     actual_basis_usd:
-      round(actual, 8),
+      round(
+        actual,
+        8
+      ),
 
     expected_basis_usd:
-      round(expected, 8),
+      round(
+        expected,
+        8
+      ),
 
     difference_usd:
-      round(difference, 8),
+      round(
+        difference,
+        8
+      ),
 
     ok:
-      Math.abs(difference) <
-      0.000001
+      Math.abs(
+        difference
+      ) < 0.000001
   };
 }
 
@@ -2015,19 +2383,20 @@ function markPortfolio(
   const byMint =
     new Map(
       candidates.map(
-        candidate =>
-          [
-            candidate.mint,
-            candidate
-          ]
+        candidate => [
+          candidate.mint,
+          candidate
+        ]
       )
     );
 
   let positionValue = 0;
-
   let unrealizedPnl = 0;
 
-  for (const position of portfolio.positions) {
+  for (
+    const position of
+    portfolio.positions
+  ) {
     const candidate =
       byMint.get(
         position.mint
@@ -2060,11 +2429,6 @@ function markPortfolio(
       unrealizedPnl +=
         position.pnl_usd;
     } else {
-      /*
-        If the scanner temporarily cannot see a held token,
-        retain its previous marked value rather than treating
-        it as zero.
-      */
       positionValue +=
         position.invested_usd *
         (
@@ -2147,10 +2511,159 @@ function markPortfolio(
 }
 
 /* ============================================================
+   SCAN RESULT FORMATTER
+   ============================================================ */
+
+function buildScanResult(
+  candidates,
+  sourceCounts,
+  diagnostics
+) {
+  return {
+    total_candidates:
+      candidates.length,
+
+    risk_pass_candidates:
+      candidates.filter(
+        c => c.risk_pass
+      ).length,
+
+    eligible_candidates:
+      candidates.filter(
+        c =>
+          c.risk_pass &&
+          c.entry_eligible
+      ).length,
+
+    source_counts:
+      sourceCounts,
+
+    rejection_diagnostics:
+      diagnostics,
+
+    top_candidates:
+      candidates
+        .slice(0, 15)
+        .map(
+          candidate => ({
+            symbol:
+              candidate.symbol,
+
+            name:
+              candidate.name,
+
+            mint:
+              candidate.mint,
+
+            price:
+              candidate.price,
+
+            score:
+              candidate.score,
+
+            momentum_score:
+              candidate.momentum_score,
+
+            liquidity_usd:
+              round(
+                candidate.liquidity_usd,
+                2
+              ),
+
+            volume_24h_usd:
+              round(
+                candidate.volume_24h_usd,
+                2
+              ),
+
+            volume_1h_usd:
+              round(
+                candidate.volume_1h_usd,
+                2
+              ),
+
+            change_5m:
+              round(
+                pct(
+                  candidate.change_5m
+                ),
+                2
+              ),
+
+            change_1h:
+              round(
+                pct(
+                  candidate.change_1h
+                ),
+                2
+              ),
+
+            change_6h:
+              round(
+                pct(
+                  candidate.change_6h
+                ),
+                2
+              ),
+
+            change_24h:
+              round(
+                pct(
+                  candidate.change_24h
+                ),
+                2
+              ),
+
+            buy_pressure_5m:
+              round(
+                candidate.buy_pressure_5m,
+                3
+              ),
+
+            buy_pressure_1h:
+              round(
+                candidate.buy_pressure_1h,
+                3
+              ),
+
+            age_days:
+              candidate.age_days ===
+              null
+                ? null
+                : round(
+                    candidate.age_days,
+                    4
+                  ),
+
+            risk_pass:
+              candidate.risk_pass,
+
+            risk_reasons:
+              candidate.risk_reasons,
+
+            entry_eligible:
+              candidate.entry_eligible,
+
+            entry_reasons:
+              candidate.entry_reasons,
+
+            sources:
+              candidate.sources,
+
+            jupiter_confirmed:
+              candidate.jupiter_confirmed
+          })
+        )
+  };
+}
+
+/* ============================================================
    RUN PAPER ENGINE
    ============================================================ */
 
-async function runPaperEngine(env) {
+async function runPaperEngine(
+  env
+) {
   if (!PAPER_MODE) {
     throw new Error(
       "This build is configured for PAPER MODE only."
@@ -2160,18 +2673,37 @@ async function runPaperEngine(env) {
   const portfolio =
     await loadPortfolio(env);
 
-  const buys = [];
+  /*
+    Snapshot allows us to roll back a paper trade if the
+    resulting portfolio cannot be persisted.
+  */
+  const beforeRun =
+    cloneObject(
+      portfolio
+    );
 
+  const buys = [];
   const sells = [];
+  const blockedSells = [];
+
+  let importantStateChanged =
+    false;
+
+  const persistenceReady =
+    canPersistNow(
+      portfolio
+    );
 
   /*
     ==========================================================
-    FIRST: SCAN CURRENT MARKET
+    SCAN
     ==========================================================
   */
 
   const scan =
-    await buildCandidates(env);
+    await buildCandidates(
+      env
+    );
 
   const candidates =
     scan.candidates;
@@ -2205,8 +2737,36 @@ async function runPaperEngine(env) {
       );
 
     if (
+      decision.important_state_change
+    ) {
+      importantStateChanged =
+        true;
+    }
+
+    if (
       decision.sell
     ) {
+      /*
+        If persistence is not currently available, do not
+        execute a paper sell that cannot safely be saved.
+      */
+      if (
+        !persistenceReady
+      ) {
+        blockedSells.push({
+          mint:
+            position.mint,
+
+          symbol:
+            position.symbol,
+
+          reason:
+            "PERSISTENCE_THROTTLE"
+        });
+
+        continue;
+      }
+
       const result =
         paperSell(
           portfolio,
@@ -2216,23 +2776,29 @@ async function runPaperEngine(env) {
         );
 
       if (result.ok) {
-        sells.push(result);
+        sells.push(
+          result
+        );
       }
     }
   }
 
   /*
     ==========================================================
-    FIND NEW ENTRY
+    NEW ENTRY
     ==========================================================
   */
 
   let buysRemaining =
     MAX_NEW_BUYS_PER_RUN;
 
+  let tradeBlocked =
+    !persistenceReady;
+
   if (
+    persistenceReady &&
     portfolio.positions.length <
-    MAX_POSITIONS
+      MAX_POSITIONS
   ) {
     const eligible =
       candidates.filter(
@@ -2251,7 +2817,8 @@ async function runPaperEngine(env) {
       );
 
     for (
-      const candidate of eligible
+      const candidate of
+      eligible
     ) {
       if (
         buysRemaining <= 0
@@ -2325,7 +2892,7 @@ async function runPaperEngine(env) {
 
   /*
     ==========================================================
-    MARK PORTFOLIO AFTER TRADES
+    MARK AFTER TRADES
     ==========================================================
   */
 
@@ -2342,7 +2909,7 @@ async function runPaperEngine(env) {
 
   /*
     ==========================================================
-    REJECTION DIAGNOSTICS
+    DIAGNOSTICS
     ==========================================================
   */
 
@@ -2353,7 +2920,8 @@ async function runPaperEngine(env) {
 
   const riskPassCount =
     candidates.filter(
-      c => c.risk_pass
+      c =>
+        c.risk_pass
     ).length;
 
   const eligibleCount =
@@ -2387,6 +2955,11 @@ async function runPaperEngine(env) {
       noTradeReason =
         "NO_CANDIDATES";
     } else if (
+      !persistenceReady
+    ) {
+      noTradeReason =
+        "PERSISTENCE_THROTTLE";
+    } else if (
       riskPassCount === 0
     ) {
       noTradeReason =
@@ -2402,146 +2975,137 @@ async function runPaperEngine(env) {
     }
   }
 
-  const sizing =
-    getPositionSize(
-      portfolioMark.equity_usd
+  /*
+    ==========================================================
+    SCAN RESULT
+    ==========================================================
+  */
+
+  const scanResult =
+    buildScanResult(
+      candidates,
+      scan.sourceCounts,
+      diagnostics
     );
 
-  const scanResult = {
-    total_candidates:
-      candidates.length,
+  /*
+    ==========================================================
+    PERSISTENCE DECISION
+    ==========================================================
+  */
 
-    risk_pass_candidates:
-      riskPassCount,
+  const hadTrades =
+    buys.length > 0 ||
+    sells.length > 0;
 
-    eligible_candidates:
-      eligibleCount,
+  const checkpoint =
+    checkpointDue(
+      portfolio
+    );
 
-    source_counts:
-      scan.sourceCounts,
-
-    rejection_diagnostics:
-      diagnostics,
-
-    top_candidates:
-      candidates
-        .slice(0, 15)
-        .map(candidate => ({
-          symbol:
-            candidate.symbol,
-
-          name:
-            candidate.name,
-
-          mint:
-            candidate.mint,
-
-          price:
-            candidate.price,
-
-          score:
-            candidate.score,
-
-          momentum_score:
-            candidate.momentum_score,
-
-          liquidity_usd:
-            round(
-              candidate.liquidity_usd,
-              2
-            ),
-
-          volume_24h_usd:
-            round(
-              candidate.volume_24h_usd,
-              2
-            ),
-
-          volume_1h_usd:
-            round(
-              candidate.volume_1h_usd,
-              2
-            ),
-
-          change_5m:
-            round(
-              pct(
-                candidate.change_5m
-              ),
-              2
-            ),
-
-          change_1h:
-            round(
-              pct(
-                candidate.change_1h
-              ),
-              2
-            ),
-
-          change_6h:
-            round(
-              pct(
-                candidate.change_6h
-              ),
-              2
-            ),
-
-          change_24h:
-            round(
-              pct(
-                candidate.change_24h
-              ),
-              2
-            ),
-
-          buy_pressure_5m:
-            round(
-              candidate.buy_pressure_5m,
-              3
-            ),
-
-          buy_pressure_1h:
-            round(
-              candidate.buy_pressure_1h,
-              3
-            ),
-
-          age_days:
-            candidate.age_days === null
-              ? null
-              : round(
-                  candidate.age_days,
-                  4
-                ),
-
-          risk_pass:
-            candidate.risk_pass,
-
-          risk_reasons:
-            candidate.risk_reasons,
-
-          entry_eligible:
-            candidate.entry_eligible,
-
-          entry_reasons:
-            candidate.entry_reasons,
-
-          sources:
-            candidate.sources,
-
-          jupiter_confirmed:
-            candidate.jupiter_confirmed
-        }))
+  let persistence = {
+    attempted: false,
+    saved: false,
+    throttled: false,
+    reason:
+      "NOT_NEEDED"
   };
 
-  portfolio.last_scan =
-    scanResult;
+  /*
+    A trade MUST be persisted.
+    If that fails, roll the in-memory paper account back
+    so the bot never reports a trade that cannot be recovered.
+  */
+  if (hadTrades) {
+    persistence.attempted =
+      true;
 
-  await savePortfolio(
-    env,
-    portfolio
-  );
+    try {
+      persistence =
+        await savePortfolio(
+          env,
+          portfolio,
+          "TRADE",
+          {
+            force: true
+          }
+        );
+    } catch (error) {
+      restoreObject(
+        portfolio,
+        beforeRun
+      );
+
+      throw new Error(
+        `PAPER_TRADE_ROLLED_BACK_PERSISTENCE_FAILED: ${errorText(error)}`
+      );
+    }
+  } else if (
+    importantStateChanged &&
+    persistenceReady
+  ) {
+    persistence.attempted =
+      true;
+
+    try {
+      persistence =
+        await savePortfolio(
+          env,
+          portfolio,
+          "IMPORTANT_STATE_CHANGE"
+        );
+    } catch (error) {
+      /*
+        No trade occurred, so a failed checkpoint does not
+        corrupt the paper account. The next run can recover
+        the state from the last successful persistence.
+      */
+      persistence = {
+        attempted: true,
+        saved: false,
+        throttled: false,
+        reason:
+          "IMPORTANT_STATE_CHANGE",
+        error:
+          errorText(error)
+      };
+    }
+  } else if (
+    checkpoint &&
+    canPersistNow(portfolio)
+  ) {
+    persistence.attempted =
+      true;
+
+    try {
+      persistence =
+        await savePortfolio(
+          env,
+          portfolio,
+          "CHECKPOINT"
+        );
+    } catch (error) {
+      persistence = {
+        attempted: true,
+        saved: false,
+        throttled: false,
+        reason:
+          "CHECKPOINT",
+        error:
+          errorText(error)
+      };
+    }
+  } else if (
+    !persistenceReady
+  ) {
+    persistence = {
+      attempted: false,
+      saved: false,
+      throttled: true,
+      reason:
+        "PERSISTENCE_INTERVAL"
+    };
+  }
 
   return {
     ok: true,
@@ -2550,8 +3114,11 @@ async function runPaperEngine(env) {
       BOT_NAME,
 
     mode: {
-      type: "PAPER",
-      transaction_execution: false
+      type:
+        "PAPER",
+
+      transaction_execution:
+        false
     },
 
     buys:
@@ -2566,6 +3133,9 @@ async function runPaperEngine(env) {
     sell_details:
       sells,
 
+    blocked_sells:
+      blockedSells,
+
     scanner_status:
       "OK",
 
@@ -2577,7 +3147,9 @@ async function runPaperEngine(env) {
 
     sizing: {
       current_position_size_usd:
-        sizing,
+        getPositionSize(
+          portfolioMark.equity_usd
+        ),
 
       max_position_size_usd:
         MAX_PAPER_POSITION_USD,
@@ -2591,6 +3163,19 @@ async function runPaperEngine(env) {
 
     accounting,
 
+    persistence,
+
+    storage_policy: {
+      min_persist_interval_seconds:
+        MIN_PERSIST_INTERVAL_SECONDS,
+
+      checkpoint_interval_seconds:
+        CHECKPOINT_INTERVAL_SECONDS,
+
+      scan_writes_portfolio:
+        false
+    },
+
     scan:
       scanResult
   };
@@ -2600,9 +3185,13 @@ async function runPaperEngine(env) {
    TEST SCAN
    ============================================================ */
 
-async function runScanOnly(env) {
+async function runScanOnly(
+  env
+) {
   const scan =
-    await buildCandidates(env);
+    await buildCandidates(
+      env
+    );
 
   const candidates =
     scan.candidates;
@@ -2619,125 +3208,29 @@ async function runScanOnly(env) {
       BOT_NAME,
 
     mode: {
-      type: "PAPER",
-      transaction_execution: false
+      type:
+        "PAPER",
+
+      transaction_execution:
+        false
     },
 
     scanner_status:
       "OK",
 
-    scan: {
-      total_candidates:
-        candidates.length,
-
-      risk_pass_candidates:
-        candidates.filter(
-          c => c.risk_pass
-        ).length,
-
-      eligible_candidates:
-        candidates.filter(
-          c =>
-            c.risk_pass &&
-            c.entry_eligible
-        ).length,
-
-      source_counts:
+    scan:
+      buildScanResult(
+        candidates,
         scan.sourceCounts,
+        diagnostics
+      ),
 
-      rejection_diagnostics:
-        diagnostics,
+    storage_policy: {
+      write_performed:
+        false,
 
-      top_candidates:
-        candidates
-          .slice(0, 15)
-          .map(candidate => ({
-            symbol:
-              candidate.symbol,
-
-            name:
-              candidate.name,
-
-            mint:
-              candidate.mint,
-
-            price:
-              candidate.price,
-
-            score:
-              candidate.score,
-
-            momentum_score:
-              candidate.momentum_score,
-
-            liquidity_usd:
-              round(
-                candidate.liquidity_usd,
-                2
-              ),
-
-            volume_24h_usd:
-              round(
-                candidate.volume_24h_usd,
-                2
-              ),
-
-            volume_1h_usd:
-              round(
-                candidate.volume_1h_usd,
-                2
-              ),
-
-            change_5m:
-              round(
-                pct(
-                  candidate.change_5m
-                ),
-                2
-              ),
-
-            change_1h:
-              round(
-                pct(
-                  candidate.change_1h
-                ),
-                2
-              ),
-
-            change_6h:
-              round(
-                pct(
-                  candidate.change_6h
-                ),
-                2
-              ),
-
-            change_24h:
-              round(
-                pct(
-                  candidate.change_24h
-                ),
-                2
-              ),
-
-            risk_pass:
-              candidate.risk_pass,
-
-            risk_reasons:
-              candidate.risk_reasons,
-
-            entry_eligible:
-              candidate.entry_eligible,
-
-            entry_reasons:
-              candidate.entry_reasons,
-
-            sources:
-              candidate.sources,
-
-            jupiter_confirmed:
-              candidate.jupiter_confirmed
-          }))
+      reason:
+        "SCAN_ONLY_IS_READ_ONLY"
     }
   };
 }
@@ -2746,9 +3239,13 @@ async function runScanOnly(env) {
    STATUS
    ============================================================ */
 
-async function getStatus(env) {
+async function getStatus(
+  env
+) {
   const portfolio =
-    await loadPortfolio(env);
+    await loadPortfolio(
+      env
+    );
 
   const mark =
     markPortfolio(
@@ -2771,8 +3268,11 @@ async function getStatus(env) {
       BOT_NAME,
 
     mode: {
-      type: "PAPER",
-      transaction_execution: false
+      type:
+        "PAPER",
+
+      transaction_execution:
+        false
     },
 
     settings: {
@@ -2799,6 +3299,31 @@ async function getStatus(env) {
 
       reversal_confirmations_required:
         REVERSAL_CONFIRMATIONS_REQUIRED
+    },
+
+    storage: {
+      last_persist_at:
+        portfolio.last_persist_at ||
+        null,
+
+      last_persist_reason:
+        portfolio.last_persist_reason ||
+        null,
+
+      min_persist_interval_seconds:
+        MIN_PERSIST_INTERVAL_SECONDS,
+
+      checkpoint_interval_seconds:
+        CHECKPOINT_INTERVAL_SECONDS,
+
+      next_persist_allowed_at:
+        portfolio.last_persist_at
+          ? new Date(
+              portfolio.last_persist_at +
+              MIN_PERSIST_INTERVAL_SECONDS *
+                1000
+            ).toISOString()
+          : null
     },
 
     portfolio:
@@ -2858,18 +3383,25 @@ async function getStatus(env) {
    RESET PAPER ACCOUNT
    ============================================================ */
 
-async function resetPaper(env) {
+async function resetPaper(
+  env
+) {
   const portfolio =
     createEmptyPortfolio();
 
-  await env.BOT_KV.delete(
-    "PAPER_SCAN"
-  );
-
-  await savePortfolio(
-    env,
-    portfolio
-  );
+  /*
+    Force is intentional here because RESET is an explicit
+    user action rather than an automatic scan.
+  */
+  const persistence =
+    await savePortfolio(
+      env,
+      portfolio,
+      "RESET",
+      {
+        force: true
+      }
+    );
 
   return {
     ok: true,
@@ -2878,12 +3410,17 @@ async function resetPaper(env) {
       BOT_NAME,
 
     mode: {
-      type: "PAPER",
-      transaction_execution: false
+      type:
+        "PAPER",
+
+      transaction_execution:
+        false
     },
 
     message:
       "Paper portfolio reset.",
+
+    persistence,
 
     portfolio:
       markPortfolio(
@@ -2894,14 +3431,44 @@ async function resetPaper(env) {
 }
 
 /* ============================================================
+   HTTP RESPONSE HELPER
+   ============================================================ */
+
+function jsonResponse(
+  body,
+  status = 200
+) {
+  return new Response(
+    JSON.stringify(
+      body,
+      null,
+      2
+    ),
+    {
+      status,
+
+      headers: {
+        "content-type":
+          "application/json"
+      }
+    }
+  );
+}
+
+/* ============================================================
    HTTP ROUTER
    ============================================================ */
 
 export default {
-  async fetch(request, env) {
+  async fetch(
+    request,
+    env
+  ) {
     try {
       const url =
-        new URL(request.url);
+        new URL(
+          request.url
+        );
 
       const path =
         url.pathname;
@@ -2910,53 +3477,45 @@ export default {
         request.method !== "GET" &&
         request.method !== "POST"
       ) {
-        return new Response(
-          JSON.stringify({
+        return jsonResponse(
+          {
             ok: false,
             error:
               "Method not allowed"
-          }),
-          {
-            status: 405,
-            headers: {
-              "content-type":
-                "application/json"
-            }
-          }
+          },
+          405
         );
       }
 
       /*
-        Health check
+        HEALTH
       */
+
       if (
         path === "/" ||
         path === "/health"
       ) {
-        return new Response(
-          JSON.stringify({
-            ok: true,
-            bot:
-              BOT_NAME,
-            mode:
-              "PAPER",
-            transaction_execution:
-              false,
-            time:
-              nowIso()
-          }),
-          {
-            headers: {
-              "content-type":
-                "application/json"
-            }
-          }
-        );
+        return jsonResponse({
+          ok: true,
+
+          bot:
+            BOT_NAME,
+
+          mode:
+            "PAPER",
+
+          transaction_execution:
+            false,
+
+          time:
+            nowIso()
+        });
       }
 
       /*
-        Run full paper engine
+        FULL PAPER ENGINE
       */
+
       if (
         path === "/run"
       ) {
@@ -2965,24 +3524,15 @@ export default {
             env
           );
 
-        return new Response(
-          JSON.stringify(
-            result,
-            null,
-            2
-          ),
-          {
-            headers: {
-              "content-type":
-                "application/json"
-            }
-          }
+        return jsonResponse(
+          result
         );
       }
 
       /*
-        Scan without trading
+        SCAN ONLY
       */
+
       if (
         path === "/scan"
       ) {
@@ -2991,24 +3541,15 @@ export default {
             env
           );
 
-        return new Response(
-          JSON.stringify(
-            result,
-            null,
-            2
-          ),
-          {
-            headers: {
-              "content-type":
-                "application/json"
-            }
-          }
+        return jsonResponse(
+          result
         );
       }
 
       /*
-        Portfolio status
+        STATUS
       */
+
       if (
         path === "/status"
       ) {
@@ -3017,26 +3558,15 @@ export default {
             env
           );
 
-        return new Response(
-          JSON.stringify(
-            result,
-            null,
-            2
-          ),
-          {
-            headers: {
-              "content-type":
-                "application/json"
-            }
-          }
+        return jsonResponse(
+          result
         );
       }
 
       /*
-        Reset only when explicitly confirmed.
-        Example:
-        /reset?confirm=RESET
+        RESET
       */
+
       if (
         path === "/reset"
       ) {
@@ -3046,21 +3576,17 @@ export default {
           );
 
         if (
-          confirm !== "RESET"
+          confirm !==
+          "RESET"
         ) {
-          return new Response(
-            JSON.stringify({
+          return jsonResponse(
+            {
               ok: false,
+
               error:
                 "Reset requires ?confirm=RESET"
-            }),
-            {
-              status: 400,
-              headers: {
-                "content-type":
-                  "application/json"
-              }
-            }
+            },
+            400
           );
         }
 
@@ -3069,26 +3595,18 @@ export default {
             env
           );
 
-        return new Response(
-          JSON.stringify(
-            result,
-            null,
-            2
-          ),
-          {
-            headers: {
-              "content-type":
-                "application/json"
-            }
-          }
+        return jsonResponse(
+          result
         );
       }
 
-      return new Response(
-        JSON.stringify({
+      return jsonResponse(
+        {
           ok: false,
+
           error:
             "Unknown endpoint",
+
           endpoints: [
             "/health",
             "/run",
@@ -3096,82 +3614,72 @@ export default {
             "/status",
             "/reset?confirm=RESET"
           ]
-        }),
-        {
-          status: 404,
-          headers: {
-            "content-type":
-              "application/json"
-          }
-        }
+        },
+        404
       );
     } catch (error) {
       /*
-        Keep failures visible in the Worker response and
-        history without attempting any live transaction.
+        IMPORTANT:
+        Do NOT write the error back to KV.
+
+        If the original problem is KV quota exhaustion,
+        another KV write here would only make the problem
+        worse.
       */
 
-      try {
-        const portfolio =
-          await loadPortfolio(env);
+      console.error(
+        JSON.stringify({
+          bot:
+            BOT_NAME,
 
-        addHistory(
-          portfolio,
-          {
-            type:
-              "ENGINE_ERROR",
+          type:
+            "ENGINE_ERROR",
 
-            error:
-              errorText(error)
-          }
-        );
+          error:
+            errorText(error),
 
-        await savePortfolio(
-          env,
-          portfolio
-        );
-      } catch {
-        /* Do not mask the original error */
-      }
+          time:
+            nowIso()
+        })
+      );
 
-      return new Response(
-        JSON.stringify(
-          {
-            ok: false,
-
-            bot:
-              BOT_NAME,
-
-            mode: {
-              type: "PAPER",
-              transaction_execution:
-                false
-            },
-
-            error:
-              errorText(error),
-
-            time:
-              nowIso()
-          },
-          null,
-          2
-        ),
+      return jsonResponse(
         {
-          status: 500,
-          headers: {
-            "content-type":
-              "application/json"
-          }
-        }
+          ok: false,
+
+          bot:
+            BOT_NAME,
+
+          mode: {
+            type:
+              "PAPER",
+
+            transaction_execution:
+              false
+          },
+
+          error:
+            errorText(error),
+
+          time:
+            nowIso()
+        },
+        500
       );
     }
   },
 
   /*
-    Cloudflare Cron:
-    run the paper engine once every minute.
+    ==========================================================
+    CLOUDFLARE CRON
+    ==========================================================
+
+    Keep the existing one-minute cron.
+
+    Scanning frequency and KV persistence frequency are now
+    separate.
   */
+
   async scheduled(
     event,
     env,
@@ -3186,37 +3694,47 @@ export default {
             );
 
           console.log(
-            JSON.stringify(
-              {
-                cron:
-                  true,
+            JSON.stringify({
+              cron:
+                true,
 
-                bot:
-                  BOT_NAME,
+              bot:
+                BOT_NAME,
 
-                time:
-                  nowIso(),
+              time:
+                nowIso(),
 
-                buys:
-                  result.buys,
+              buys:
+                result.buys,
 
-                sells:
-                  result.sells,
+              sells:
+                result.sells,
 
-                no_trade_reason:
-                  result.no_trade_reason,
+              blocked_sells:
+                result.blocked_sells?.length ||
+                0,
 
-                equity:
-                  result.portfolio
-                    .equity_usd,
+              no_trade_reason:
+                result.no_trade_reason,
 
-                eligible:
-                  result.scan
-                    .eligible_candidates
-              }
-            )
+              equity:
+                result.portfolio
+                  .equity_usd,
+
+              eligible:
+                result.scan
+                  .eligible_candidates,
+
+              persistence:
+                result.persistence
+            })
           );
         } catch (error) {
+          /*
+            Log only.
+            Never attempt another KV write here.
+          */
+
           console.error(
             JSON.stringify({
               cron:
@@ -3224,6 +3742,9 @@ export default {
 
               bot:
                 BOT_NAME,
+
+              type:
+                "CRON_ERROR",
 
               error:
                 errorText(error),
