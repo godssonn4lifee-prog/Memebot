@@ -39,9 +39,50 @@ const PAPER_SCHEMA_VERSION = 2;
 const PAPER_STARTING_CASH_USD = 100;
 const PAPER_MIN_CASH_RESERVE_USD = 10;
 
-const SMALL_TRADE_CAP_USD = 2;
-const LARGE_TRADE_CAP_USD = 5;
-const BALANCE_THRESHOLD_USD = 20;
+/*
+============================================================
+PROGRESSIVE PAPER POSITION SIZING
+============================================================
+
+Position size is based on CURRENT PAPER EQUITY.
+
+As the paper account grows, the bot can gradually
+increase the size of NEW positions.
+
+If equity falls, sizing automatically steps back down.
+
+The reserve is always protected separately.
+============================================================
+*/
+
+const POSITION_SIZE_TIERS = [
+  {
+    equity: 0,
+    size: 5
+  },
+  {
+    equity: 150,
+    size: 7
+  },
+  {
+    equity: 250,
+    size: 10
+  },
+  {
+    equity: 500,
+    size: 15
+  },
+  {
+    equity: 1000,
+    size: 25
+  },
+  {
+    equity: 2000,
+    size: 40
+  }
+];
+
+const MAX_PAPER_POSITION_USD = 40;
 
 /*
 ============================================================
@@ -49,7 +90,14 @@ POSITION LIMITS
 ============================================================
 */
 
-const MAX_POSITIONS = 10;
+const MAX_POSITIONS = 7;
+
+/*
+Only one new position is opened per engine run.
+This prevents the bot from suddenly filling all
+7 slots in one execution.
+*/
+
 const MAX_NEW_BUYS_PER_RUN = 1;
 
 /*
@@ -96,14 +144,6 @@ const MIN_VOLUME_1H_USD = 1000;
 /*
 ============================================================
 ENTRY PROTECTION
-============================================================
-
-5m remains strict.
-1h is moderately widened so the paper bot
-can test controlled entries without opening
-the door to extreme moves.
-
-6h and 24h remain strict.
 ============================================================
 */
 
@@ -730,12 +770,7 @@ async function getDexScreenerDiscovery() {
         );
       }
 
-    } catch {
-      /*
-      Individual source failure does not
-      stop the scanner.
-      */
-    }
+    } catch {}
   }
 
   const unique =
@@ -768,14 +803,11 @@ async function getDexScreenerDiscovery() {
       mint,
       {
         mint,
-
         source:
           "DEXSCREENER",
-
         dex_url:
           item.url ||
           null,
-
         boosted:
           Boolean(
             item.amount ||
@@ -862,18 +894,12 @@ async function getDexSearchCandidates() {
 
         candidates.push({
           mint,
-
           source:
             "DEXSCREENER_SEARCH",
-
           pair
         });
       }
-    } catch {
-      /*
-      Individual search failure is ignored.
-      */
-    }
+    } catch {}
   }
 
   return candidates;
@@ -1043,11 +1069,6 @@ function extractGeckoMint(value) {
     return "";
   }
 
-  /*
-  GeckoTerminal Solana IDs commonly look like:
-  solana_MINT
-  */
-
   if (
     textValue.startsWith(
       "solana_"
@@ -1057,10 +1078,6 @@ function extractGeckoMint(value) {
       "solana_".length
     );
   }
-
-  /*
-  Defensive handling for other prefixed IDs.
-  */
 
   if (
     textValue.includes("_")
@@ -1167,11 +1184,7 @@ async function getJupiterCrossCheck(
       }
     }
 
-  } catch {
-    /*
-    Jupiter is supplemental only.
-    */
-  }
+  } catch {}
 
   return {
     checked,
@@ -1943,11 +1956,6 @@ function evaluateEntryQuality(
     );
   }
 
-  /*
-  New tokens cannot be entered while
-  undergoing an extreme 1h move.
-  */
-
   if (
     data.pair_age_days <=
     NEW_TOKEN_DAYS &&
@@ -2019,7 +2027,6 @@ function scoreCandidate(
     sources.geckoterminal
   ) {
     crossSource = 10;
-
   } else if (
     sources.geckoterminal
   ) {
@@ -2057,35 +2064,23 @@ function scoreCandidate(
 
   return {
     total,
-
     gross_score:
       grossScore,
-
     momentum,
-
     volume,
-
     liquidity,
-
     buy_pressure:
       buyPressure,
-
     acceleration,
-
     cross_source:
       crossSource,
-
     penalties:
       marketShape.penalty,
-
     penalty_reasons:
       marketShape.reasons,
-
     jupiter_price_check:
       jupiterConfirmed,
-
     risk,
-
     entry
   };
 }
@@ -2154,9 +2149,23 @@ async function buildCandidates(
     }
   }
 
+  /*
+  IMPORTANT:
+  GeckoTerminal candidates are now included
+  in DEX hydration instead of merely being
+  counted as a separate source.
+  */
+
   const dexCandidates = [
     ...dexDiscovery,
-    ...dexSearch
+    ...dexSearch,
+    ...[...geckoMints].map(
+      mint => ({
+        mint,
+        source:
+          "GECKOTERMINAL"
+      })
+    )
   ];
 
   const hydratedPairs =
@@ -2399,11 +2408,12 @@ async function buildCandidates(
 
 /*
 ============================================================
-PAPER TRADE SIZE
+PROGRESSIVE PAPER TRADE SIZE
 ============================================================
 */
 
 function calculateTradeSize(
+  equity,
   cash
 ) {
   const available =
@@ -2414,17 +2424,36 @@ function calculateTradeSize(
     );
 
   if (
-    cash >=
-    BALANCE_THRESHOLD_USD
+    available <= 0
   ) {
-    return Math.min(
-      LARGE_TRADE_CAP_USD,
-      available
+    return 0;
+  }
+
+  const currentEquity =
+    safeNumber(
+      equity,
+      PAPER_STARTING_CASH_USD
     );
+
+  let tierSize =
+    POSITION_SIZE_TIERS[0].size;
+
+  for (
+    const tier of
+    POSITION_SIZE_TIERS
+  ) {
+    if (
+      currentEquity >=
+      tier.equity
+    ) {
+      tierSize =
+        tier.size;
+    }
   }
 
   return Math.min(
-    SMALL_TRADE_CAP_USD,
+    tierSize,
+    MAX_PAPER_POSITION_USD,
     available
   );
 }
@@ -2464,8 +2493,32 @@ async function openPaperPosition(
     };
   }
 
+  /*
+  Calculate current equity BEFORE buying.
+  */
+
+  const positionValue =
+    portfolio.open_positions.reduce(
+      (sum, position) =>
+        sum +
+        (
+          safeNumber(
+            position.quantity
+          ) *
+          safeNumber(
+            position.current_price
+          )
+        ),
+      0
+    );
+
+  const equity =
+    portfolio.cash_usd +
+    positionValue;
+
   const tradeUsd =
     calculateTradeSize(
+      equity,
       portfolio.cash_usd
     );
 
@@ -2577,6 +2630,9 @@ async function openPaperPosition(
 
       amount_usd:
         tradeUsd,
+
+      account_equity_at_entry:
+        equity,
 
       score:
         candidate.score
@@ -2701,51 +2757,31 @@ function updatePosition(
     };
   }
 
+  /*
+  ==========================================================
+  REVERSAL CONFIRMATION
+  ==========================================================
+
+  Count ONE reversal signal per monitoring cycle.
+
+  Previously, short-term and hourly selling could
+  both increment the counter during the same cycle.
+  ==========================================================
+  */
+
   const buyPressure5 =
     calculateBuyPressure5m(
+      candidate
+    );
+
+  const hourlyPressure =
+    calculateBuyPressure(
       candidate
     );
 
   const shortTermSelling =
     buyPressure5 <
     0.50;
-
-  if (
-    position.trailing_active &&
-    pnl > 0 &&
-    shortTermSelling
-  ) {
-    position.reversal_confirmations++;
-
-    if (
-      position.reversal_confirmations >=
-      REVERSAL_CONFIRMATIONS_REQUIRED
-    ) {
-      return {
-        action:
-          "SELL",
-
-        reason:
-          "REVERSAL_CONFIRMATION",
-
-        pnl,
-
-        drawdown
-      };
-    }
-
-  } else if (
-    buyPressure5 >=
-    0.50
-  ) {
-    position.reversal_confirmations =
-      0;
-  }
-
-  const hourlyPressure =
-    calculateBuyPressure(
-      candidate
-    );
 
   const hourlySellPressure =
     hourlyPressure <
@@ -2755,10 +2791,14 @@ function updatePosition(
       PROFIT_REVERSAL_SELL_RATIO
     );
 
+  const reversalSignal =
+    shortTermSelling ||
+    hourlySellPressure;
+
   if (
     position.trailing_active &&
     pnl > 0 &&
-    hourlySellPressure
+    reversalSignal
   ) {
     position.reversal_confirmations++;
 
@@ -2771,13 +2811,21 @@ function updatePosition(
           "SELL",
 
         reason:
-          "PROFIT_REVERSAL_CONFIRMATION",
+          hourlySellPressure
+            ? "PROFIT_REVERSAL_CONFIRMATION"
+            : "REVERSAL_CONFIRMATION",
 
         pnl,
 
         drawdown
       };
     }
+
+  } else if (
+    !reversalSignal
+  ) {
+    position.reversal_confirmations =
+      0;
   }
 
   return {
@@ -3070,11 +3118,6 @@ function markPortfolio(
         position.mint
       );
 
-    /*
-    NEVER replace a valid last-known price
-    with zero.
-    */
-
     if (
       candidate &&
       safeNumber(
@@ -3159,7 +3202,7 @@ async function runPaperEngine(
     );
 
   /*
-  1. Monitor existing positions.
+  1. Monitor EVERY existing position first.
   */
 
   const sells =
@@ -3199,7 +3242,8 @@ async function runPaperEngine(
   }
 
   /*
-  3. Search for new paper entries.
+  3. Fill another position only if
+     there is an available slot.
   */
 
   if (
@@ -3259,10 +3303,20 @@ async function runPaperEngine(
         );
       }
     }
+  }
 
+  if (
+    buys.length === 0 &&
+    sells.length === 0
+  ) {
     if (
-      buys.length === 0 &&
-      sells.length === 0
+      portfolio.open_positions.length >=
+      MAX_POSITIONS
+    ) {
+      noTradeReason =
+        "MAX_POSITIONS_REACHED";
+    } else if (
+      candidates.length > 0
     ) {
       noTradeReason =
         "NO_ELIGIBLE_NEW_ENTRY";
@@ -3358,7 +3412,24 @@ async function runPaperEngine(
         portfolio.return_percent,
 
       open_positions:
-        portfolio.open_positions.length
+        portfolio.open_positions.length,
+
+      max_positions:
+        MAX_POSITIONS
+    },
+
+    sizing: {
+      current_position_size_usd:
+        calculateTradeSize(
+          marked.equity,
+          portfolio.cash_usd
+        ),
+
+      max_position_size_usd:
+        MAX_PAPER_POSITION_USD,
+
+      tiers:
+        POSITION_SIZE_TIERS
     },
 
     scan: {
@@ -3543,6 +3614,25 @@ async function getStatus(
       env
     );
 
+  const positionValue =
+    portfolio.open_positions.reduce(
+      (sum, position) =>
+        sum +
+        (
+          safeNumber(
+            position.quantity
+          ) *
+          safeNumber(
+            position.current_price
+          )
+        ),
+      0
+    );
+
+  const equity =
+    portfolio.cash_usd +
+    positionValue;
+
   return {
     ok: true,
 
@@ -3567,17 +3657,26 @@ async function getStatus(
       minimum_cash_reserve_usd:
         PAPER_MIN_CASH_RESERVE_USD,
 
-      small_trade_cap_usd:
-        SMALL_TRADE_CAP_USD,
-
-      large_trade_cap_usd:
-        LARGE_TRADE_CAP_USD,
-
       max_positions:
         MAX_POSITIONS,
 
       max_new_buys_per_run:
         MAX_NEW_BUYS_PER_RUN,
+
+      current_equity_usd:
+        equity,
+
+      current_position_size_usd:
+        calculateTradeSize(
+          equity,
+          portfolio.cash_usd
+        ),
+
+      position_size_tiers:
+        POSITION_SIZE_TIERS,
+
+      max_paper_position_usd:
+        MAX_PAPER_POSITION_USD,
 
       stop_loss_percent:
         STOP_LOSS * 100,
