@@ -5,14 +5,14 @@ const BOT_NAME = "memebott";
   MEMEBOTT — PAPER TRADING ONLY
   ============================================================
 
-  Storage revision:
-  - Scans can run every minute.
-  - No KV write for ordinary no-trade scans.
-  - Portfolio persists on actual trades.
-  - Important position-state changes may persist.
-  - Periodic checkpoint protects state.
-  - last_scan is NOT persisted.
-  - Errors are logged instead of creating another KV write.
+  Strategy revision:
+  - Scanner still runs every minute.
+  - KV persistence remains throttled.
+  - Compact short-term candidate memory is maintained.
+  - Historical observations help identify early momentum.
+  - Existing safety filters remain intact.
+  - Duplicate extreme 1h penalty removed.
+  - No live transaction execution.
 */
 
 const PAPER_MODE = true;
@@ -29,20 +29,42 @@ const MAX_NEW_BUYS_PER_RUN = 1;
 const MAX_PAPER_POSITION_USD = 40;
 const COOLDOWN_SECONDS = 60;
 
-/*
-  KV protection.
+/* ============================================================
+   KV PROTECTION
+   ============================================================ */
 
-  The scanner remains one-minute, but portfolio persistence
-  is deliberately throttled so the bot does not burn through
-  Cloudflare KV writes when nothing meaningful happened.
-
-  120 seconds means a theoretical maximum of about 720
-  bot-generated persistence writes/day.
-*/
 const MIN_PERSIST_INTERVAL_SECONDS = 120;
 const CHECKPOINT_INTERVAL_SECONDS = 300;
 
-/* Progressive paper position sizing */
+/* ============================================================
+   CANDIDATE MEMORY
+   ============================================================
+
+   This is deliberately compact.
+
+   The bot remembers only a small number of promising
+   candidates and only their recent market observations.
+
+   It does NOT persist the entire scanner result.
+*/
+
+const MAX_MEMORY_CANDIDATES = 12;
+const MAX_MEMORY_OBSERVATIONS = 4;
+
+/*
+  Candidates need repeated observations before historical
+  momentum can contribute strongly to an entry.
+
+  At least two observations means we can compare:
+    observation N-1
+    observation N
+*/
+const MIN_HISTORY_OBSERVATIONS = 2;
+
+/* ============================================================
+   PROGRESSIVE PAPER POSITION SIZING
+   ============================================================ */
+
 const POSITION_SIZE_TIERS = [
   { equity: 0, amount: 5 },
   { equity: 150, amount: 7 },
@@ -68,6 +90,22 @@ const PROFIT_REVERSAL_SELL_RATIO = 1.20;
 
 const MIN_ENTRY_SCORE = 45;
 const MIN_MOMENTUM_SCORE = 5;
+
+/*
+  Historical setup score.
+
+  This does NOT replace the main score.
+
+  It rewards improvement across observations rather than
+  simply rewarding a token that has already moved heavily.
+*/
+const MIN_SETUP_SCORE = 5;
+
+/*
+  Historical confirmation can add points, but cannot
+  override the existing safety filters.
+*/
+const MAX_HISTORICAL_SETUP_BONUS = 15;
 
 /* ============================================================
    MARKET FILTERS
@@ -214,6 +252,12 @@ function createEmptyPortfolio() {
 
     cooldowns: {},
 
+    /*
+      Compact candidate memory.
+      This is intentionally separate from full scan output.
+    */
+    market_memory: {},
+
     created_at:
       nowIso(),
 
@@ -257,6 +301,7 @@ async function loadPortfolio(env) {
     portfolio.positions ||= [];
     portfolio.history ||= [];
     portfolio.cooldowns ||= {};
+    portfolio.market_memory ||= {};
 
     portfolio.cash_usd =
       safeNumber(
@@ -282,6 +327,13 @@ async function loadPortfolio(env) {
       Never carry that large object forward.
     */
     delete portfolio.last_scan;
+
+    /*
+      Clean malformed memory entries.
+    */
+    cleanupMarketMemory(
+      portfolio
+    );
 
     return portfolio;
   } catch {
@@ -511,7 +563,8 @@ async function getDexSearch() {
   const results = [];
 
   for (
-    const query of queries
+    const query of
+    queries
   ) {
     try {
       const data =
@@ -941,6 +994,13 @@ function analyzeMarketShape(
 
   let penalty = 0;
 
+  /*
+    FIX:
+    The old build applied two penalties to the exact same
+    EXTREME_1H_MOVE condition.
+
+    One condition is sufficient here.
+  */
   if (
     candidate.change_1h >=
     EXTREME_1H_MOVE
@@ -949,22 +1009,6 @@ function analyzeMarketShape(
 
     reasons.push(
       "EXTREME_1H_MOVE"
-    );
-  }
-
-  /*
-    NOTE:
-    The existing strategy intentionally remains unchanged
-    in this storage revision.
-  */
-  if (
-    candidate.change_1h >=
-    EXTREME_1H_MOVE
-  ) {
-    penalty += 8;
-
-    reasons.push(
-      "EXTREME_1H_ACCELERATION"
     );
   }
 
@@ -1725,6 +1769,9 @@ async function buildCandidates(
     candidate.score =
       scoring.score;
 
+    candidate.base_score =
+      scoring.score;
+
     candidate.momentum_score =
       scoring.momentum_score;
 
@@ -1772,6 +1819,814 @@ async function buildCandidates(
 
     sourceCounts
   };
+}
+
+/* ============================================================
+   MARKET MEMORY
+   ============================================================ */
+
+/*
+  Only store fields needed to compare short-term movement.
+
+  This keeps KV payloads small.
+*/
+function createMemoryObservation(
+  candidate
+) {
+  return {
+    time:
+      Date.now(),
+
+    price:
+      safeNumber(
+        candidate.price
+      ),
+
+    change_5m:
+      safeNumber(
+        candidate.change_5m
+      ),
+
+    change_1h:
+      safeNumber(
+        candidate.change_1h
+      ),
+
+    change_6h:
+      safeNumber(
+        candidate.change_6h
+      ),
+
+    volume_1h:
+      safeNumber(
+        candidate.volume_1h_usd
+      ),
+
+    volume_24h:
+      safeNumber(
+        candidate.volume_24h_usd
+      ),
+
+    liquidity:
+      safeNumber(
+        candidate.liquidity_usd
+      ),
+
+    buy_pressure_5m:
+      safeNumber(
+        candidate.buy_pressure_5m
+      ),
+
+    buy_pressure_1h:
+      safeNumber(
+        candidate.buy_pressure_1h
+      )
+  };
+}
+
+function memoryCandidatePriority(
+  candidate
+) {
+  /*
+    Prefer candidates that are already passing basic risk
+    checks or are close to doing so.
+
+    This prevents memory from filling with obviously dead
+    or unusable tokens.
+  */
+  let priority = 0;
+
+  if (
+    candidate.risk_pass
+  ) {
+    priority += 100;
+  }
+
+  if (
+    candidate.entry_eligible
+  ) {
+    priority += 40;
+  }
+
+  priority +=
+    safeNumber(
+      candidate.score
+    );
+
+  priority +=
+    safeNumber(
+      candidate.liquidity_usd
+    ) /
+    50000;
+
+  priority +=
+    safeNumber(
+      candidate.volume_1h_usd
+    ) /
+    10000;
+
+  return priority;
+}
+
+function shouldRememberCandidate(
+  candidate
+) {
+  if (
+    !candidate.mint
+  ) {
+    return false;
+  }
+
+  if (
+    !Number.isFinite(
+      candidate.price
+    ) ||
+    candidate.price <= 0
+  ) {
+    return false;
+  }
+
+  /*
+    Memory should focus on candidates that have at least
+    some realistic chance of becoming eligible.
+  */
+  if (
+    candidate.risk_pass ||
+    candidate.score >= 35 ||
+    candidate.liquidity_usd >=
+      MIN_LIQUIDITY_USD
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function cleanupMarketMemory(
+  portfolio
+) {
+  if (
+    !portfolio.market_memory ||
+    typeof portfolio.market_memory !==
+      "object"
+  ) {
+    portfolio.market_memory = {};
+    return;
+  }
+
+  const entries =
+    Object.entries(
+      portfolio.market_memory
+    );
+
+  const cleaned = {};
+
+  for (
+    const [mint, memory]
+    of entries
+  ) {
+    if (
+      !mint ||
+      !memory ||
+      !Array.isArray(
+        memory.observations
+      )
+    ) {
+      continue;
+    }
+
+    const observations =
+      memory.observations
+        .filter(
+          observation =>
+            observation &&
+            safeNumber(
+              observation.time
+            ) > 0 &&
+            safeNumber(
+              observation.price
+            ) > 0
+        )
+        .slice(
+          -MAX_MEMORY_OBSERVATIONS
+        );
+
+    if (
+      !observations.length
+    ) {
+      continue;
+    }
+
+    cleaned[mint] = {
+      symbol:
+        memory.symbol ||
+        "UNKNOWN",
+
+      name:
+        memory.name ||
+        "UNKNOWN",
+
+      priority:
+        safeNumber(
+          memory.priority
+        ),
+
+      observations
+    };
+  }
+
+  portfolio.market_memory =
+    cleaned;
+}
+
+function getCandidateMemory(
+  portfolio,
+  mint
+) {
+  return (
+    portfolio.market_memory?.[
+      mint
+    ] || null
+  );
+}
+
+/*
+  Historical setup analysis.
+
+  We are deliberately looking for:
+    - price movement strengthening
+    - buy pressure strengthening
+    - 1h trend recovering
+    - volume increasing
+    - liquidity remaining healthy
+
+  We are NOT looking for the largest raw percentage gain.
+*/
+function evaluateHistoricalSetup(
+  candidate,
+  memory
+) {
+  const result = {
+    observations:
+      0,
+
+    setup_score:
+      0,
+
+    setup_bonus:
+      0,
+
+    confirmed:
+      false,
+
+    signals: [],
+
+    deltas: {
+      change_5m:
+        null,
+
+      change_1h:
+        null,
+
+      volume_1h:
+        null,
+
+      buy_pressure_5m:
+        null,
+
+      buy_pressure_1h:
+        null,
+
+      liquidity:
+        null
+    }
+  };
+
+  if (
+    !memory ||
+    !Array.isArray(
+      memory.observations
+    )
+  ) {
+    return result;
+  }
+
+  const observations =
+    memory.observations;
+
+  result.observations =
+    observations.length;
+
+  if (
+    observations.length <
+    MIN_HISTORY_OBSERVATIONS
+  ) {
+    return result;
+  }
+
+  const previous =
+    observations[
+      observations.length - 1
+    ];
+
+  const current =
+    createMemoryObservation(
+      candidate
+    );
+
+  const delta5m =
+    current.change_5m -
+    safeNumber(
+      previous.change_5m
+    );
+
+  const delta1h =
+    current.change_1h -
+    safeNumber(
+      previous.change_1h
+    );
+
+  const deltaVolume1h =
+    current.volume_1h -
+    safeNumber(
+      previous.volume_1h
+    );
+
+  const deltaBuy5m =
+    current.buy_pressure_5m -
+    safeNumber(
+      previous.buy_pressure_5m
+    );
+
+  const deltaBuy1h =
+    current.buy_pressure_1h -
+    safeNumber(
+      previous.buy_pressure_1h
+    );
+
+  const deltaLiquidity =
+    current.liquidity -
+    safeNumber(
+      previous.liquidity
+    );
+
+  result.deltas = {
+    change_5m:
+      delta5m,
+
+    change_1h:
+      delta1h,
+
+    volume_1h:
+      deltaVolume1h,
+
+    buy_pressure_5m:
+      deltaBuy5m,
+
+    buy_pressure_1h:
+      deltaBuy1h,
+
+    liquidity:
+      deltaLiquidity
+  };
+
+  let score = 0;
+
+  /*
+    5m acceleration.
+
+    Example:
+      +2% -> +6%
+
+    is much more interesting than:
+      +12% -> +6%
+  */
+  if (
+    delta5m >= 0.01
+  ) {
+    score += 3;
+
+    result.signals.push(
+      "IMPROVING_5M_MOMENTUM"
+    );
+  }
+
+  /*
+    Stronger short-term acceleration.
+  */
+  if (
+    delta5m >= 0.03
+  ) {
+    score += 2;
+
+    result.signals.push(
+      "STRONG_5M_ACCELERATION"
+    );
+  }
+
+  /*
+    1h recovery.
+
+    This is especially useful for setups like the REVS
+    pattern we observed earlier:
+      mildly negative 1h trend + positive short-term move.
+  */
+  if (
+    delta1h >= 0.01
+  ) {
+    score += 2;
+
+    result.signals.push(
+      "1H_RECOVERY"
+    );
+  }
+
+  /*
+    Improving 5m buy pressure.
+  */
+  if (
+    deltaBuy5m >= 0.05
+  ) {
+    score += 2;
+
+    result.signals.push(
+      "IMPROVING_5M_BUY_PRESSURE"
+    );
+  }
+
+  /*
+    Improving hourly buy pressure.
+  */
+  if (
+    deltaBuy1h >= 0.03
+  ) {
+    score += 2;
+
+    result.signals.push(
+      "IMPROVING_1H_BUY_PRESSURE"
+    );
+  }
+
+  /*
+    Increasing hourly volume.
+
+    Require both an absolute increase and meaningful
+    relative growth.
+  */
+  const previousVolume =
+    safeNumber(
+      previous.volume_1h
+    );
+
+  if (
+    deltaVolume1h > 0 &&
+    previousVolume > 0 &&
+    deltaVolume1h /
+      previousVolume >=
+      0.10
+  ) {
+    score += 2;
+
+    result.signals.push(
+      "RISING_1H_VOLUME"
+    );
+  }
+
+  /*
+    Liquidity should not be collapsing while momentum rises.
+  */
+  if (
+    current.liquidity > 0 &&
+    previous.liquidity > 0
+  ) {
+    const liquidityRatio =
+      current.liquidity /
+      previous.liquidity;
+
+    if (
+      liquidityRatio >= 0.95
+    ) {
+      score += 1;
+
+      result.signals.push(
+        "LIQUIDITY_STABLE"
+      );
+    }
+  }
+
+  /*
+    A setup becomes confirmed when multiple independent
+    improvement signals exist.
+
+    We don't require every signal.
+  */
+  const hasMomentumImprovement =
+    delta5m >= 0.01;
+
+  const hasPressureImprovement =
+    deltaBuy5m >= 0.03 ||
+    deltaBuy1h >= 0.02;
+
+  const hasTrendRecovery =
+    delta1h >= 0.005;
+
+  result.confirmed =
+    score >= MIN_SETUP_SCORE &&
+    (
+      hasMomentumImprovement ||
+      hasPressureImprovement
+    ) &&
+    (
+      hasTrendRecovery ||
+      hasPressureImprovement
+    );
+
+  result.setup_score =
+    clamp(
+      score,
+      0,
+      MAX_HISTORICAL_SETUP_BONUS
+    );
+
+  /*
+    Historical setup contributes a controlled bonus to the
+    main score.
+
+    It can help a candidate cross the entry threshold, but
+    it cannot rescue a candidate that fails risk assessment.
+  */
+  if (
+    result.confirmed
+  ) {
+    result.setup_bonus =
+      Math.min(
+        result.setup_score,
+        MAX_HISTORICAL_SETUP_BONUS
+      );
+  }
+
+  return result;
+}
+
+/*
+  Update memory after a scan.
+
+  Important:
+  This changes the in-memory portfolio but does not itself
+  perform a KV write. The normal persistence controller
+  decides when the memory gets stored.
+*/
+function updateMarketMemory(
+  portfolio,
+  candidates
+) {
+  cleanupMarketMemory(
+    portfolio
+  );
+
+  const ranked =
+    candidates
+      .filter(
+        shouldRememberCandidate
+      )
+      .sort(
+        (a, b) =>
+          memoryCandidatePriority(b) -
+          memoryCandidatePriority(a)
+      )
+      .slice(
+        0,
+        MAX_MEMORY_CANDIDATES
+      );
+
+  for (
+    const candidate of
+    ranked
+  ) {
+    const existing =
+      portfolio.market_memory[
+        candidate.mint
+      ];
+
+    const observation =
+      createMemoryObservation(
+        candidate
+      );
+
+    if (!existing) {
+      portfolio.market_memory[
+        candidate.mint
+      ] = {
+        symbol:
+          candidate.symbol,
+
+        name:
+          candidate.name,
+
+        priority:
+          memoryCandidatePriority(
+            candidate
+          ),
+
+        observations: [
+          observation
+        ]
+      };
+
+      continue;
+    }
+
+    /*
+      Avoid storing duplicate observations if two runs happen
+      to execute almost simultaneously.
+    */
+    const observations =
+      Array.isArray(
+        existing.observations
+      )
+        ? existing.observations
+        : [];
+
+    const last =
+      observations[
+        observations.length - 1
+      ];
+
+    if (
+      last &&
+      Math.abs(
+        safeNumber(
+          last.price
+        ) -
+        observation.price
+      ) === 0 &&
+      Date.now() -
+        safeNumber(
+          last.time
+        ) <
+        30000
+    ) {
+      continue;
+    }
+
+    observations.push(
+      observation
+    );
+
+    existing.observations =
+      observations.slice(
+        -MAX_MEMORY_OBSERVATIONS
+      );
+
+    existing.symbol =
+      candidate.symbol;
+
+    existing.name =
+      candidate.name;
+
+    existing.priority =
+      memoryCandidatePriority(
+        candidate
+      );
+  }
+
+  /*
+    Remove memory entries that are no longer among the
+    strongest remembered candidates.
+
+    We retain entries that have useful history, but cap the
+    total size.
+  */
+  const entries =
+    Object.entries(
+      portfolio.market_memory
+    );
+
+  entries.sort(
+    (a, b) =>
+      safeNumber(
+        b[1]?.priority
+      ) -
+      safeNumber(
+        a[1]?.priority
+      )
+  );
+
+  const trimmed = {};
+
+  for (
+    const [mint, memory]
+    of entries.slice(
+      0,
+      MAX_MEMORY_CANDIDATES
+    )
+  ) {
+    trimmed[mint] =
+      memory;
+  }
+
+  portfolio.market_memory =
+    trimmed;
+}
+
+/*
+  Apply historical setup scoring after the current snapshot
+  has been scored.
+
+  This intentionally happens after the normal score/risk/entry
+  calculations so the historical signal cannot bypass risk.
+*/
+function applyHistoricalSetup(
+  portfolio,
+  candidates
+) {
+  for (
+    const candidate of
+    candidates
+  ) {
+    const memory =
+      getCandidateMemory(
+        portfolio,
+        candidate.mint
+      );
+
+    const setup =
+      evaluateHistoricalSetup(
+        candidate,
+        memory
+      );
+
+    candidate.history_observations =
+      setup.observations;
+
+    candidate.setup_score =
+      setup.setup_score;
+
+    candidate.setup_bonus =
+      setup.setup_bonus;
+
+    candidate.setup_confirmed =
+      setup.confirmed;
+
+    candidate.setup_signals =
+      setup.signals;
+
+    candidate.setup_deltas =
+      setup.deltas;
+
+    /*
+      Historical setup improves the main score only after
+      confirmation.
+    */
+    if (
+      setup.confirmed &&
+      setup.setup_bonus > 0
+    ) {
+      candidate.score =
+        clamp(
+          candidate.base_score +
+            setup.setup_bonus,
+          0,
+          100
+        );
+    }
+
+    /*
+      Re-evaluate entry threshold with the adjusted score.
+      Risk remains independently enforced.
+    */
+    const entry =
+      evaluateEntryQuality(
+        candidate
+      );
+
+    candidate.entry_eligible =
+      entry.eligible;
+
+    candidate.entry_reasons =
+      entry.reasons;
+
+    /*
+      Important:
+      An historical setup bonus is NOT enough by itself to
+      create an entry.
+
+      The candidate must have at least two observations.
+    */
+    if (
+      candidate.entry_eligible &&
+      !candidate.setup_confirmed
+    ) {
+      candidate.entry_eligible =
+        false;
+
+      candidate.entry_reasons =
+        [
+          ...candidate.entry_reasons,
+          "WAITING_FOR_HISTORICAL_CONFIRMATION"
+        ];
+    }
+  }
 }
 
 /* ============================================================
@@ -1995,6 +2850,15 @@ function paperBuy(
     entry_momentum_score:
       candidate.momentum_score,
 
+    entry_setup_score:
+      candidate.setup_score,
+
+    entry_setup_confirmed:
+      candidate.setup_confirmed,
+
+    entry_history_observations:
+      candidate.history_observations,
+
     entry_score_breakdown:
       candidate.score_breakdown,
 
@@ -2043,8 +2907,17 @@ function paperBuy(
       momentum_score:
         candidate.momentum_score,
 
+      setup_score:
+        candidate.setup_score,
+
+      setup_confirmed:
+        candidate.setup_confirmed,
+
+      history_observations:
+        candidate.history_observations,
+
       reason:
-        "ENTRY_ELIGIBLE"
+        "ENTRY_ELIGIBLE_HISTORICAL_SETUP"
     }
   );
 
@@ -2561,8 +3434,26 @@ function buildScanResult(
             score:
               candidate.score,
 
+            base_score:
+              candidate.base_score,
+
             momentum_score:
               candidate.momentum_score,
+
+            setup_score:
+              candidate.setup_score,
+
+            setup_bonus:
+              candidate.setup_bonus,
+
+            setup_confirmed:
+              candidate.setup_confirmed,
+
+            history_observations:
+              candidate.history_observations,
+
+            setup_signals:
+              candidate.setup_signals,
 
             liquidity_usd:
               round(
@@ -2710,6 +3601,30 @@ async function runPaperEngine(
 
   /*
     ==========================================================
+    HISTORICAL SETUP ANALYSIS
+    ==========================================================
+  */
+
+  /*
+    Analyze the previous memory BEFORE adding this scan's
+    observation. Otherwise the current observation would be
+    compared against itself.
+  */
+  applyHistoricalSetup(
+    portfolio,
+    candidates
+  );
+
+  /*
+    Now append the current observations for future scans.
+  */
+  updateMarketMemory(
+    portfolio,
+    candidates
+  );
+
+  /*
+    ==========================================================
     MONITOR EXISTING POSITIONS
     ==========================================================
   */
@@ -2805,6 +3720,9 @@ async function runPaperEngine(
         candidate =>
           candidate.risk_pass &&
           candidate.entry_eligible &&
+          candidate.setup_confirmed &&
+          candidate.history_observations >=
+            MIN_HISTORY_OBSERVATIONS &&
           !isOnCooldown(
             portfolio,
             candidate.mint
@@ -2815,6 +3733,42 @@ async function runPaperEngine(
               candidate.mint
           )
       );
+
+    /*
+      Sort by:
+        1. setup confirmation strength
+        2. final score
+        3. base score
+
+      This prioritizes an improving setup over a token that
+      merely has a large static score.
+    */
+    eligible.sort(
+      (a, b) => {
+        const setupDifference =
+          safeNumber(
+            b.setup_score
+          ) -
+          safeNumber(
+            a.setup_score
+          );
+
+        if (
+          setupDifference !== 0
+        ) {
+          return setupDifference;
+        }
+
+        return (
+          safeNumber(
+            b.score
+          ) -
+          safeNumber(
+            a.score
+          )
+        );
+      }
+    );
 
     for (
       const candidate of
@@ -2881,8 +3835,20 @@ async function runPaperEngine(
           score:
             candidate.score,
 
+          base_score:
+            candidate.base_score,
+
           momentum_score:
-            candidate.momentum_score
+            candidate.momentum_score,
+
+          setup_score:
+            candidate.setup_score,
+
+          history_observations:
+            candidate.history_observations,
+
+          setup_signals:
+            candidate.setup_signals
         });
 
         buysRemaining--;
@@ -3055,11 +4021,6 @@ async function runPaperEngine(
           "IMPORTANT_STATE_CHANGE"
         );
     } catch (error) {
-      /*
-        No trade occurred, so a failed checkpoint does not
-        corrupt the paper account. The next run can recover
-        the state from the last successful persistence.
-      */
       persistence = {
         attempted: true,
         saved: false,
@@ -3173,7 +4134,19 @@ async function runPaperEngine(
         CHECKPOINT_INTERVAL_SECONDS,
 
       scan_writes_portfolio:
-        false
+        false,
+
+      market_memory_enabled:
+        true,
+
+      max_memory_candidates:
+        MAX_MEMORY_CANDIDATES,
+
+      max_memory_observations:
+        MAX_MEMORY_OBSERVATIONS,
+
+      minimum_history_observations:
+        MIN_HISTORY_OBSERVATIONS
     },
 
     scan:
@@ -3230,7 +4203,10 @@ async function runScanOnly(
         false,
 
       reason:
-        "SCAN_ONLY_IS_READ_ONLY"
+        "SCAN_ONLY_IS_READ_ONLY",
+
+      market_memory_updated:
+        false
     }
   };
 }
@@ -3261,6 +4237,11 @@ async function getStatus(
       )
     );
 
+  const memoryEntries =
+    Object.entries(
+      portfolio.market_memory || {}
+    );
+
   return {
     ok: true,
 
@@ -3282,6 +4263,9 @@ async function getStatus(
       min_momentum_score:
         MIN_MOMENTUM_SCORE,
 
+      min_setup_score:
+        MIN_SETUP_SCORE,
+
       max_positions:
         MAX_POSITIONS,
 
@@ -3298,7 +4282,10 @@ async function getStatus(
         TRAILING_STOP,
 
       reversal_confirmations_required:
-        REVERSAL_CONFIRMATIONS_REQUIRED
+        REVERSAL_CONFIRMATIONS_REQUIRED,
+
+      minimum_history_observations:
+        MIN_HISTORY_OBSERVATIONS
     },
 
     storage: {
@@ -3324,6 +4311,38 @@ async function getStatus(
                 1000
             ).toISOString()
           : null
+    },
+
+    market_memory: {
+      candidates:
+        memoryEntries.length,
+
+      max_candidates:
+        MAX_MEMORY_CANDIDATES,
+
+      max_observations_per_candidate:
+        MAX_MEMORY_OBSERVATIONS,
+
+      entries:
+        memoryEntries.map(
+          ([mint, memory]) => ({
+            mint,
+
+            symbol:
+              memory.symbol,
+
+            observations:
+              memory.observations?.length ||
+              0,
+
+            latest_observation:
+              memory.observations?.length
+                ? memory.observations[
+                    memory.observations.length - 1
+                  ]
+                : null
+          })
+        )
     },
 
     portfolio:
@@ -3371,6 +4390,18 @@ async function getStatus(
 
           entry_score:
             position.entry_score,
+
+          entry_setup_score:
+            position.entry_setup_score ||
+            0,
+
+          entry_setup_confirmed:
+            position.entry_setup_confirmed ||
+            false,
+
+          entry_history_observations:
+            position.entry_history_observations ||
+            0,
 
           entry_time:
             position.entry_time
@@ -3676,7 +4707,7 @@ export default {
 
     Keep the existing one-minute cron.
 
-    Scanning frequency and KV persistence frequency are now
+    Scanning frequency and KV persistence frequency are
     separate.
   */
 
