@@ -14,27 +14,28 @@ const BOT_NAME = "memebott";
   DISCOVERY:
     1. DEX Screener
     2. GeckoTerminal
-    3. Jupiter price cross-check
+    3. Jupiter price data when available
 
-  Jupiter does NOT select candidates.
+  Jupiter is NOT the primary discovery source.
 
-  ENTRY ENGINE:
-    - Liquidity
-    - Volume
-    - 1h momentum
-    - 5m momentum
-    - Momentum alignment
-    - Volume acceleration
-    - Buy pressure
-    - Cross-source confirmation
-    - Reversal detection
-    - Extreme-pump detection
-
-  EXIT ENGINE:
+  STRATEGY:
+    - Discover many Solana candidates
+    - Deduplicate by mint
+    - Hydrate market data
+    - Check liquidity
+    - Check volume
+    - Check buy/sell pressure
+    - Analyze 5m / 1h / 6h momentum
+    - Detect acceleration
+    - Detect late-stage pumps
+    - Detect short-term reversals
+    - Confirm across independent sources
+    - Score candidates
+    - Paper-buy only strong candidates
+    - Monitor open positions
     - Hard stop
-    - Trailing activation
-    - Trailing stop
-    - Reversal confirmations
+    - Trailing-profit exit
+    - Record every decision
 */
 
 /*
@@ -64,42 +65,32 @@ const MAX_NEW_BUYS_PER_RUN = 1;
 const STOP_LOSS = -0.01;
 
 const TRAILING_ACTIVATION = 0.01;
+
 const TRAILING_STOP = 0.03;
 
 const REVERSAL_CONFIRMATIONS_REQUIRED = 2;
 
 /*
   ============================================================
-  ENTRY RULES
-  ============================================================
-*/
-
-const MIN_ENTRY_SCORE = 55;
-
-/*
-  Reversal detection.
-*/
-const REVERSAL_1H_THRESHOLD = -8;
-const REVERSAL_5M_THRESHOLD = 4;
-
-/*
-  Extreme move detection.
-*/
-const EXTREME_1H_MOVE = 80;
-const EXTREME_5M_MOVE = 15;
-
-/*
-  ============================================================
-  SCANNER
+  SCANNER LIMITS
   ============================================================
 */
 
 const MAX_CANDIDATES = 30;
 
-const MAX_DEX_TOKENS_TO_ANALYZE = 30;
-const MAX_GECKO_POOLS_TO_ANALYZE = 10;
+const MAX_DEX_TOKENS_TO_ANALYZE = 40;
+
+const MAX_GECKO_POOLS_TO_ANALYZE = 20;
+
+const MAX_JUPITER_PRICE_CHECKS = 20;
 
 const MIN_TOKEN_PRICE_USD = 0.00000001;
+
+/*
+  ============================================================
+  RISK FILTERS
+  ============================================================
+*/
 
 const MIN_LIQUIDITY_USD = 15000;
 
@@ -107,24 +98,83 @@ const MIN_VOLUME_24H_USD = 10000;
 
 const MIN_VOLUME_1H_USD = 1000;
 
+/*
+  Very old pools are not automatically bad, but we don't want
+  stale pairs dominating the scanner.
+*/
 const MAX_PAIR_AGE_DAYS = 365;
 
+/*
+  ============================================================
+  MARKET-SHAPE RULES
+  ============================================================
+*/
+
+/*
+  Don't chase a token after an enormous 1h move.
+*/
+const EXTREME_1H_MOVE_PERCENT = 50;
+
+/*
+  Strongly negative 6h movement can indicate a temporary bounce
+  rather than a healthy trend.
+*/
+const STRONG_NEGATIVE_6H_PERCENT = -15;
+
+/*
+  Very strong negative 5m movement is treated as a reversal.
+*/
+const STRONG_NEGATIVE_5M_PERCENT = -3;
+
+/*
+  A large positive 5m movement after a heavily negative 6h
+  movement can indicate a bounce/chase situation.
+*/
+const BOUNCE_5M_PERCENT = 7;
+
+/*
+  If 5m sells greatly overwhelm buys, short-term momentum
+  is considered unhealthy.
+*/
+const SHORT_TERM_SELL_RATIO = 1.50;
+
+/*
+  If 1h sells greatly overwhelm buys, avoid the candidate.
+*/
+const HOURLY_SELL_RATIO = 1.43;
+
+/*
+  Minimum score needed to even be considered for entry.
+*/
+const MIN_ENTRY_SCORE = 50;
+
+/*
+  Require at least one meaningful momentum component.
+*/
+const MIN_MOMENTUM_SCORE = 5;
+
+/*
+  Avoid immediately re-buying the same token.
+*/
 const COOLDOWN_SECONDS = 60;
 
 /*
   ============================================================
-  KV KEYS
+  STORAGE
   ============================================================
 */
 
 const PORTFOLIO_KEY = "PAPER_PORTFOLIO";
+
 const HISTORY_KEY = "PAPER_TRADE_HISTORY";
+
 const COOLDOWN_KEY = "PAPER_TRADE_COOLDOWN";
+
 const SCAN_KEY = "LAST_SCAN";
 
 /*
   ============================================================
-  DATA SOURCES
+  API ENDPOINTS
   ============================================================
 */
 
@@ -136,32 +186,6 @@ const GECKO_API =
 
 const JUPITER_PRICE_API =
   "https://api.jup.ag/price/v3";
-
-/*
-  ============================================================
-  SOLANA
-  ============================================================
-*/
-
-const SOL_MINT =
-  "So11111111111111111111111111111111111111112";
-
-const USDC_MINT =
-  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGgZwyTDt1v";
-
-/*
-  Stable/native assets that should never
-  become buy candidates.
-*/
-const BLOCKED_SYMBOLS = new Set([
-  "USDC",
-  "USDT",
-  "USD1",
-  "USDS",
-  "DAI",
-  "SOL",
-  "WSOL"
-]);
 
 /*
   ============================================================
@@ -188,26 +212,6 @@ function clamp(value, min, max) {
   );
 }
 
-function normalizeAddress(value) {
-  return String(value || "").trim();
-}
-
-function isValidMint(mint) {
-  return (
-    typeof mint === "string" &&
-    mint.length >= 32 &&
-    mint.length <= 50
-  );
-}
-
-function isBlockedSymbol(symbol) {
-  return BLOCKED_SYMBOLS.has(
-    String(symbol || "")
-      .trim()
-      .toUpperCase()
-  );
-}
-
 function ageDays(timestampMs) {
   if (!timestampMs) {
     return 9999;
@@ -227,6 +231,35 @@ function ageDays(timestampMs) {
   return age / 86400000;
 }
 
+function normalizeAddress(value) {
+  return String(value || "").trim();
+}
+
+function isValidMint(mint) {
+  return (
+    typeof mint === "string" &&
+    mint.length >= 32 &&
+    mint.length <= 50
+  );
+}
+
+function isBlockedSymbol(symbol) {
+  const blocked =
+    new Set([
+      "USDC",
+      "USDT",
+      "USD1",
+      "USDS",
+      "DAI",
+      "SOL",
+      "WSOL"
+    ]);
+
+  return blocked.has(
+    String(symbol || "").toUpperCase()
+  );
+}
+
 /*
   ============================================================
   HTTP
@@ -237,17 +270,17 @@ async function getJson(
   url,
   headers = {}
 ) {
-  const response = await fetch(
-    url,
-    {
+  const response =
+    await fetch(url, {
       method: "GET",
 
       headers: {
-        accept: "application/json",
+        accept:
+          "application/json",
+
         ...headers
       }
-    }
-  );
+    });
 
   if (!response.ok) {
     throw new Error(
@@ -272,19 +305,25 @@ function createFreshPortfolio() {
     cash_usd:
       PAPER_STARTING_CASH_USD,
 
-    realized_pnl_usd: 0,
+    realized_pnl_usd:
+      0,
 
-    unrealized_pnl_usd: 0,
+    unrealized_pnl_usd:
+      0,
 
-    total_pnl_usd: 0,
+    total_pnl_usd:
+      0,
 
-    return_percent: 0,
+    return_percent:
+      0,
 
     open_positions: [],
 
-    last_run_at: null,
+    last_run_at:
+      null,
 
-    updated_at: nowIso()
+    updated_at:
+      nowIso()
   };
 }
 
@@ -318,6 +357,52 @@ async function getPortfolio(env) {
       portfolio.open_positions = [];
     }
 
+    /*
+      Make sure old portfolio records have
+      the fields used by the current version.
+    */
+    if (
+      !Number.isFinite(
+        Number(
+          portfolio.starting_cash_usd
+        )
+      )
+    ) {
+      portfolio.starting_cash_usd =
+        PAPER_STARTING_CASH_USD;
+    }
+
+    if (
+      !Number.isFinite(
+        Number(
+          portfolio.cash_usd
+        )
+      )
+    ) {
+      portfolio.cash_usd =
+        portfolio.starting_cash_usd;
+    }
+
+    if (
+      !Number.isFinite(
+        Number(
+          portfolio.realized_pnl_usd
+        )
+      )
+    ) {
+      portfolio.realized_pnl_usd = 0;
+    }
+
+    if (
+      !Number.isFinite(
+        Number(
+          portfolio.unrealized_pnl_usd
+        )
+      )
+    ) {
+      portfolio.unrealized_pnl_usd = 0;
+    }
+
     return portfolio;
   } catch {
     const portfolio =
@@ -344,6 +429,12 @@ async function savePortfolio(
     JSON.stringify(portfolio)
   );
 }
+
+/*
+  ============================================================
+  HISTORY
+  ============================================================
+*/
 
 async function getHistory(env) {
   const raw =
@@ -388,7 +479,9 @@ async function addHistory(
     await getHistory(env);
 
   history.push({
-    timestamp: nowIso(),
+    timestamp:
+      nowIso(),
+
     ...event
   });
 
@@ -445,7 +538,8 @@ async function isCoolingDown(
     );
 
   return (
-    Date.now() - last <
+    Date.now() -
+      last <
     COOLDOWN_SECONDS * 1000
   );
 }
@@ -466,10 +560,10 @@ async function setCooldown(
   ) {
     if (
       Date.now() -
-      safeNumber(
-        cooldowns[key],
-        0
-      ) >
+        safeNumber(
+          cooldowns[key],
+          0
+        ) >
       86400000
     ) {
       delete cooldowns[key];
@@ -493,7 +587,9 @@ async function getDexScreenerDiscovery() {
 
   const urls = [
     `${DEXSCREENER_API}/token-profiles/latest/v1`,
+
     `${DEXSCREENER_API}/token-boosts/latest/v1`,
+
     `${DEXSCREENER_API}/token-boosts/top/v1`
   ];
 
@@ -507,11 +603,14 @@ async function getDexScreenerDiscovery() {
       if (
         Array.isArray(data)
       ) {
-        results.push(...data);
+        results.push(
+          ...data
+        );
       }
     } catch {
       /*
-        Continue if one endpoint fails.
+        One source failing must not
+        stop the entire scanner.
       */
     }
   }
@@ -536,7 +635,9 @@ async function getDexScreenerDiscovery() {
         item.tokenAddress
       );
 
-    if (!isValidMint(mint)) {
+    if (
+      !isValidMint(mint)
+    ) {
       continue;
     }
 
@@ -544,10 +645,14 @@ async function getDexScreenerDiscovery() {
       mint,
       {
         mint,
+
         source:
           "DEXSCREENER",
+
         dex_url:
-          item.url || null,
+          item.url ||
+          null,
+
         boosted:
           Boolean(
             item.amount ||
@@ -582,7 +687,8 @@ async function getDexSearchCandidates() {
   ) {
     try {
       const url =
-        `${DEXSCREENER_API}/latest/dex/search?q=` +
+        `${DEXSCREENER_API}` +
+        `/latest/dex/search?q=` +
         encodeURIComponent(query);
 
       const data =
@@ -610,27 +716,33 @@ async function getDexSearchCandidates() {
         }
 
         const base =
-          pair.baseToken || {};
+          pair.baseToken ||
+          {};
 
         const mint =
           normalizeAddress(
             base.address
           );
 
-        if (!isValidMint(mint)) {
+        if (
+          !isValidMint(mint)
+        ) {
           continue;
         }
 
         candidates.push({
           mint,
+
           source:
             "DEXSCREENER_SEARCH",
+
           pair
         });
       }
     } catch {
       /*
-        Continue with remaining searches.
+        Continue with the
+        other search terms.
       */
     }
   }
@@ -640,125 +752,27 @@ async function getDexSearchCandidates() {
 
 /*
   ============================================================
-  GECKOTERMINAL DISCOVERY
-  ============================================================
-*/
-
-async function getGeckoTrendingPools() {
-  try {
-    const url =
-      `${GECKO_API}/networks/solana/trending_pools`;
-
-    const data =
-      await getJson(url);
-
-    if (
-      !Array.isArray(
-        data.data
-      )
-    ) {
-      return [];
-    }
-
-    return data.data
-      .slice(
-        0,
-        MAX_GECKO_POOLS_TO_ANALYZE
-      )
-      .map(pool => {
-        const attrs =
-          pool.attributes || {};
-
-        const relationships =
-          pool.relationships || {};
-
-        const poolId =
-          String(
-            pool.id || ""
-          );
-
-        const poolAddress =
-          poolId.includes("_")
-            ? poolId
-                .split("_")
-                .slice(1)
-                .join("_")
-            : poolId;
-
-        const baseTokenId =
-          relationships
-            .base_token
-            ?.data
-            ?.id || "";
-
-        return {
-          source:
-            "GECKOTERMINAL",
-
-          pool_address:
-            poolAddress,
-
-          name:
-            attrs.name || null,
-
-          address:
-            baseTokenId,
-
-          attributes:
-            attrs
-        };
-      });
-  } catch {
-    return [];
-  }
-}
-
-function extractGeckoMint(
-  value
-) {
-  const textValue =
-    String(value || "");
-
-  if (!textValue) {
-    return "";
-  }
-
-  if (
-    textValue.includes("_")
-  ) {
-    return textValue
-      .split("_")
-      .slice(1)
-      .join("_");
-  }
-
-  return textValue;
-}
-
-/*
-  ============================================================
-  DEX PAIR HYDRATION
+  HYDRATE DEX DATA
   ============================================================
 */
 
 async function hydrateDexCandidates(
   candidates
 ) {
-  const uniqueMints =
-    [
-      ...new Set(
-        candidates
-          .map(
-            x => x.mint
-          )
-          .filter(
-            isValidMint
-          )
-      )
-    ].slice(
-      0,
-      MAX_DEX_TOKENS_TO_ANALYZE
-    );
+  const uniqueMints = [
+    ...new Set(
+      candidates
+        .map(
+          x => x.mint
+        )
+        .filter(
+          isValidMint
+        )
+    )
+  ].slice(
+    0,
+    MAX_DEX_TOKENS_TO_ANALYZE
+  );
 
   if (
     !uniqueMints.length
@@ -767,7 +781,8 @@ async function hydrateDexCandidates(
   }
 
   const url =
-    `${DEXSCREENER_API}/tokens/v1/solana/` +
+    `${DEXSCREENER_API}` +
+    `/tokens/v1/solana/` +
     uniqueMints.join(",");
 
   try {
@@ -794,7 +809,112 @@ async function hydrateDexCandidates(
 
 /*
   ============================================================
-  BEST DEX PAIR
+  GECKOTERMINAL
+  ============================================================
+*/
+
+async function getGeckoTrendingPools() {
+  try {
+    const url =
+      `${GECKO_API}` +
+      `/networks/solana/trending_pools`;
+
+    const data =
+      await getJson(url);
+
+    if (
+      !Array.isArray(
+        data.data
+      )
+    ) {
+      return [];
+    }
+
+    return data.data
+      .slice(
+        0,
+        MAX_GECKO_POOLS_TO_ANALYZE
+      )
+      .map(pool => {
+        const attrs =
+          pool.attributes ||
+          {};
+
+        const relationships =
+          pool.relationships ||
+          {};
+
+        const poolId =
+          String(
+            pool.id || ""
+          );
+
+        const poolAddress =
+          poolId.includes("_")
+            ? poolId
+                .split("_")
+                .slice(1)
+                .join("_")
+            : poolId;
+
+        const baseTokenId =
+          relationships
+            ?.base_token
+            ?.data
+            ?.id ||
+          "";
+
+        return {
+          source:
+            "GECKOTERMINAL",
+
+          pool_address:
+            poolAddress,
+
+          name:
+            attrs.name ||
+            null,
+
+          address:
+            baseTokenId ||
+            null,
+
+          attributes:
+            attrs
+        };
+      });
+  } catch {
+    return [];
+  }
+}
+
+function extractGeckoMint(
+  value
+) {
+  const textValue =
+    String(
+      value || ""
+    );
+
+  if (!textValue) {
+    return "";
+  }
+
+  if (
+    textValue.includes("_")
+  ) {
+    return textValue
+      .split("_")
+      .slice(1)
+      .join("_");
+  }
+
+  return textValue;
+}
+
+/*
+  ============================================================
+  DEX DATA NORMALIZATION
   ============================================================
 */
 
@@ -810,12 +930,14 @@ function getBestDexPair(
         ) === mint
     );
 
-  if (!matches.length) {
+  if (
+    !matches.length
+  ) {
     return null;
   }
 
   /*
-    Prefer deepest liquidity.
+    Choose deepest liquidity pool.
   */
   matches.sort(
     (a, b) =>
@@ -830,35 +952,36 @@ function getBestDexPair(
   return matches[0];
 }
 
-/*
-  ============================================================
-  DEX DATA NORMALIZATION
-  ============================================================
-*/
-
 function normalizeDexPair(
   pair
 ) {
   const txns =
-    pair.txns || {};
+    pair.txns ||
+    {};
 
   const volume =
-    pair.volume || {};
+    pair.volume ||
+    {};
 
   const change =
-    pair.priceChange || {};
+    pair.priceChange ||
+    {};
 
   const h24 =
-    txns.h24 || {};
+    txns.h24 ||
+    {};
 
   const h6 =
-    txns.h6 || {};
+    txns.h6 ||
+    {};
 
   const h1 =
-    txns.h1 || {};
+    txns.h1 ||
+    {};
 
   const m5 =
-    txns.m5 || {};
+    txns.m5 ||
+    {};
 
   return {
     mint:
@@ -997,7 +1120,7 @@ function normalizeDexPair(
 
 /*
   ============================================================
-  JUPITER PRICE CROSS-CHECK
+  JUPITER OPTIONAL CROSS-CHECK
   ============================================================
 */
 
@@ -1005,45 +1128,83 @@ async function getJupiterCrossCheck(
   env,
   mints
 ) {
-  const unique =
-    [
-      ...new Set(
-        mints.filter(
+  const unique = [
+    ...new Set(
+      mints
+        .filter(
           isValidMint
         )
-      )
-    ];
+    )
+  ].slice(
+    0,
+    MAX_JUPITER_PRICE_CHECKS
+  );
 
-  if (!unique.length) {
-    return {};
+  /*
+    Jupiter is optional.
+
+    If there is no API key configured,
+    do not allow that to affect the scanner.
+  */
+  if (
+    !env.JUPITER_API_KEY ||
+    !unique.length
+  ) {
+    return {
+      checked: 0,
+      confirmed: 0,
+      data: {},
+      available: false
+    };
   }
 
   try {
     const url =
-      `${JUPITER_PRICE_API}?ids=` +
+      `${JUPITER_PRICE_API}` +
+      `?ids=` +
       unique.join(",");
-
-    const headers = {};
-
-    if (
-      env.JUPITER_API_KEY
-    ) {
-      headers["x-api-key"] =
-        env.JUPITER_API_KEY;
-    }
 
     const data =
       await getJson(
         url,
-        headers
+        {
+          "x-api-key":
+            env.JUPITER_API_KEY
+        }
       );
 
-    return (
+    const prices =
       data?.data ||
-      {}
-    );
+      {};
+
+    return {
+      checked:
+        unique.length,
+
+      confirmed:
+        Object.keys(
+          prices
+        ).length,
+
+      data:
+        prices,
+
+      available:
+        true
+    };
   } catch {
-    return {};
+    return {
+      checked:
+        unique.length,
+
+      confirmed:
+        0,
+
+      data: {},
+
+      available:
+        false
+    };
   }
 }
 
@@ -1069,14 +1230,18 @@ function calculateBuyPressure(
   const total =
     buys + sells;
 
-  if (total <= 0) {
+  if (
+    total <= 0
+  ) {
     return 0;
   }
 
-  return buys / total;
+  return (
+    buys / total
+  );
 }
 
-function calculateShortBuyPressure(
+function calculateShortTermPressure(
   data
 ) {
   const buys =
@@ -1092,16 +1257,20 @@ function calculateShortBuyPressure(
   const total =
     buys + sells;
 
-  if (total <= 0) {
+  if (
+    total <= 0
+  ) {
     return 0.5;
   }
 
-  return buys / total;
+  return (
+    buys / total
+  );
 }
 
 /*
   ============================================================
-  MOMENTUM ANALYSIS
+  MOMENTUM SCORE
   ============================================================
 */
 
@@ -1110,67 +1279,61 @@ function calculateMomentumScore(
 ) {
   let score = 0;
 
-  const m5 =
-    data.price_change_5m;
-
-  const h1 =
-    data.price_change_1h;
-
-  const h6 =
-    data.price_change_6h;
-
   /*
-    Healthy 1h trend.
+    5-minute momentum.
   */
   if (
-    h1 >= 2 &&
-    h1 <= 60
-  ) {
-    score += 7;
-  } else if (
-    h1 > 0
-  ) {
-    score += 3;
-  }
-
-  /*
-    Healthy short-term continuation.
-  */
-  if (
-    m5 >= 0.5 &&
-    m5 <= 8
-  ) {
-    score += 6;
-  } else if (
-    m5 > 0 &&
-    m5 < 15
-  ) {
-    score += 3;
-  }
-
-  /*
-    Longer trend confirmation.
-  */
-  if (
-    h6 > 0 &&
-    h6 < 100
+    data.price_change_5m > 0
   ) {
     score += clamp(
-      h6 * 0.08,
+      data.price_change_5m *
+        0.65,
       0,
-      4
+      6
     );
   }
 
   /*
-    Alignment bonus.
+    1-hour momentum.
   */
   if (
-    m5 > 0 &&
-    h1 > 0 &&
-    h6 > 0
+    data.price_change_1h > 0
   ) {
-    score += 3;
+    score += clamp(
+      data.price_change_1h *
+        0.45,
+      0,
+      8
+    );
+  }
+
+  /*
+    6-hour momentum.
+  */
+  if (
+    data.price_change_6h > 0
+  ) {
+    score += clamp(
+      data.price_change_6h *
+        0.12,
+      0,
+      5
+    );
+  }
+
+  /*
+    Slight bonus for a stable short-term movement
+    while the 1h trend remains positive.
+
+    This prevents us from requiring a token to be
+    pumping every five minutes.
+  */
+  if (
+    data.price_change_1h > 1 &&
+    data.price_change_5m >= -0.75 &&
+    data.price_change_5m <= 2
+  ) {
+    score += 2;
   }
 
   return clamp(
@@ -1182,7 +1345,7 @@ function calculateMomentumScore(
 
 /*
   ============================================================
-  VOLUME
+  VOLUME SCORE
   ============================================================
 */
 
@@ -1200,22 +1363,22 @@ function calculateVolumeScore(
     data.volume_24h_usd >=
     250000
   ) {
-    score += 7;
+    score += 6;
   } else if (
     data.volume_24h_usd >=
     100000
   ) {
-    score += 6;
+    score += 5;
   } else if (
     data.volume_24h_usd >=
     50000
   ) {
-    score += 4;
+    score += 3;
   } else if (
     data.volume_24h_usd >=
     10000
   ) {
-    score += 2;
+    score += 1;
   }
 
   if (
@@ -1241,22 +1404,20 @@ function calculateVolumeScore(
   }
 
   /*
-    5m activity shows whether the market
-    is actually active right now.
+    5m activity bonus.
+
+    We don't require huge 5m volume, but we want
+    some actual activity when the token is being
+    considered for entry.
   */
   if (
     data.volume_5m_usd >=
-    5000
+    10000
   ) {
-    score += 5;
+    score += 2;
   } else if (
     data.volume_5m_usd >=
-    2000
-  ) {
-    score += 3;
-  } else if (
-    data.volume_5m_usd >=
-    500
+    2500
   ) {
     score += 1;
   }
@@ -1270,7 +1431,7 @@ function calculateVolumeScore(
 
 /*
   ============================================================
-  LIQUIDITY
+  LIQUIDITY SCORE
   ============================================================
 */
 
@@ -1305,28 +1466,28 @@ function calculateLiquidityScore(
     liquidity >=
     100000
   ) {
-    return 14;
+    return 13;
   }
 
   if (
     liquidity >=
     50000
   ) {
-    return 11;
+    return 10;
   }
 
   if (
     liquidity >=
     25000
   ) {
-    return 7;
+    return 6;
   }
 
   if (
     liquidity >=
     MIN_LIQUIDITY_USD
   ) {
-    return 4;
+    return 3;
   }
 
   return 0;
@@ -1346,54 +1507,42 @@ function calculateBuyPressureScore(
       data
     );
 
-  const shortPressure =
-    calculateShortBuyPressure(
-      data
-    );
-
-  let score = 0;
-
-  /*
-    1h pressure.
-  */
   if (
-    pressure >= 0.70
+    pressure >=
+    0.70
   ) {
-    score += 10;
-  } else if (
-    pressure >= 0.62
-  ) {
-    score += 8;
-  } else if (
-    pressure >= 0.56
-  ) {
-    score += 6;
-  } else if (
-    pressure >= 0.52
-  ) {
-    score += 3;
+    return 15;
   }
 
-  /*
-    5m confirmation.
-  */
   if (
-    shortPressure >=
-    0.65
+    pressure >=
+    0.62
   ) {
-    score += 5;
-  } else if (
-    shortPressure >=
-    0.55
-  ) {
-    score += 3;
+    return 12;
   }
 
-  return clamp(
-    score,
-    0,
-    15
-  );
+  if (
+    pressure >=
+    0.56
+  ) {
+    return 9;
+  }
+
+  if (
+    pressure >=
+    0.52
+  ) {
+    return 6;
+  }
+
+  if (
+    pressure >=
+    0.50
+  ) {
+    return 3;
+  }
+
+  return 0;
 }
 
 /*
@@ -1418,8 +1567,7 @@ function calculateAccelerationScore(
   let score = 0;
 
   /*
-    Positive short-term movement
-    while the hourly trend is also positive.
+    Healthy positive trend.
   */
   if (
     shortTerm > 0 &&
@@ -1429,26 +1577,37 @@ function calculateAccelerationScore(
   }
 
   /*
-    5m should represent a meaningful
-    portion of the 1h move.
+    5m is meaningfully participating
+    in the 1h trend.
   */
   if (
     shortTerm > 0 &&
     hourly > 0 &&
     shortTerm >=
-    hourly / 12
+      hourly / 6
   ) {
     score += 3;
   }
 
   /*
-    Current volume acceleration.
+    Positive short-term price movement
+    with meaningful short-term volume.
   */
   if (
     data.volume_5m_usd >
     data.volume_1h_usd / 12
   ) {
-    score += 3;
+    score += 2;
+  }
+
+  /*
+    Short-term buyers exceeding sellers.
+  */
+  if (
+    data.buys_5m >
+    data.sells_5m
+  ) {
+    score += 1;
   }
 
   return clamp(
@@ -1465,148 +1624,215 @@ function calculateAccelerationScore(
 */
 
 function calculateCrossSourceScore(
+  jupiterData,
   geckoFound
 ) {
+  let score = 0;
+
   /*
-    DEX Screener is the base market-data source.
-
-    GeckoTerminal is an independent
-    confirmation source.
-
-    Jupiter price availability is NOT
-    counted as independent confirmation.
+    DEX Screener is already the primary
+    market-data source, so we do not award
+    a bonus merely for having it.
   */
 
-  if (geckoFound) {
-    return 10;
+  /*
+    GeckoTerminal independently confirms
+    the token.
+  */
+  if (
+    geckoFound
+  ) {
+    score += 10;
   }
 
-  return 0;
+  /*
+    Jupiter is only a supplemental price
+    confirmation when actually available.
+  */
+  if (
+    jupiterData
+  ) {
+    score += 3;
+  }
+
+  return clamp(
+    score,
+    0,
+    13
+  );
 }
 
 /*
   ============================================================
-  REVERSAL / OVEREXTENSION
+  MARKET SHAPE
   ============================================================
 */
 
 function analyzeMarketShape(
   data
 ) {
-  const reasons = [];
-
   let penalty = 0;
 
-  const m5 =
-    safeNumber(
-      data.price_change_5m
-    );
-
-  const h1 =
-    safeNumber(
-      data.price_change_1h
-    );
-
-  const h6 =
-    safeNumber(
-      data.price_change_6h
-    );
+  const reasons = [];
 
   /*
-    Major reversal:
-    hourly trend strongly negative,
-    but 5m suddenly spikes.
+    ========================================================
+    EXTREME 1H MOVE
+    ========================================================
   */
+
   if (
-    h1 <=
-    REVERSAL_1H_THRESHOLD &&
-    m5 >=
-    REVERSAL_5M_THRESHOLD
+    data.price_change_1h >=
+    EXTREME_1H_MOVE_PERCENT
   ) {
-    reasons.push(
-      "REVERSAL_PATTERN"
-    );
+    penalty += 10;
 
-    penalty += 15;
-  }
-
-  /*
-    Severe hourly decline.
-  */
-  if (
-    h1 <= -20
-  ) {
-    reasons.push(
-      "SEVERE_NEGATIVE_1H"
-    );
-
-    penalty += 20;
-  }
-
-  /*
-    Short-term collapse.
-  */
-  if (
-    m5 <= -8
-  ) {
-    reasons.push(
-      "SHARP_5M_DECLINE"
-    );
-
-    penalty += 15;
-  }
-
-  /*
-    Very large short-term spike.
-  */
-  if (
-    m5 >=
-    EXTREME_5M_MOVE
-  ) {
-    reasons.push(
-      "EXTREME_5M_MOVE"
-    );
-
-    penalty += 8;
-  }
-
-  /*
-    Very large hourly pump.
-  */
-  if (
-    h1 >=
-    EXTREME_1H_MOVE
-  ) {
     reasons.push(
       "EXTREME_1H_MOVE"
     );
-
-    penalty += 8;
   }
 
   /*
-    6h strongly positive while
-    1h is deeply negative can indicate
-    the move is already rolling over.
+    ========================================================
+    STRONG NEGATIVE 6H TREND
+    ========================================================
   */
+
   if (
-    h6 > 20 &&
-    h1 < -5
+    data.price_change_6h <=
+    STRONG_NEGATIVE_6H_PERCENT
   ) {
+    penalty += 8;
+
     reasons.push(
-      "ROLLING_OVER"
+      "NEGATIVE_6H_TREND"
+    );
+  }
+
+  /*
+    ========================================================
+    LARGE 5M REVERSAL
+    ========================================================
+  */
+
+  if (
+    data.price_change_5m <=
+    STRONG_NEGATIVE_5M_PERCENT &&
+    data.price_change_1h > 0
+  ) {
+    penalty += 8;
+
+    reasons.push(
+      "SHORT_TERM_REVERSAL"
+    );
+  }
+
+  /*
+    ========================================================
+    BUY/SELL DETERIORATION
+    ========================================================
+  */
+
+  const shortBuys =
+    safeNumber(
+      data.buys_5m
     );
 
-    penalty += 10;
+  const shortSells =
+    safeNumber(
+      data.sells_5m
+    );
+
+  if (
+    shortSells > 0 &&
+    shortBuys <
+      shortSells /
+        SHORT_TERM_SELL_RATIO
+  ) {
+    penalty += 6;
+
+    reasons.push(
+      "SHORT_TERM_SELL_PRESSURE"
+    );
+  }
+
+  /*
+    ========================================================
+    HOURLY SELL PRESSURE
+    ========================================================
+  */
+
+  const hourlyBuys =
+    safeNumber(
+      data.buys_1h
+    );
+
+  const hourlySells =
+    safeNumber(
+      data.sells_1h
+    );
+
+  if (
+    hourlySells > 0 &&
+    hourlyBuys <
+      hourlySells /
+        HOURLY_SELL_RATIO
+  ) {
+    penalty += 7;
+
+    reasons.push(
+      "HOURLY_SELL_PRESSURE"
+    );
+  }
+
+  /*
+    ========================================================
+    BOUNCE / CHASE DETECTION
+    ========================================================
+
+    Example:
+
+      6h = -30%
+      1h = +8%
+      5m = +10%
+
+    That can be a bounce rather than
+    the beginning of a sustained trend.
+  */
+
+  if (
+    data.price_change_6h <=
+      STRONG_NEGATIVE_6H_PERCENT &&
+    data.price_change_5m >=
+      BOUNCE_5M_PERCENT
+  ) {
+    penalty += 7;
+
+    reasons.push(
+      "BOUNCE_AFTER_LARGE_DECLINE"
+    );
+  }
+
+  /*
+    ========================================================
+    TOO MANY SHORT-TERM SELLS
+    ========================================================
+  */
+
+  if (
+    shortSells >= 20 &&
+    shortSells >
+      shortBuys * 1.25
+  ) {
+    penalty += 4;
+
+    reasons.push(
+      "SHORT_TERM_SELL_DOMINANCE"
+    );
   }
 
   return {
-    penalty:
-      clamp(
-        penalty,
-        0,
-        40
-      ),
+    penalty,
 
     reasons
   };
@@ -1614,7 +1840,7 @@ function analyzeMarketShape(
 
 /*
   ============================================================
-  RISK
+  RISK ASSESSMENT
   ============================================================
 */
 
@@ -1670,12 +1896,13 @@ function assessRisk(
   }
 
   /*
-    1h sell pressure.
+    Hard hourly sell-pressure rule.
   */
   if (
     data.sells_1h > 0 &&
     data.buys_1h <
-    data.sells_1h * 0.70
+      data.sells_1h *
+        0.70
   ) {
     reasons.push(
       "SELL_PRESSURE"
@@ -1683,35 +1910,29 @@ function assessRisk(
   }
 
   /*
-    Hard reversal rejection.
+    Strong negative short-term momentum
+    while the hourly trend is already negative.
   */
   if (
-    marketShape.reasons.includes(
-      "SEVERE_NEGATIVE_1H"
-    )
+    data.price_change_5m <
+      -2 &&
+    data.price_change_1h <
+      0
   ) {
     reasons.push(
       "NEGATIVE_MOMENTUM"
     );
   }
 
+  /*
+    Extremely dangerous short-term reversal.
+  */
   if (
-    marketShape.reasons.includes(
-      "REVERSAL_PATTERN"
-    )
+    data.price_change_5m <=
+      -6
   ) {
     reasons.push(
-      "REVERSAL_PATTERN"
-    );
-  }
-
-  if (
-    marketShape.reasons.includes(
-      "SHARP_5M_DECLINE"
-    )
-  ) {
-    reasons.push(
-      "NEGATIVE_5M"
+      "SEVERE_5M_DECLINE"
     );
   }
 
@@ -1725,7 +1946,107 @@ function assessRisk(
 
 /*
   ============================================================
-  FINAL SCORE
+  ENTRY QUALITY
+  ============================================================
+*/
+
+function evaluateEntryQuality(
+  data,
+  score,
+  marketShape,
+  risk
+) {
+  const reasons = [];
+
+  /*
+    Must pass basic risk.
+  */
+  if (
+    !risk.pass
+  ) {
+    reasons.push(
+      ...risk.reasons
+    );
+  }
+
+  /*
+    Minimum overall score.
+  */
+  if (
+    score.total <
+    MIN_ENTRY_SCORE
+  ) {
+    reasons.push(
+      "BELOW_ENTRY_SCORE"
+    );
+  }
+
+  /*
+    Need actual momentum.
+  */
+  if (
+    score.momentum <
+    MIN_MOMENTUM_SCORE
+  ) {
+    reasons.push(
+      "WEAK_MOMENTUM"
+    );
+  }
+
+  /*
+    Don't enter when the market shape
+    has accumulated too many warning points.
+  */
+  if (
+    marketShape.penalty >=
+    8
+  ) {
+    reasons.push(
+      "BAD_MARKET_SHAPE"
+    );
+  }
+
+  /*
+    Avoid buying a token with strongly
+    negative 6h momentum unless the overall
+    structure is exceptionally strong.
+  */
+  if (
+    data.price_change_6h <
+      -20 &&
+    score.momentum <
+      12
+  ) {
+    reasons.push(
+      "NEGATIVE_LONGER_TREND"
+    );
+  }
+
+  /*
+    If 5m selling dominates while the
+    candidate is trying to enter, wait.
+  */
+  if (
+    data.sells_5m >= 10 &&
+    data.sells_5m >
+      data.buys_5m * 1.50
+  ) {
+    reasons.push(
+      "5M_ENTRY_SELL_PRESSURE"
+    );
+  }
+
+  return {
+    pass:
+      reasons.length === 0,
+
+    reasons
+  };
+}
+
+/*
+  ============================================================
+  COMPLETE CANDIDATE SCORE
   ============================================================
 */
 
@@ -1761,6 +2082,7 @@ function scoreCandidate(
 
   const crossSource =
     calculateCrossSourceScore(
+      jupiterData,
       geckoFound
     );
 
@@ -1778,13 +2100,12 @@ function scoreCandidate(
     crossSource;
 
   const total =
-    clamp(
+    Math.max(
+      0,
       Math.round(
         grossScore -
         marketShape.penalty
-      ),
-      0,
-      100
+      )
     );
 
   return {
@@ -1835,42 +2156,72 @@ async function scanCandidates(
     Date.now();
 
   /*
+    ----------------------------------------------------------
     SOURCE 1:
-    DEX Screener discovery.
+    DEX Screener discovery
+    ----------------------------------------------------------
   */
+
   const dexDiscovery =
     await getDexScreenerDiscovery();
 
   /*
+    ----------------------------------------------------------
     SOURCE 2:
-    DEX Screener search.
+    DEX Screener search
+    ----------------------------------------------------------
   */
+
   const dexSearch =
     await getDexSearchCandidates();
 
   /*
-    SOURCE 3:
-    GeckoTerminal trending pools.
-  */
-  const geckoPools =
-    await getGeckoTrendingPools();
-
-  /*
-    ------------------------------------------------------------
-    BUILD SOURCE MAP
-    ------------------------------------------------------------
+    ----------------------------------------------------------
+    COMBINE DISCOVERY
+    ----------------------------------------------------------
   */
 
   const discoveryMap =
     new Map();
 
-  /*
-    IMPORTANT:
-    Gecko candidates are inserted FIRST.
+  for (
+    const item of [
+      ...dexDiscovery,
+      ...dexSearch
+    ]
+  ) {
+    if (
+      !isValidMint(
+        item.mint
+      )
+    ) {
+      continue;
+    }
 
-    This prevents them from being pushed out
-    when the hydration limit is reached.
+    if (
+      !discoveryMap.has(
+        item.mint
+      )
+    ) {
+      discoveryMap.set(
+        item.mint,
+        item
+      );
+    }
+  }
+
+  /*
+    ----------------------------------------------------------
+    SOURCE 3:
+    GeckoTerminal
+    ----------------------------------------------------------
   */
+
+  const geckoPools =
+    await getGeckoTrendingPools();
+
+  const geckoMints =
+    new Set();
 
   for (
     const pool of geckoPools
@@ -1886,185 +2237,82 @@ async function scanCandidates(
       continue;
     }
 
-    discoveryMap.set(
-      mint,
-      {
-        mint,
-        source:
-          "GECKOTERMINAL"
-      }
+    geckoMints.add(
+      mint
     );
-  }
-
-  /*
-    Add DEX Screener discovery.
-  */
-  for (
-    const item of dexDiscovery
-  ) {
-    if (
-      !isValidMint(
-        item.mint
-      )
-    ) {
-      continue;
-    }
 
     if (
       !discoveryMap.has(
-        item.mint
+        mint
       )
     ) {
       discoveryMap.set(
-        item.mint,
-        item
+        mint,
+        {
+          mint,
+
+          source:
+            "GECKOTERMINAL"
+        }
       );
     }
   }
 
   /*
-    Add DEX Screener search.
+    ----------------------------------------------------------
+    HYDRATE MARKET DATA
+    ----------------------------------------------------------
   */
-  for (
-    const item of dexSearch
-  ) {
-    if (
-      !isValidMint(
-        item.mint
-      )
-    ) {
-      continue;
-    }
 
-    if (
-      !discoveryMap.has(
-        item.mint
-      )
-    ) {
-      discoveryMap.set(
-        item.mint,
-        item
-      );
-    }
-  }
+  const dexPairs =
+    await hydrateDexCandidates(
+      [
+        ...discoveryMap.values()
+      ]
+    );
 
   /*
-    Gecko confirmation set.
+    ----------------------------------------------------------
+    UNIQUE MARKET MINTS
+    ----------------------------------------------------------
   */
-  const geckoMints =
-    new Set(
-      geckoPools
+
+  const mints = [
+    ...new Set(
+      dexPairs
         .map(
-          pool =>
-            extractGeckoMint(
-              pool.address
+          pair =>
+            normalizeAddress(
+              pair
+                .baseToken
+                ?.address
             )
         )
         .filter(
           isValidMint
         )
-    );
+    )
+  ];
 
   /*
-    ------------------------------------------------------------
-    HYDRATION ORDER
-    ------------------------------------------------------------
-
-    Gecko tokens first.
-
-    Then DEX tokens.
-
-    This is the main fix for the previous
-    cross-source problem.
+    ----------------------------------------------------------
+    JUPITER OPTIONAL CHECK
+    ----------------------------------------------------------
   */
 
-  const geckoCandidates =
-    [];
-
-  const dexCandidates =
-    [];
-
-  for (
-    const item of
-    discoveryMap.values()
-  ) {
-    if (
-      geckoMints.has(
-        item.mint
-      )
-    ) {
-      geckoCandidates.push(
-        item
-      );
-    } else {
-      dexCandidates.push(
-        item
-      );
-    }
-  }
-
-  const hydrationCandidates =
-    [
-      ...geckoCandidates,
-      ...dexCandidates
-    ];
-
-  /*
-    Hydrate candidates with
-    DEX Screener market data.
-  */
-  const dexPairs =
-    await hydrateDexCandidates(
-      hydrationCandidates
-    );
-
-  /*
-    Get unique mints from actual
-    market data.
-  */
-  const mints =
-    [
-      ...new Set(
-        dexPairs
-          .map(
-            pair =>
-              normalizeAddress(
-                pair.baseToken?.address
-              )
-          )
-          .filter(
-            isValidMint
-          )
-      )
-    ];
-
-  /*
-    Jupiter is ONLY a price cross-check.
-  */
-  const jupiterPrices =
+  const jupiter =
     await getJupiterCrossCheck(
       env,
-      mints.slice(
-        0,
-        30
-      )
+      mints
     );
 
   /*
-    ------------------------------------------------------------
-    BUILD CANDIDATES
-    ------------------------------------------------------------
+    ----------------------------------------------------------
+    NORMALIZE + SCORE
+    ----------------------------------------------------------
   */
 
   const candidates = [];
-
-  /*
-    Track duplicate token addresses so
-    the same token does not appear multiple
-    times because it has several pools.
-  */
-  const seenMints =
-    new Set();
 
   for (
     const pair of dexPairs
@@ -2083,18 +2331,6 @@ async function scanCandidates(
     }
 
     if (
-      seenMints.has(
-        data.mint
-      )
-    ) {
-      continue;
-    }
-
-    seenMints.add(
-      data.mint
-    );
-
-    if (
       isBlockedSymbol(
         data.symbol
       )
@@ -2109,17 +2345,6 @@ async function scanCandidates(
       continue;
     }
 
-    const geckoFound =
-      geckoMints.has(
-        data.mint
-      );
-
-    const jupiterData =
-      jupiterPrices[
-        data.mint
-      ] ||
-      null;
-
     const marketShape =
       analyzeMarketShape(
         data
@@ -2131,6 +2356,17 @@ async function scanCandidates(
         marketShape
       );
 
+    const jupiterData =
+      jupiter.data[
+        data.mint
+      ] ||
+      null;
+
+    const geckoFound =
+      geckoMints.has(
+        data.mint
+      );
+
     const score =
       scoreCandidate(
         data,
@@ -2138,27 +2374,29 @@ async function scanCandidates(
         geckoFound
       );
 
-    /*
-      Entry quality is separate from
-      simple eligibility.
-    */
-    const entryQuality =
-      risk.pass &&
-      score.total >=
-      MIN_ENTRY_SCORE;
+    const entry =
+      evaluateEntryQuality(
+        data,
+        score,
+        marketShape,
+        risk
+      );
 
     candidates.push({
       ...data,
 
       score,
 
-      risk,
-
       entry_quality:
-        entryQuality,
+        entry.pass,
+
+      entry_reasons:
+        entry.reasons,
 
       market_shape:
         marketShape,
+
+      risk,
 
       sources: {
         dexscreener:
@@ -2174,7 +2412,7 @@ async function scanCandidates(
       },
 
       decision:
-        entryQuality
+        entry.pass
           ? "PAPER_ELIGIBLE"
           : risk.pass
             ? "BELOW_ENTRY_SCORE"
@@ -2183,70 +2421,28 @@ async function scanCandidates(
   }
 
   /*
-    ------------------------------------------------------------
+    ----------------------------------------------------------
     SORT
-    ------------------------------------------------------------
+    ----------------------------------------------------------
   */
 
   candidates.sort(
-    (a, b) => {
-      /*
-        Eligible candidates first.
-      */
-      if (
-        a.entry_quality &&
-        !b.entry_quality
-      ) {
-        return -1;
-      }
-
-      if (
-        !a.entry_quality &&
-        b.entry_quality
-      ) {
-        return 1;
-      }
-
-      return (
-        b.score.total -
-        a.score.total
-      );
-    }
+    (a, b) =>
+      b.score.total -
+      a.score.total
   );
 
+  const eligible =
+    candidates.filter(
+      candidate =>
+        candidate.entry_quality
+    );
+
   /*
-    ------------------------------------------------------------
-    SOURCE COUNTS
-    ------------------------------------------------------------
+    ----------------------------------------------------------
+    SCAN RESULT
+    ----------------------------------------------------------
   */
-
-  const sourceCounts = {
-    dexscreener_discovery:
-      dexDiscovery.length,
-
-    dexscreener_search:
-      dexSearch.length,
-
-    gecko_trending:
-      geckoPools.length,
-
-    gecko_confirmed_tokens:
-      candidates.filter(
-        candidate =>
-          candidate.sources
-            .geckoterminal
-      ).length,
-
-    jupiter_price_checked:
-      candidates.filter(
-        candidate =>
-          candidate.sources
-            .jupiter_price
-      ).length,
-
-    hydrated_pairs:
-      dexPairs.length
-  };
 
   const result = {
     scanned_at:
@@ -2256,34 +2452,54 @@ async function scanCandidates(
       Date.now() -
       scanStarted,
 
-    source_counts:
-      sourceCounts,
+    source_counts: {
+      dexscreener_discovery:
+        dexDiscovery.length,
+
+      dexscreener_search:
+        dexSearch.length,
+
+      gecko_trending:
+        geckoPools.length,
+
+      gecko_confirmed_tokens:
+        geckoMints.size,
+
+      jupiter_price_checked:
+        jupiter.checked,
+
+      jupiter_price_confirmed:
+        jupiter.confirmed,
+
+      hydrated_pairs:
+        dexPairs.length
+    },
 
     total_candidates:
       candidates.length,
 
-    eligible_candidates:
-      candidates.filter(
-        candidate =>
-          candidate.entry_quality
-      ).length,
-
     risk_pass_candidates:
       candidates.filter(
-        candidate =>
-          candidate.risk.pass
+        x =>
+          x.risk.pass
       ).length,
 
+    eligible_candidates:
+      eligible.length,
+
     candidates:
-      candidates.slice(
-        0,
-        MAX_CANDIDATES
-      )
+      candidates
+        .slice(
+          0,
+          MAX_CANDIDATES
+        )
   };
 
   await env.BOT_KV.put(
     SCAN_KEY,
-    JSON.stringify(result)
+    JSON.stringify(
+      result
+    )
   );
 
   return result;
@@ -2291,7 +2507,7 @@ async function scanCandidates(
 
 /*
   ============================================================
-  CURRENT TOKEN PRICE
+  POSITION PRICE
   ============================================================
 */
 
@@ -2300,10 +2516,14 @@ async function getTokenPriceFromDex(
 ) {
   try {
     const url =
-      `${DEXSCREENER_API}/tokens/v1/solana/${mint}`;
+      `${DEXSCREENER_API}` +
+      `/tokens/v1/solana/` +
+      mint;
 
     const pairs =
-      await getJson(url);
+      await getJson(
+        url
+      );
 
     if (
       !Array.isArray(pairs) ||
@@ -2346,30 +2566,25 @@ async function openPaperPosition(
   portfolio,
   candidate
 ) {
-  if (!PAPER_MODE) {
+  if (
+    !PAPER_MODE
+  ) {
     throw new Error(
       "Safety error: PAPER_MODE must remain true."
     );
   }
 
   if (
-    portfolio.open_positions.length >=
+    portfolio.open_positions
+      .length >=
     MAX_POSITIONS
   ) {
     return {
-      opened: false,
+      opened:
+        false,
+
       reason:
         "MAX_POSITIONS"
-    };
-  }
-
-  if (
-    !candidate.entry_quality
-  ) {
-    return {
-      opened: false,
-      reason:
-        "ENTRY_SCORE_TOO_LOW"
     };
   }
 
@@ -2381,7 +2596,9 @@ async function openPaperPosition(
     availableCash <= 0
   ) {
     return {
-      opened: false,
+      opened:
+        false,
+
       reason:
         "CASH_RESERVE"
     };
@@ -2403,7 +2620,9 @@ async function openPaperPosition(
     cost <= 0
   ) {
     return {
-      opened: false,
+      opened:
+        false,
+
       reason:
         "INSUFFICIENT_CASH"
     };
@@ -2418,7 +2637,9 @@ async function openPaperPosition(
     price <= 0
   ) {
     return {
-      opened: false,
+      opened:
+        false,
+
       reason:
         "INVALID_PRICE"
     };
@@ -2490,14 +2711,14 @@ async function openPaperPosition(
     entry_score:
       candidate.score,
 
-    entry_quality:
-      candidate.entry_quality,
-
     entry_sources:
       candidate.sources,
 
     entry_risk:
       candidate.risk,
+
+    entry_quality:
+      candidate.entry_quality,
 
     entry_market_shape:
       candidate.market_shape
@@ -2506,9 +2727,10 @@ async function openPaperPosition(
   portfolio.cash_usd -=
     cost;
 
-  portfolio.open_positions.push(
-    position
-  );
+  portfolio.open_positions
+    .push(
+      position
+    );
 
   await setCooldown(
     env,
@@ -2551,7 +2773,9 @@ async function openPaperPosition(
   );
 
   return {
-    opened: true,
+    opened:
+      true,
+
     position
   };
 }
@@ -2669,10 +2893,8 @@ async function updatePosition(
   ) {
     const trailingFloor =
       position.highest_price_usd *
-      (
-        1 -
-        TRAILING_STOP
-      );
+      (1 -
+        TRAILING_STOP);
 
     if (
       price <=
@@ -2788,7 +3010,8 @@ async function closePaperPosition(
           ? (
               pnl /
               position.cost_usd
-            ) * 100
+            ) *
+            100
           : 0,
 
       reason,
@@ -2810,6 +3033,7 @@ async function refreshPortfolioValues(
   portfolio
 ) {
   let marketValue = 0;
+
   let unrealized = 0;
 
   for (
@@ -2840,21 +3064,23 @@ async function refreshPortfolioValues(
 
   /*
     IMPORTANT:
-    Return is based on total portfolio
-    value versus original starting cash.
+    Return is based on total portfolio value
+    versus starting cash.
 
-    This fixes the previous percentage
-    calculation problem.
+    This prevents the old incorrect percentage
+    calculation.
   */
   portfolio.return_percent =
-    portfolio.starting_cash_usd > 0
+    portfolio.starting_cash_usd >
+    0
       ? (
           (
             totalValue -
             portfolio.starting_cash_usd
           ) /
           portfolio.starting_cash_usd
-        ) * 100
+        ) *
+        100
       : 0;
 
   return {
@@ -2876,21 +3102,28 @@ async function runBot(
   env,
   reason = "manual"
 ) {
-  if (!PAPER_MODE) {
+  if (
+    !PAPER_MODE
+  ) {
     throw new Error(
       "SAFETY STOP: This version is PAPER ONLY."
     );
   }
 
   const portfolio =
-    await getPortfolio(env);
+    await getPortfolio(
+      env
+    );
 
   const actions = [];
 
   /*
+    ----------------------------------------------------------
     STEP 1:
-    Monitor existing positions.
+    MONITOR EXISTING POSITIONS
+    ----------------------------------------------------------
   */
+
   for (
     const position of [
       ...portfolio.open_positions
@@ -2936,20 +3169,24 @@ async function runBot(
   }
 
   /*
+    ----------------------------------------------------------
     STEP 2:
-    Scan market.
+    SCAN MARKET
+    ----------------------------------------------------------
   */
+
   const scan =
     await scanCandidates(
       env
     );
 
   /*
+    ----------------------------------------------------------
     STEP 3:
-    Eligible means:
-      - passed risk checks
-      - reached entry score
+    ONLY ENTRY-QUALITY CANDIDATES
+    ----------------------------------------------------------
   */
+
   const eligible =
     scan.candidates.filter(
       candidate =>
@@ -2957,8 +3194,11 @@ async function runBot(
     );
 
   /*
-    Never buy a token already held.
+    ----------------------------------------------------------
+    DON'T BUY ALREADY-HELD TOKENS
+    ----------------------------------------------------------
   */
+
   const heldMints =
     new Set(
       portfolio.open_positions.map(
@@ -2977,6 +3217,12 @@ async function runBot(
 
   let buysThisRun = 0;
 
+  /*
+    ----------------------------------------------------------
+    PAPER ENTRY
+    ----------------------------------------------------------
+  */
+
   for (
     const candidate of
     buyCandidates
@@ -2993,6 +3239,23 @@ async function runBot(
         env,
         candidate.mint
       )
+    ) {
+      continue;
+    }
+
+    /*
+      Safety check:
+      Never bypass entry quality.
+    */
+    if (
+      !candidate.entry_quality
+    ) {
+      continue;
+    }
+
+    if (
+      candidate.score.total <
+      MIN_ENTRY_SCORE
     ) {
       continue;
     }
@@ -3044,9 +3307,12 @@ async function runBot(
   }
 
   /*
+    ----------------------------------------------------------
     STEP 4:
-    Recalculate portfolio.
+    PORTFOLIO VALUE
+    ----------------------------------------------------------
   */
+
   const value =
     await refreshPortfolioValues(
       env,
@@ -3062,7 +3328,8 @@ async function runBot(
   );
 
   return {
-    ok: true,
+    ok:
+      true,
 
     bot:
       BOT_NAME,
@@ -3094,6 +3361,9 @@ async function runBot(
       candidates:
         scan.total_candidates,
 
+      risk_pass:
+        scan.risk_pass_candidates,
+
       eligible:
         scan.eligible_candidates,
 
@@ -3123,6 +3393,9 @@ async function runBot(
               entry_quality:
                 candidate.entry_quality,
 
+              entry_reasons:
+                candidate.entry_reasons,
+
               liquidity_usd:
                 candidate.liquidity_usd,
 
@@ -3141,11 +3414,20 @@ async function runBot(
               price_change_1h:
                 candidate.price_change_1h,
 
+              price_change_6h:
+                candidate.price_change_6h,
+
               buys_1h:
                 candidate.buys_1h,
 
               sells_1h:
                 candidate.sells_1h,
+
+              buys_5m:
+                candidate.buys_5m,
+
+              sells_5m:
+                candidate.sells_5m,
 
               sources:
                 candidate.sources,
@@ -3208,16 +3490,17 @@ async function handleRequest(
     url.pathname;
 
   /*
-    ==========================================================
+    ----------------------------------------------------------
     HOME
-    ==========================================================
+    ----------------------------------------------------------
   */
 
   if (
     path === "/"
   ) {
     return json({
-      ok: true,
+      ok:
+        true,
 
       bot:
         BOT_NAME,
@@ -3254,9 +3537,9 @@ async function handleRequest(
   }
 
   /*
-    ==========================================================
+    ----------------------------------------------------------
     STATUS
-    ==========================================================
+    ----------------------------------------------------------
   */
 
   if (
@@ -3279,7 +3562,8 @@ async function handleRequest(
     );
 
     return json({
-      ok: true,
+      ok:
+        true,
 
       bot:
         BOT_NAME,
@@ -3337,12 +3621,6 @@ async function handleRequest(
       },
 
       settings: {
-        paper_mode:
-          PAPER_MODE,
-
-        minimum_entry_score:
-          MIN_ENTRY_SCORE,
-
         small_trade_cap_usd:
           SMALL_TRADE_CAP_USD,
 
@@ -3374,7 +3652,16 @@ async function handleRequest(
           MIN_VOLUME_24H_USD,
 
         minimum_1h_volume_usd:
-          MIN_VOLUME_1H_USD
+          MIN_VOLUME_1H_USD,
+
+        minimum_entry_score:
+          MIN_ENTRY_SCORE,
+
+        extreme_1h_move_percent:
+          EXTREME_1H_MOVE_PERCENT,
+
+        strong_negative_6h_percent:
+          STRONG_NEGATIVE_6H_PERCENT
       },
 
       positions:
@@ -3383,9 +3670,9 @@ async function handleRequest(
   }
 
   /*
-    ==========================================================
-    SCAN ONLY
-    ==========================================================
+    ----------------------------------------------------------
+    SCAN
+    ----------------------------------------------------------
   */
 
   if (
@@ -3397,7 +3684,8 @@ async function handleRequest(
       );
 
     return json({
-      ok: true,
+      ok:
+        true,
 
       bot:
         BOT_NAME,
@@ -3410,9 +3698,9 @@ async function handleRequest(
   }
 
   /*
-    ==========================================================
+    ----------------------------------------------------------
     TEST
-    ==========================================================
+    ----------------------------------------------------------
   */
 
   if (
@@ -3424,7 +3712,8 @@ async function handleRequest(
       );
 
     return json({
-      ok: true,
+      ok:
+        true,
 
       bot:
         BOT_NAME,
@@ -3444,11 +3733,11 @@ async function handleRequest(
         total_candidates:
           scan.total_candidates,
 
-        eligible_candidates:
-          scan.eligible_candidates,
-
         risk_pass_candidates:
           scan.risk_pass_candidates,
+
+        eligible_candidates:
+          scan.eligible_candidates,
 
         source_counts:
           scan.source_counts,
@@ -3478,6 +3767,9 @@ async function handleRequest(
 
                 entry_quality:
                   candidate.entry_quality,
+
+                entry_reasons:
+                  candidate.entry_reasons,
 
                 liquidity_usd:
                   candidate.liquidity_usd,
@@ -3530,9 +3822,9 @@ async function handleRequest(
   }
 
   /*
-    ==========================================================
+    ----------------------------------------------------------
     RUN
-    ==========================================================
+    ----------------------------------------------------------
   */
 
   if (
@@ -3550,9 +3842,9 @@ async function handleRequest(
   }
 
   /*
-    ==========================================================
+    ----------------------------------------------------------
     TRADES
-    ==========================================================
+    ----------------------------------------------------------
   */
 
   if (
@@ -3564,7 +3856,8 @@ async function handleRequest(
       );
 
     return json({
-      ok: true,
+      ok:
+        true,
 
       bot:
         BOT_NAME,
@@ -3581,13 +3874,14 @@ async function handleRequest(
   }
 
   /*
-    ==========================================================
+    ----------------------------------------------------------
     RESET PAPER ACCOUNT
-    ==========================================================
+    ----------------------------------------------------------
   */
 
   if (
-    path === "/reset-paper"
+    path ===
+    "/reset-paper"
   ) {
     const confirm =
       url.searchParams.get(
@@ -3595,11 +3889,13 @@ async function handleRequest(
       );
 
     if (
-      confirm !== "RESET"
+      confirm !==
+      "RESET"
     ) {
       return json(
         {
-          ok: false,
+          ok:
+            false,
 
           error:
             "Reset blocked. Use /reset-paper?confirm=RESET"
@@ -3629,7 +3925,8 @@ async function handleRequest(
     );
 
     return json({
-      ok: true,
+      ok:
+        true,
 
       message:
         "Paper account reset.",
@@ -3640,14 +3937,16 @@ async function handleRequest(
   }
 
   /*
-    ==========================================================
+    ----------------------------------------------------------
     NOT FOUND
-    ==========================================================
+    ----------------------------------------------------------
   */
 
   return json(
     {
-      ok: false,
+      ok:
+        false,
+
       error:
         "Not found"
     },
@@ -3701,10 +4000,13 @@ export default {
         request,
         env
       );
-    } catch (error) {
+    } catch (
+      error
+    ) {
       return json(
         {
-          ok: false,
+          ok:
+            false,
 
           bot:
             BOT_NAME,
