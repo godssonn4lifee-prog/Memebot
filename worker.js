@@ -1,102 +1,132 @@
 const BOT_NAME = "memebott";
 
 /*
-  ============================================================
-  MEMEBOTT — PAPER TRADING VERSION
-  ============================================================
+============================================================
+MEMEBOTT — PAPER TRADING ONLY
+============================================================
 
-  IMPORTANT:
-  - PAPER TRADING ONLY
-  - NO PRIVATE KEY
-  - NO WALLET SIGNING
-  - NO TRANSACTION EXECUTION
-  - NO REAL MONEY
-  - NO REAL BUY/SELL ORDERS
+NO REAL TRADING
+NO WALLET SIGNING
+NO PRIVATE KEY
+NO REAL TRANSACTIONS
 
-  The bot scans Solana tokens, creates simulated positions,
-  tracks their prices, and simulates exits.
+The bot:
+1. Scans Solana tokens
+2. Filters candidates
+3. Opens simulated positions
+4. Tracks prices
+5. Uses a hard stop
+6. Uses a trailing exit
+7. Records simulated P&L
+8. Stores everything in Cloudflare KV
 
-  Default paper portfolio:
-    $100 starting cash
-    $2 trades below $20 portfolio value
-    $5 trades at/above $20
-    maximum 10 positions
-
-  EXIT LOGIC:
-    Hard stop: -1%
-    Trailing activates after +1% profit
-    Trailing distance: 3%
-    Two consecutive qualifying declines confirm an exit
-
-  ============================================================
+============================================================
 */
 
 
-/* ============================================================
-   BASIC SETTINGS
-   ============================================================ */
-
-const BOT_NAME = "memebott";
+/* =========================================================
+   MODE
+========================================================= */
 
 const PAPER_MODE = true;
 
-// Starting simulated portfolio.
+
+/* =========================================================
+   PAPER ACCOUNT
+========================================================= */
+
 const PAPER_STARTING_CASH_USD = 100;
 
-// Never use the user's real wallet balance for paper trading.
 const PAPER_MIN_CASH_RESERVE_USD = 10;
 
-// Position sizing.
+
+/* =========================================================
+   POSITION SIZING
+========================================================= */
+
 const SMALL_TRADE_CAP_USD = 2;
+
 const LARGE_TRADE_CAP_USD = 5;
+
 const BALANCE_THRESHOLD_USD = 20;
 
-// Maximum simultaneous simulated positions.
+
+/* =========================================================
+   POSITION LIMITS
+========================================================= */
+
 const MAX_POSITIONS = 10;
 
-// Hard stop.
-const STOP_LOSS = -0.01;
-
-// Trailing stop distance from highest price.
-const TRAILING_STOP = 0.03;
-
-// Trailing stop does not activate until this profit.
-const TRAILING_ACTIVATION = 0.01;
-
-// Require two consecutive qualifying observations
-// before selling on a trailing decline.
-const REVERSAL_CONFIRMATIONS_REQUIRED = 2;
-
-// Do not repeatedly buy/sell the same token immediately.
-const COOLDOWN_SECONDS = 30;
-
-
-/* ============================================================
-   SCANNING SETTINGS
-   ============================================================ */
-
-// We scan more candidates than the old version.
-const MAX_CANDIDATES = 20;
-
-// Maximum number of new paper positions opened in one run.
 const MAX_NEW_BUYS_PER_RUN = 1;
 
-// Minimum usable price.
+
+/* =========================================================
+   EXIT SETTINGS
+========================================================= */
+
+/*
+   Hard stop:
+   -1% from entry.
+*/
+
+const STOP_LOSS = -0.01;
+
+
+/*
+   Trailing exit:
+   Once the position reaches +1%,
+   the trailing stop becomes active.
+*/
+
+const TRAILING_ACTIVATION = 0.01;
+
+
+/*
+   Sell if price falls 3% from the
+   highest price reached after entry.
+*/
+
+const TRAILING_STOP = 0.03;
+
+
+/*
+   Require two consecutive qualifying
+   checks before selling.
+*/
+
+const REVERSAL_CONFIRMATIONS_REQUIRED = 2;
+
+
+/* =========================================================
+   SCANNER SETTINGS
+========================================================= */
+
+const MAX_CANDIDATES = 20;
+
 const MIN_TOKEN_PRICE_USD = 0.00000001;
 
 
-/* ============================================================
-   STORAGE KEYS
-   ============================================================ */
+/* =========================================================
+   COOLDOWN
+========================================================= */
+
+const COOLDOWN_SECONDS = 30;
+
+
+/* =========================================================
+   KV STORAGE
+========================================================= */
 
 const PORTFOLIO_KEY = "PAPER_PORTFOLIO";
+
 const HISTORY_KEY = "PAPER_TRADE_HISTORY";
+
 const COOLDOWN_KEY = "PAPER_TRADE_COOLDOWN";
 
 
-/* ============================================================
-   JUPITER
-   ============================================================ */
+/* =========================================================
+   JUPITER API
+========================================================= */
 
 const JUPITER_API = "https://api.jup.ag";
 
@@ -107,9 +137,9 @@ const TOKENS_API =
   `${JUPITER_API}/tokens/v2`;
 
 
-/* ============================================================
-   WELL-KNOWN SOLANA TOKENS
-   ============================================================ */
+/* =========================================================
+   SOLANA TOKEN ADDRESSES
+========================================================= */
 
 const SOL_MINT =
   "So11111111111111111111111111111111111111112";
@@ -121,9 +151,9 @@ const USDT_MINT =
   "Es9vMFrzaCERmJfrF4H2FYD4WkYx8YhY6W3xG8sY5H";
 
 
-/* ============================================================
-   HTTP HELPERS
-   ============================================================ */
+/* =========================================================
+   RESPONSE HELPERS
+========================================================= */
 
 function jsonResponse(data, status = 200) {
   return new Response(
@@ -131,8 +161,11 @@ function jsonResponse(data, status = 200) {
     {
       status,
       headers: {
-        "content-type": "application/json; charset=utf-8",
-        "cache-control": "no-store"
+        "content-type":
+          "application/json; charset=utf-8",
+
+        "cache-control":
+          "no-store"
       }
     }
   );
@@ -142,59 +175,120 @@ function jsonResponse(data, status = 200) {
 function textResponse(text, status = 200) {
   return new Response(text, {
     status,
+
     headers: {
-      "content-type": "text/plain; charset=utf-8",
-      "cache-control": "no-store"
+      "content-type":
+        "text/plain; charset=utf-8",
+
+      "cache-control":
+        "no-store"
     }
   });
 }
 
 
-/* ============================================================
-   MAIN WORKER
-   ============================================================ */
+/* =========================================================
+   WORKER
+========================================================= */
 
 export default {
+
   async fetch(request, env) {
+
     try {
-      const url = new URL(request.url);
-      const path = url.pathname;
+
+      const url =
+        new URL(request.url);
+
+      const path =
+        url.pathname;
+
+
+      /* -----------------------------------------------------
+         HOME
+      ----------------------------------------------------- */
 
       if (path === "/") {
         return await handleHome(env);
       }
 
+
+      /* -----------------------------------------------------
+         STATUS
+      ----------------------------------------------------- */
+
       if (path === "/status") {
         return await handleStatus(env);
       }
+
+
+      /* -----------------------------------------------------
+         TEST SCANNER
+      ----------------------------------------------------- */
 
       if (path === "/test") {
         return await handleTest(env);
       }
 
+
+      /* -----------------------------------------------------
+         MANUAL RUN
+      ----------------------------------------------------- */
+
       if (path === "/run") {
-        const result = await runBot(env, "manual");
+
+        const result =
+          await runBot(
+            env,
+            "manual"
+          );
 
         return jsonResponse({
           ok: true,
-          bot: BOT_NAME,
-          mode: "PAPER",
+
+          bot:
+            BOT_NAME,
+
+          mode:
+            "PAPER",
+
           result
         });
       }
+
+
+      /* -----------------------------------------------------
+         TRADE HISTORY
+      ----------------------------------------------------- */
 
       if (path === "/trades") {
         return await handleTrades(env);
       }
 
+
+      /* -----------------------------------------------------
+         RESET PAPER ACCOUNT
+      ----------------------------------------------------- */
+
       if (path === "/reset-paper") {
-        return await handleResetPaper(env, url);
+        return await handleResetPaper(
+          env,
+          url
+        );
       }
+
+
+      /* -----------------------------------------------------
+         UNKNOWN ROUTE
+      ----------------------------------------------------- */
 
       return jsonResponse(
         {
           ok: false,
-          error: "Route not found",
+
+          error:
+            "Route not found.",
+
           available_routes: [
             "/",
             "/status",
@@ -208,14 +302,21 @@ export default {
       );
 
     } catch (error) {
+
       return jsonResponse(
         {
           ok: false,
-          bot: BOT_NAME,
-          mode: "PAPER",
-          error: error instanceof Error
-            ? error.message
-            : String(error)
+
+          bot:
+            BOT_NAME,
+
+          mode:
+            "PAPER",
+
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error)
         },
         500
       );
@@ -223,99 +324,176 @@ export default {
   },
 
 
-  async scheduled(event, env, ctx) {
+  /* =======================================================
+     CRON
+  ======================================================= */
+
+  async scheduled(
+    event,
+    env,
+    ctx
+  ) {
+
     ctx.waitUntil(
-      runBot(env, "cron")
-        .catch(error => {
-          console.error(
-            "Scheduled bot error:",
-            error instanceof Error
-              ? error.message
-              : String(error)
-          );
-        })
+      runBot(
+        env,
+        "cron"
+      ).catch(error => {
+
+        console.error(
+          "Scheduled bot error:",
+          error instanceof Error
+            ? error.message
+            : String(error)
+        );
+
+      })
     );
   }
+
 };
 
 
-/* ============================================================
+/* =========================================================
    HOME
-   ============================================================ */
+========================================================= */
 
 async function handleHome(env) {
-  const portfolio = await getPortfolio(env);
+
+  const portfolio =
+    await getPortfolio(env);
+
 
   return jsonResponse({
-    bot: BOT_NAME,
-    status: "ONLINE",
-    mode: "PAPER TRADING",
-    real_money: false,
-    live_execution: false,
-    wallet_signing: false,
+
+    bot:
+      BOT_NAME,
+
+    status:
+      "ONLINE",
+
+    mode:
+      "PAPER TRADING",
+
+    real_money:
+      false,
+
+    live_execution:
+      false,
+
+    wallet_signing:
+      false,
 
     paper_cash_usd:
-      round(portfolio.cash_usd, 2),
+      round(
+        portfolio.cash_usd,
+        2
+      ),
 
     open_positions:
       portfolio.positions.length,
 
     realized_pnl_usd:
-      round(portfolio.realized_pnl_usd, 2),
+      round(
+        portfolio.realized_pnl_usd,
+        2
+      ),
 
     message:
-      "Paper trading is active. No real trades are being executed."
+      "Paper trading is active. No real money is being traded."
   });
 }
 
 
-/* ============================================================
+/* =========================================================
    STATUS
-   ============================================================ */
+========================================================= */
 
 async function handleStatus(env) {
-  const portfolio = await getPortfolio(env);
+
+  const portfolio =
+    await getPortfolio(env);
+
 
   const valuation =
-    await calculatePortfolioValue(portfolio);
+    await calculatePortfolioValue(
+      portfolio
+    );
+
 
   return jsonResponse({
-    ok: true,
 
-    bot: BOT_NAME,
+    ok:
+      true,
+
+    bot:
+      BOT_NAME,
 
     mode: {
-      type: "PAPER",
-      real_money: false,
-      live_trading: false,
-      transaction_execution: false,
-      private_key_required: false
+
+      type:
+        "PAPER",
+
+      real_money:
+        false,
+
+      live_trading:
+        false,
+
+      transaction_execution:
+        false,
+
+      wallet_signing:
+        false,
+
+      private_key_required:
+        false
     },
 
+
     portfolio: {
+
       starting_cash_usd:
-        round(portfolio.starting_cash_usd, 2),
+        round(
+          portfolio.starting_cash_usd,
+          2
+        ),
 
       cash_usd:
-        round(portfolio.cash_usd, 2),
-
-      positions:
-        portfolio.positions.length,
-
-      position_limit:
-        MAX_POSITIONS,
+        round(
+          portfolio.cash_usd,
+          2
+        ),
 
       market_value_usd:
-        round(valuation.market_value_usd, 2),
+        round(
+          valuation.market_value_usd,
+          2
+        ),
 
       total_value_usd:
-        round(valuation.total_value_usd, 2),
+        round(
+          valuation.total_value_usd,
+          2
+        ),
+
+      open_positions:
+        portfolio.positions.length,
+
+      maximum_positions:
+        MAX_POSITIONS,
 
       realized_pnl_usd:
-        round(portfolio.realized_pnl_usd, 2),
+        round(
+          portfolio.realized_pnl_usd,
+          2
+        ),
 
       unrealized_pnl_usd:
-        round(valuation.unrealized_pnl_usd, 2),
+        round(
+          valuation.unrealized_pnl_usd,
+          2
+        ),
 
       total_pnl_usd:
         round(
@@ -336,11 +514,20 @@ async function handleStatus(env) {
         )
     },
 
+
     settings: {
-      small_trade_cap_usd: SMALL_TRADE_CAP_USD,
-      large_trade_cap_usd: LARGE_TRADE_CAP_USD,
-      balance_threshold_usd: BALANCE_THRESHOLD_USD,
-      minimum_cash_reserve_usd: PAPER_MIN_CASH_RESERVE_USD,
+
+      small_trade_cap_usd:
+        SMALL_TRADE_CAP_USD,
+
+      large_trade_cap_usd:
+        LARGE_TRADE_CAP_USD,
+
+      balance_threshold_usd:
+        BALANCE_THRESHOLD_USD,
+
+      minimum_cash_reserve_usd:
+        PAPER_MIN_CASH_RESERVE_USD,
 
       hard_stop_percent:
         STOP_LOSS * 100,
@@ -352,46 +539,67 @@ async function handleStatus(env) {
         TRAILING_STOP * 100,
 
       reversal_confirmations:
-        REVERSAL_CONFIRMATIONS_REQUIRED,
-
-      maximum_positions:
-        MAX_POSITIONS
+        REVERSAL_CONFIRMATIONS_REQUIRED
     },
 
+
     positions:
-      await buildPositionStatus(portfolio)
+      await buildPositionStatus(
+        portfolio
+      )
   });
 }
 
 
-/* ============================================================
-   TEST SCANNER
-   ============================================================ */
+/* =========================================================
+   TEST
+========================================================= */
 
 async function handleTest(env) {
+
   const candidates =
     await getTrendingTokens(env);
 
+
   const results = [];
 
-  for (const token of candidates) {
+
+  for (
+    const token of candidates
+  ) {
+
     try {
+
       const price =
-        await getTokenPrice(env, token.mint);
+        await getTokenPrice(
+          env,
+          token.mint
+        );
+
 
       results.push({
-        symbol: token.symbol,
-        name: token.name,
-        mint: token.mint,
+
+        symbol:
+          token.symbol,
+
+        name:
+          token.name,
+
+        mint:
+          token.mint,
 
         price_usd:
           price === null
             ? "UNAVAILABLE"
-            : round(price, 10),
+            : round(
+                price,
+                10
+              ),
 
         eligible:
           price !== null &&
-          price >= MIN_TOKEN_PRICE_USD,
+          price >=
+            MIN_TOKEN_PRICE_USD,
 
         status:
           price === null
@@ -399,127 +607,196 @@ async function handleTest(env) {
             : "READY_FOR_PAPER_SCAN"
       });
 
+
     } catch (error) {
+
       results.push({
-        symbol: token.symbol,
-        name: token.name,
-        mint: token.mint,
-        price_usd: "UNAVAILABLE",
-        eligible: false,
-        status: "ERROR",
-        error: error instanceof Error
-          ? error.message
-          : String(error)
+
+        symbol:
+          token.symbol,
+
+        name:
+          token.name,
+
+        mint:
+          token.mint,
+
+        price_usd:
+          "UNAVAILABLE",
+
+        eligible:
+          false,
+
+        status:
+          "ERROR",
+
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error)
       });
     }
   }
 
+
   return jsonResponse({
-    ok: true,
 
-    bot: BOT_NAME,
+    ok:
+      true,
 
-    mode: "PAPER",
+    bot:
+      BOT_NAME,
 
-    real_trade_execution: false,
+    mode:
+      "PAPER",
+
+    real_trade_execution:
+      false,
 
     candidates_scanned:
       results.length,
 
-    candidates: results
+    candidates:
+      results
   });
 }
 
 
-/* ============================================================
+/* =========================================================
    TRADE HISTORY
-   ============================================================ */
+========================================================= */
 
 async function handleTrades(env) {
+
   const history =
     await getTradeHistory(env);
 
+
   return jsonResponse({
-    ok: true,
-    mode: "PAPER",
-    trades: history
+
+    ok:
+      true,
+
+    bot:
+      BOT_NAME,
+
+    mode:
+      "PAPER",
+
+    trades:
+      history
   });
 }
 
 
-/* ============================================================
-   RESET PAPER ACCOUNT
-   ============================================================ */
+/* =========================================================
+   RESET
+========================================================= */
 
-async function handleResetPaper(env, url) {
+async function handleResetPaper(
+  env,
+  url
+) {
+
   const confirmation =
-    url.searchParams.get("confirm");
+    url.searchParams.get(
+      "confirm"
+    );
 
-  if (confirmation !== "RESET") {
+
+  if (
+    confirmation !==
+    "RESET"
+  ) {
+
     return jsonResponse(
       {
-        ok: false,
+        ok:
+          false,
+
         message:
           "Paper account was NOT reset.",
+
         instruction:
-          "Use /reset-paper?confirm=RESET if you really want to reset the simulated portfolio."
+          "Use /reset-paper?confirm=RESET if you really want to reset the simulated account."
       },
       400
     );
   }
 
+
   const portfolio =
     createFreshPortfolio();
+
 
   await savePortfolio(
     env,
     portfolio
   );
 
+
   await saveTradeHistory(
     env,
     []
   );
 
+
   await env.BOT_KV.delete(
     COOLDOWN_KEY
   );
 
+
   return jsonResponse({
-    ok: true,
-    mode: "PAPER",
+
+    ok:
+      true,
+
+    bot:
+      BOT_NAME,
+
+    mode:
+      "PAPER",
+
     message:
       "Paper portfolio reset.",
+
     starting_cash_usd:
       PAPER_STARTING_CASH_USD
   });
 }
 
 
-/* ============================================================
-   MAIN BOT LOOP
-   ============================================================ */
+/* =========================================================
+   MAIN BOT
+========================================================= */
 
-async function runBot(env, source) {
+async function runBot(
+  env,
+  source
+) {
+
   if (!env.BOT_KV) {
+
     throw new Error(
       "BOT_KV binding is missing."
     );
   }
 
+
   const portfolio =
     await getPortfolio(env);
+
 
   const before =
     await calculatePortfolioValue(
       portfolio
     );
 
+
   /*
-    ------------------------------------------------------------
-    STEP 1
-    Manage positions that already exist.
-    ------------------------------------------------------------
+  ----------------------------------------------------------
+  MANAGE EXISTING POSITIONS
+  ----------------------------------------------------------
   */
 
   const positionResults =
@@ -528,39 +805,43 @@ async function runBot(env, source) {
       portfolio
     );
 
-  /*
-    Reload after possible simulated sells.
-  */
 
   const updatedPortfolio =
     await getPortfolio(env);
 
+
   /*
-    ------------------------------------------------------------
-    STEP 2
-    Check cooldown.
-    ------------------------------------------------------------
+  ----------------------------------------------------------
+  COOLDOWN
+  ----------------------------------------------------------
   */
 
-  if (await isOnCooldown(env)) {
-    const afterCooldown =
+  if (
+    await isOnCooldown(env)
+  ) {
+
+    const value =
       await calculatePortfolioValue(
         updatedPortfolio
       );
 
+
     return {
+
       source,
 
-      action: "HOLD",
+      action:
+        "HOLD",
 
       reason:
         "Cooldown active.",
 
-      mode: "PAPER",
+      mode:
+        "PAPER",
 
       portfolio:
         summarizePortfolio(
-          afterCooldown,
+          value,
           updatedPortfolio
         ),
 
@@ -571,34 +852,38 @@ async function runBot(env, source) {
 
 
   /*
-    ------------------------------------------------------------
-    STEP 3
-    Don't exceed position limit.
-    ------------------------------------------------------------
+  ----------------------------------------------------------
+  POSITION LIMIT
+  ----------------------------------------------------------
   */
 
   if (
     updatedPortfolio.positions.length >=
     MAX_POSITIONS
   ) {
-    const fullPortfolio =
+
+    const value =
       await calculatePortfolioValue(
         updatedPortfolio
       );
 
+
     return {
+
       source,
 
-      action: "HOLD",
+      action:
+        "HOLD",
 
       reason:
         "Maximum paper positions reached.",
 
-      mode: "PAPER",
+      mode:
+        "PAPER",
 
       portfolio:
         summarizePortfolio(
-          fullPortfolio,
+          value,
           updatedPortfolio
         ),
 
@@ -609,30 +894,50 @@ async function runBot(env, source) {
 
 
   /*
-    ------------------------------------------------------------
-    STEP 4
-    Look for a new paper trade.
-    ------------------------------------------------------------
+  ----------------------------------------------------------
+  FIND NEW PAPER TRADE
+  ----------------------------------------------------------
   */
 
-  const buyResult =
-    await findPaperBuy(
-      env,
-      updatedPortfolio
-    );
+  let buyResult =
+    null;
+
+
+  for (
+    let i = 0;
+    i < MAX_NEW_BUYS_PER_RUN;
+    i++
+  ) {
+
+    buyResult =
+      await findPaperBuy(
+        env,
+        updatedPortfolio
+      );
+
+
+    if (
+      !buyResult ||
+      buyResult.action !==
+        "PAPER_BUY"
+    ) {
+      break;
+    }
+  }
 
 
   /*
-    ------------------------------------------------------------
-    STEP 5
-    Save cooldown if a simulated buy happened.
-    ------------------------------------------------------------
+  ----------------------------------------------------------
+  COOLDOWN AFTER BUY
+  ----------------------------------------------------------
   */
 
   if (
     buyResult &&
-    buyResult.action === "PAPER_BUY"
+    buyResult.action ===
+      "PAPER_BUY"
   ) {
+
     await setCooldown(
       env
     );
@@ -642,6 +947,7 @@ async function runBot(env, source) {
   const finalPortfolio =
     await getPortfolio(env);
 
+
   const after =
     await calculatePortfolioValue(
       finalPortfolio
@@ -649,9 +955,11 @@ async function runBot(env, source) {
 
 
   return {
+
     source,
 
-    mode: "PAPER",
+    mode:
+      "PAPER",
 
     action:
       buyResult?.action ||
@@ -662,7 +970,7 @@ async function runBot(env, source) {
       "No new paper trade.",
 
     paper_trade:
-      buyResult || null,
+      buyResult,
 
     position_actions:
       positionResults,
@@ -683,36 +991,40 @@ async function runBot(env, source) {
 }
 
 
-/* ============================================================
+/* =========================================================
    FIND PAPER BUY
-   ============================================================ */
+========================================================= */
 
 async function findPaperBuy(
   env,
   portfolio
 ) {
+
   const availableCash =
     portfolio.cash_usd -
     PAPER_MIN_CASH_RESERVE_USD;
 
-  if (availableCash <= 0) {
+
+  if (
+    availableCash <= 0
+  ) {
+
     return {
-      action: "HOLD",
+
+      action:
+        "HOLD",
+
       reason:
         "Paper cash reserve reached."
     };
   }
 
 
-  /*
-    Determine position size from paper
-    portfolio value, NOT the real wallet.
-  */
-
   const valuation =
     await calculatePortfolioValue(
       portfolio
     );
+
 
   const tradeCap =
     valuation.total_value_usd <
@@ -721,9 +1033,16 @@ async function findPaperBuy(
       : LARGE_TRADE_CAP_USD;
 
 
-  if (availableCash < tradeCap) {
+  if (
+    availableCash <
+    tradeCap
+  ) {
+
     return {
-      action: "HOLD",
+
+      action:
+        "HOLD",
+
       reason:
         "Not enough paper cash for the configured trade size."
     };
@@ -731,42 +1050,58 @@ async function findPaperBuy(
 
 
   /*
-    Get a broad candidate list.
+  ----------------------------------------------------------
+  GET CANDIDATES
+  ----------------------------------------------------------
   */
 
   const candidates =
-    await getTrendingTokens(env);
+    await getTrendingTokens(
+      env
+    );
 
 
-  if (!candidates.length) {
+  if (
+    candidates.length === 0
+  ) {
+
     return {
-      action: "HOLD",
+
+      action:
+        "HOLD",
+
       reason:
-        "No candidates returned by the scanner."
+        "No candidates returned by scanner."
     };
   }
 
 
-  /*
-    Filter tokens.
-  */
-
   const heldMints =
     new Set(
       portfolio.positions.map(
-        position => position.mint
+        position =>
+          position.mint
       )
     );
 
 
   const eligible = [];
 
+
   for (
     const token of candidates
   ) {
-    if (!token.mint) {
+
+    if (
+      !token.mint
+    ) {
       continue;
     }
+
+
+    /*
+      Don't buy SOL itself or stablecoins.
+    */
 
     if (
       token.mint === SOL_MINT ||
@@ -776,17 +1111,27 @@ async function findPaperBuy(
       continue;
     }
 
+
+    /*
+      Don't open another position
+      in something already held.
+    */
+
     if (
-      heldMints.has(token.mint)
+      heldMints.has(
+        token.mint
+      )
     ) {
       continue;
     }
+
 
     const price =
       await getTokenPrice(
         env,
         token.mint
       );
+
 
     if (
       price === null ||
@@ -796,26 +1141,33 @@ async function findPaperBuy(
       continue;
     }
 
+
     eligible.push({
+
       ...token,
+
       price
     });
 
-    /*
-      Avoid hammering the API unnecessarily.
-    */
 
     if (
-      eligible.length >= MAX_CANDIDATES
+      eligible.length >=
+      MAX_CANDIDATES
     ) {
       break;
     }
   }
 
 
-  if (!eligible.length) {
+  if (
+    eligible.length === 0
+  ) {
+
     return {
-      action: "HOLD",
+
+      action:
+        "HOLD",
+
       reason:
         "No eligible token with a usable price was found."
     };
@@ -823,29 +1175,34 @@ async function findPaperBuy(
 
 
   /*
-    ----------------------------------------------------------
-    SIMPLE PAPER SCORING
-    ----------------------------------------------------------
+  ----------------------------------------------------------
+  CANDIDATE SCORING
+  ----------------------------------------------------------
 
-    This is deliberately transparent.
+  This is intentionally transparent.
 
-    We are NOT pretending this is an AI model.
+  The current version does NOT pretend that it has
+  an AI model or social-media intelligence.
 
-    Candidate ranking currently uses:
-      - scanner order
-      - valid price
-      - not already held
-      - not a stablecoin
-      - usable market data
+  It uses scanner order plus eligibility.
 
-    AI/social/security scoring can be added later
-    as separate modules without putting real money at risk.
-    ----------------------------------------------------------
+  Later we can add:
+    - momentum
+    - liquidity
+    - volume
+    - security checks
+    - wallet activity
+    - social velocity
+    - AI scoring
+
+  without adding live execution.
+  ----------------------------------------------------------
   */
 
   const scored =
     eligible.map(
       (token, index) => ({
+
         ...token,
 
         score:
@@ -866,9 +1223,9 @@ async function findPaperBuy(
 
 
   /*
-    ----------------------------------------------------------
-    SIMULATED BUY
-    ----------------------------------------------------------
+  ----------------------------------------------------------
+  SIMULATED BUY
+  ----------------------------------------------------------
   */
 
   const quantity =
@@ -880,8 +1237,12 @@ async function findPaperBuy(
     !Number.isFinite(quantity) ||
     quantity <= 0
   ) {
+
     return {
-      action: "HOLD",
+
+      action:
+        "HOLD",
+
       reason:
         "Could not calculate simulated quantity."
     };
@@ -893,6 +1254,7 @@ async function findPaperBuy(
 
 
   const position = {
+
     id:
       createId(),
 
@@ -976,12 +1338,15 @@ async function findPaperBuy(
 
 
   /*
-    Record simulated trade.
+  ----------------------------------------------------------
+  SAVE TRADE
+  ----------------------------------------------------------
   */
 
   await appendTradeHistory(
     env,
     {
+
       id:
         createId(),
 
@@ -1021,6 +1386,7 @@ async function findPaperBuy(
 
 
   return {
+
     action:
       "PAPER_BUY",
 
@@ -1057,20 +1423,17 @@ async function findPaperBuy(
 }
 
 
-/* ============================================================
-   MANAGE OPEN POSITIONS
-   ============================================================ */
+/* =========================================================
+   MANAGE POSITIONS
+========================================================= */
 
 async function managePositions(
   env,
   portfolio
 ) {
+
   const actions = [];
 
-  /*
-    Copy the array because positions may
-    be removed while we process them.
-  */
 
   const positions =
     [...portfolio.positions];
@@ -1079,7 +1442,9 @@ async function managePositions(
   for (
     const position of positions
   ) {
+
     try {
+
       const currentPrice =
         await getTokenPrice(
           env,
@@ -1091,7 +1456,9 @@ async function managePositions(
         currentPrice === null ||
         !Number.isFinite(currentPrice)
       ) {
+
         actions.push({
+
           action:
             "HOLD",
 
@@ -1106,6 +1473,12 @@ async function managePositions(
       }
 
 
+      /*
+      --------------------------------------------------------
+      CURRENT PROFIT
+      --------------------------------------------------------
+      */
+
       const change =
         (
           currentPrice -
@@ -1115,39 +1488,49 @@ async function managePositions(
 
 
       /*
-        Update highest price.
+      --------------------------------------------------------
+      UPDATE HIGH
+      --------------------------------------------------------
       */
 
       if (
         currentPrice >
         position.highest_price_usd
       ) {
+
         position.highest_price_usd =
           currentPrice;
       }
 
 
       /*
-        Current profit relative to entry.
+      --------------------------------------------------------
+      UPDATE CURRENT VALUE
+      --------------------------------------------------------
       */
 
       position.current_price_usd =
         currentPrice;
 
+
       position.current_value_usd =
         position.quantity *
         currentPrice;
 
+
       position.unrealized_pnl_usd =
         position.current_value_usd -
         position.cost_usd;
+
 
       position.profit_percent =
         change;
 
 
       /*
-        Highest profit since entry.
+      --------------------------------------------------------
+      HIGHEST PROFIT
+      --------------------------------------------------------
       */
 
       const highestProfit =
@@ -1162,20 +1545,23 @@ async function managePositions(
         highestProfit >
         position.highest_profit_percent
       ) {
+
         position.highest_profit_percent =
           highestProfit;
       }
 
 
       /*
-        ------------------------------------------------------
-        HARD STOP
-        ------------------------------------------------------
+      --------------------------------------------------------
+      HARD STOP
+      --------------------------------------------------------
       */
 
       if (
-        change <= STOP_LOSS
+        change <=
+        STOP_LOSS
       ) {
+
         const result =
           await sellPaperPosition(
             env,
@@ -1185,24 +1571,30 @@ async function managePositions(
             "HARD_STOP"
           );
 
-        actions.push(result);
+
+        actions.push(
+          result
+        );
+
 
         continue;
       }
 
 
       /*
-        ------------------------------------------------------
-        TRAILING STOP
-        ------------------------------------------------------
+      --------------------------------------------------------
+      TRAILING STOP
+      --------------------------------------------------------
       */
 
       if (
         highestProfit >=
         TRAILING_ACTIVATION
       ) {
+
         position.trailing_active =
           true;
+
 
         const trailingFloor =
           position.highest_price_usd *
@@ -1216,6 +1608,7 @@ async function managePositions(
           currentPrice <=
           trailingFloor
         ) {
+
           position.reversal_confirmations =
             (
               position.reversal_confirmations ||
@@ -1227,6 +1620,7 @@ async function managePositions(
             position.reversal_confirmations >=
             REVERSAL_CONFIRMATIONS_REQUIRED
           ) {
+
             const result =
               await sellPaperPosition(
                 env,
@@ -1236,13 +1630,18 @@ async function managePositions(
                 "TRAILING_REVERSAL"
               );
 
-            actions.push(result);
+
+            actions.push(
+              result
+            );
+
 
             continue;
           }
 
 
           actions.push({
+
             action:
               "WATCH",
 
@@ -1269,14 +1668,13 @@ async function managePositions(
           });
 
         } else {
-          /*
-            Price recovered above trailing floor.
-          */
 
           position.reversal_confirmations =
             0;
 
+
           actions.push({
+
             action:
               "HOLD",
 
@@ -1307,15 +1705,13 @@ async function managePositions(
         }
 
       } else {
-        /*
-          Not profitable enough to activate
-          the trailing exit yet.
-        */
 
         position.reversal_confirmations =
           0;
 
+
         actions.push({
+
           action:
             "HOLD",
 
@@ -1343,8 +1739,11 @@ async function managePositions(
       position.last_checked_at =
         new Date().toISOString();
 
+
     } catch (error) {
+
       actions.push({
+
         action:
           "ERROR",
 
@@ -1370,9 +1769,9 @@ async function managePositions(
 }
 
 
-/* ============================================================
+/* =========================================================
    PAPER SELL
-   ============================================================ */
+========================================================= */
 
 async function sellPaperPosition(
   env,
@@ -1381,6 +1780,7 @@ async function sellPaperPosition(
   currentPrice,
   reason
 ) {
+
   const proceeds =
     position.quantity *
     currentPrice;
@@ -1399,7 +1799,9 @@ async function sellPaperPosition(
 
 
   /*
-    Return simulated proceeds to paper cash.
+  ----------------------------------------------------------
+  RETURN SIMULATED CASH
+  ----------------------------------------------------------
   */
 
   portfolio.cash_usd =
@@ -1411,15 +1813,24 @@ async function sellPaperPosition(
 
 
   /*
-    Remove position.
+  ----------------------------------------------------------
+  REMOVE POSITION
+  ----------------------------------------------------------
   */
 
   portfolio.positions =
     portfolio.positions.filter(
       item =>
-        item.id !== position.id
+        item.id !==
+        position.id
     );
 
+
+  /*
+  ----------------------------------------------------------
+  REALIZED P&L
+  ----------------------------------------------------------
+  */
 
   portfolio.realized_pnl_usd =
     round(
@@ -1433,9 +1844,16 @@ async function sellPaperPosition(
     new Date().toISOString();
 
 
+  /*
+  ----------------------------------------------------------
+  HISTORY
+  ----------------------------------------------------------
+  */
+
   await appendTradeHistory(
     env,
     {
+
       id:
         createId(),
 
@@ -1487,6 +1905,7 @@ async function sellPaperPosition(
 
 
   return {
+
     action:
       "PAPER_SELL",
 
@@ -1540,27 +1959,33 @@ async function sellPaperPosition(
 }
 
 
-/* ============================================================
+/* =========================================================
    TOKEN SCANNER
-   ============================================================ */
+========================================================= */
 
-async function getTrendingTokens(env) {
+async function getTrendingTokens(
+  env
+) {
+
   const url =
     `${TOKENS_API}/toptrending/24h`;
 
 
   const headers = {
+
     "accept":
       "application/json"
   };
 
 
   /*
-    If a Jupiter API key exists, use it.
-    If it doesn't, the request is still attempted.
+    Use Jupiter API key if configured.
   */
 
-  if (env.JUPITER_API_KEY) {
+  if (
+    env.JUPITER_API_KEY
+  ) {
+
     headers["x-api-key"] =
       env.JUPITER_API_KEY;
   }
@@ -1570,13 +1995,18 @@ async function getTrendingTokens(env) {
     await fetch(
       url,
       {
-        method: "GET",
+        method:
+          "GET",
+
         headers
       }
     );
 
 
-  if (!response.ok) {
+  if (
+    !response.ok
+  ) {
+
     throw new Error(
       `Jupiter token scanner returned HTTP ${response.status}.`
     );
@@ -1591,27 +2021,32 @@ async function getTrendingTokens(env) {
     Array.isArray(data)
       ? data
       : (
-        data.tokens ||
-        data.data ||
-        data.results ||
-        []
-      );
+          data.tokens ||
+          data.data ||
+          data.results ||
+          []
+        );
 
 
   const output = [];
-  const seen = new Set();
+
+  const seen =
+    new Set();
 
 
   for (
     const item of raw
   ) {
+
     const mint =
       item.address ||
       item.mint ||
       item.id;
 
 
-    if (!mint) {
+    if (
+      !mint
+    ) {
       continue;
     }
 
@@ -1623,10 +2058,13 @@ async function getTrendingTokens(env) {
     }
 
 
-    seen.add(mint);
+    seen.add(
+      mint
+    );
 
 
     output.push({
+
       mint,
 
       symbol:
@@ -1657,25 +2095,30 @@ async function getTrendingTokens(env) {
 }
 
 
-/* ============================================================
+/* =========================================================
    TOKEN PRICE
-   ============================================================ */
+========================================================= */
 
 async function getTokenPrice(
   env,
   mint
 ) {
+
   const url =
     `${PRICE_API}?ids=${encodeURIComponent(mint)}`;
 
 
   const headers = {
+
     "accept":
       "application/json"
   };
 
 
-  if (env.JUPITER_API_KEY) {
+  if (
+    env.JUPITER_API_KEY
+  ) {
+
     headers["x-api-key"] =
       env.JUPITER_API_KEY;
   }
@@ -1685,13 +2128,18 @@ async function getTokenPrice(
     await fetch(
       url,
       {
-        method: "GET",
+        method:
+          "GET",
+
         headers
       }
     );
 
 
-  if (!response.ok) {
+  if (
+    !response.ok
+  ) {
+
     return null;
   }
 
@@ -1705,7 +2153,10 @@ async function getTokenPrice(
     data?.[mint];
 
 
-  if (!item) {
+  if (
+    !item
+  ) {
+
     return null;
   }
 
@@ -1716,13 +2167,16 @@ async function getTokenPrice(
 
 
   const price =
-    Number(rawPrice);
+    Number(
+      rawPrice
+    );
 
 
   if (
     !Number.isFinite(price) ||
     price <= 0
   ) {
+
     return null;
   }
 
@@ -1731,13 +2185,16 @@ async function getTokenPrice(
 }
 
 
-/* ============================================================
-   PORTFOLIO
-   ============================================================ */
+/* =========================================================
+   PAPER PORTFOLIO
+========================================================= */
 
 function createFreshPortfolio() {
+
   return {
-    version: 1,
+
+    version:
+      1,
 
     mode:
       "PAPER",
@@ -1762,34 +2219,41 @@ function createFreshPortfolio() {
 }
 
 
-async function getPortfolio(env) {
+async function getPortfolio(
+  env
+) {
+
   const raw =
     await env.BOT_KV.get(
       PORTFOLIO_KEY
     );
 
 
-  if (!raw) {
+  if (
+    !raw
+  ) {
+
     const portfolio =
       createFreshPortfolio();
+
 
     await savePortfolio(
       env,
       portfolio
     );
 
+
     return portfolio;
   }
 
 
   try {
+
     const portfolio =
-      JSON.parse(raw);
+      JSON.parse(
+        raw
+      );
 
-
-    /*
-      Safety normalization.
-    */
 
     portfolio.cash_usd =
       Number(
@@ -1817,7 +2281,9 @@ async function getPortfolio(env) {
         portfolio.positions
       )
     ) {
-      portfolio.positions = [];
+
+      portfolio.positions =
+        [];
     }
 
 
@@ -1828,18 +2294,16 @@ async function getPortfolio(env) {
     return portfolio;
 
   } catch {
-    /*
-      If stored state is corrupted,
-      start a clean paper portfolio.
-    */
 
     const portfolio =
       createFreshPortfolio();
+
 
     await savePortfolio(
       env,
       portfolio
     );
+
 
     return portfolio;
   }
@@ -1850,6 +2314,7 @@ async function savePortfolio(
   env,
   portfolio
 ) {
+
   portfolio.updated_at =
     new Date().toISOString();
 
@@ -1863,28 +2328,25 @@ async function savePortfolio(
 }
 
 
-/* ============================================================
+/* =========================================================
    PORTFOLIO VALUE
-   ============================================================ */
+========================================================= */
 
 async function calculatePortfolioValue(
   portfolio
 ) {
-  let marketValue = 0;
-  let unrealizedPnl = 0;
+
+  let marketValue =
+    0;
+
+  let unrealizedPnl =
+    0;
 
 
   for (
     const position of
     portfolio.positions
   ) {
-    /*
-      Use the last known current price
-      as the fallback for status calculations.
-
-      The position manager refreshes prices
-      during normal bot runs.
-    */
 
     const current =
       Number(
@@ -1909,6 +2371,7 @@ async function calculatePortfolioValue(
 
 
   return {
+
     cash_usd:
       portfolio.cash_usd,
 
@@ -1925,15 +2388,17 @@ async function calculatePortfolioValue(
 }
 
 
-/* ============================================================
+/* =========================================================
    POSITION STATUS
-   ============================================================ */
+========================================================= */
 
 async function buildPositionStatus(
   portfolio
 ) {
+
   return portfolio.positions.map(
     position => ({
+
       id:
         position.id,
 
@@ -1990,13 +2455,15 @@ async function buildPositionStatus(
 
       profit_percent:
         round(
-          position.profit_percent * 100,
+          position.profit_percent *
+          100,
           2
         ),
 
       highest_profit_percent:
         round(
-          position.highest_profit_percent * 100,
+          position.highest_profit_percent *
+          100,
           2
         ),
 
@@ -2022,31 +2489,44 @@ async function buildPositionStatus(
 }
 
 
-/* ============================================================
-   HISTORY
-   ============================================================ */
+/* =========================================================
+   TRADE HISTORY
+========================================================= */
 
-async function getTradeHistory(env) {
+async function getTradeHistory(
+  env
+) {
+
   const raw =
     await env.BOT_KV.get(
       HISTORY_KEY
     );
 
 
-  if (!raw) {
+  if (
+    !raw
+  ) {
+
     return [];
   }
 
 
   try {
-    const history =
-      JSON.parse(raw);
 
-    return Array.isArray(history)
+    const history =
+      JSON.parse(
+        raw
+      );
+
+
+    return Array.isArray(
+      history
+    )
       ? history
       : [];
 
   } catch {
+
     return [];
   }
 }
@@ -2056,12 +2536,11 @@ async function saveTradeHistory(
   env,
   history
 ) {
-  /*
-    Keep the most recent 100 trades.
-  */
 
   const trimmed =
-    history.slice(-100);
+    history.slice(
+      -100
+    );
 
 
   await env.BOT_KV.put(
@@ -2077,8 +2556,11 @@ async function appendTradeHistory(
   env,
   trade
 ) {
+
   const history =
-    await getTradeHistory(env);
+    await getTradeHistory(
+      env
+    );
 
 
   history.push(
@@ -2093,29 +2575,40 @@ async function appendTradeHistory(
 }
 
 
-/* ============================================================
+/* =========================================================
    COOLDOWN
-   ============================================================ */
+========================================================= */
 
-async function isOnCooldown(env) {
+async function isOnCooldown(
+  env
+) {
+
   const raw =
     await env.BOT_KV.get(
       COOLDOWN_KEY
     );
 
 
-  if (!raw) {
+  if (
+    !raw
+  ) {
+
     return false;
   }
 
 
   const timestamp =
-    Number(raw);
+    Number(
+      raw
+    );
 
 
   if (
-    !Number.isFinite(timestamp)
+    !Number.isFinite(
+      timestamp
+    )
   ) {
+
     return false;
   }
 
@@ -2131,9 +2624,11 @@ async function isOnCooldown(env) {
     ageSeconds >=
     COOLDOWN_SECONDS
   ) {
+
     await env.BOT_KV.delete(
       COOLDOWN_KEY
     );
+
 
     return false;
   }
@@ -2143,23 +2638,30 @@ async function isOnCooldown(env) {
 }
 
 
-async function setCooldown(env) {
+async function setCooldown(
+  env
+) {
+
   await env.BOT_KV.put(
     COOLDOWN_KEY,
-    String(Date.now())
+    String(
+      Date.now()
+    )
   );
 }
 
 
-/* ============================================================
+/* =========================================================
    SUMMARY
-   ============================================================ */
+========================================================= */
 
 function summarizePortfolio(
   valuation,
   portfolio
 ) {
+
   return {
+
     cash_usd:
       round(
         valuation.cash_usd,
@@ -2196,21 +2698,27 @@ function summarizePortfolio(
 }
 
 
-/* ============================================================
+/* =========================================================
    UTILITIES
-   ============================================================ */
+========================================================= */
 
 function round(
   value,
   decimals = 4
 ) {
+
   const number =
-    Number(value);
+    Number(
+      value
+    );
 
 
   if (
-    !Number.isFinite(number)
+    !Number.isFinite(
+      number
+    )
   ) {
+
     return 0;
   }
 
@@ -2228,9 +2736,10 @@ function round(
 
 
 function createId() {
+
   return (
     `${Date.now()}-${Math.random()
       .toString(36)
       .slice(2, 10)}`
   );
-    }
+}
