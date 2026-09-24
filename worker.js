@@ -17,7 +17,6 @@ Discovery:
 - Jupiter price cross-check
 
 Jupiter is supplemental only.
-
 ============================================================
 */
 
@@ -99,12 +98,17 @@ const MIN_VOLUME_1H_USD = 1000;
 ENTRY PROTECTION
 ============================================================
 
-These prevent chasing extremely extended moves.
+5m remains strict.
+1h is moderately widened so the paper bot
+can test controlled entries without opening
+the door to extreme moves.
+
+6h and 24h remain strict.
 ============================================================
 */
 
 const MAX_ENTRY_5M_PERCENT = 15;
-const MAX_ENTRY_1H_PERCENT = 30;
+const MAX_ENTRY_1H_PERCENT = 45;
 const MAX_ENTRY_6H_PERCENT = 100;
 const MAX_ENTRY_24H_PERCENT = 500;
 
@@ -405,10 +409,6 @@ async function getPortfolio(env) {
       PORTFOLIO_KEY
     );
 
-  /*
-  No account yet.
-  */
-
   if (!raw) {
     const portfolio =
       createFreshPortfolio();
@@ -425,17 +425,6 @@ async function getPortfolio(env) {
     const parsed =
       JSON.parse(raw);
 
-    /*
-    IMPORTANT:
-    Old portfolio data from previous versions
-    is automatically replaced with a clean
-    paper account.
-
-    This fixes the old:
-    $59 cash + $5 position + -35% return
-    corruption.
-    */
-
     if (
       !portfolioLooksValid(parsed)
     ) {
@@ -450,10 +439,6 @@ async function getPortfolio(env) {
       return fresh;
     }
 
-    /*
-    Normalize numeric fields.
-    */
-
     parsed.cash_usd =
       safeNumber(
         parsed.cash_usd,
@@ -466,10 +451,6 @@ async function getPortfolio(env) {
         0
       );
 
-    /*
-    Remove malformed positions.
-    */
-
     parsed.open_positions =
       parsed.open_positions.filter(
         position =>
@@ -477,11 +458,6 @@ async function getPortfolio(env) {
             position
           )
       );
-
-    /*
-    Make sure required position fields
-    exist and are numeric.
-    */
 
     for (
       const position of
@@ -643,12 +619,6 @@ async function getCooldowns(env) {
     const parsed =
       JSON.parse(raw);
 
-    /*
-    Old bug protection:
-    if KV contains a single number instead
-    of the expected object, discard it safely.
-    */
-
     if (
       typeof parsed !== "object" ||
       parsed === null ||
@@ -762,8 +732,8 @@ async function getDexScreenerDiscovery() {
 
     } catch {
       /*
-      Individual source failure must not
-      crash the whole scanner.
+      Individual source failure does not
+      stop the scanner.
       */
     }
   }
@@ -827,10 +797,6 @@ DEXSCREENER SEARCH
 */
 
 async function getDexSearchCandidates() {
-  /*
-  Broader search than before.
-  */
-
   const searches = [
     "SOL",
     "USDC",
@@ -1069,20 +1035,16 @@ async function getGeckoTrendingPools() {
   }
 }
 
-function extractGeckoMint(
-  value
-) {
+function extractGeckoMint(value) {
   const textValue =
-    String(
-      value || ""
-    );
+    String(value || "").trim();
 
   if (!textValue) {
     return "";
   }
 
   /*
-  Gecko IDs commonly look like:
+  GeckoTerminal Solana IDs commonly look like:
   solana_MINT
   */
 
@@ -1094,6 +1056,25 @@ function extractGeckoMint(
     return textValue.slice(
       "solana_".length
     );
+  }
+
+  /*
+  Defensive handling for other prefixed IDs.
+  */
+
+  if (
+    textValue.includes("_")
+  ) {
+    const parts =
+      textValue.split("_");
+
+    if (
+      parts.length >= 2
+    ) {
+      return parts
+        .slice(1)
+        .join("_");
+    }
   }
 
   return textValue;
@@ -1188,7 +1169,7 @@ async function getJupiterCrossCheck(
 
   } catch {
     /*
-    Supplemental only.
+    Jupiter is supplemental only.
     */
   }
 
@@ -1767,7 +1748,7 @@ function analyzeMarketShape(
 
   if (
     one >=
-    MAX_ENTRY_1H_PERCENT
+    EXTREME_1H_MOVE_PERCENT
   ) {
     penalty += 8;
 
@@ -1926,10 +1907,6 @@ function evaluateEntryQuality(
     );
   }
 
-  /*
-  Do not chase sharp moves.
-  */
-
   if (
     data.price_change_5m >=
     MAX_ENTRY_5M_PERCENT
@@ -1967,8 +1944,8 @@ function evaluateEntryQuality(
   }
 
   /*
-  Very new tokens cannot be entered while
-  undergoing extreme acceleration.
+  New tokens cannot be entered while
+  undergoing an extreme 1h move.
   */
 
   if (
@@ -2048,10 +2025,6 @@ function scoreCandidate(
   ) {
     crossSource = 5;
   }
-
-  /*
-  Jupiter is a sanity check only.
-  */
 
   const marketShape =
     analyzeMarketShape(
@@ -2160,7 +2133,8 @@ async function buildCandidates(
     new Set();
 
   for (
-    const item of gecko
+    const item of
+    gecko
   ) {
     const mint =
       extractGeckoMint(
@@ -2198,10 +2172,6 @@ async function buildCandidates(
 
   const candidates =
     new Map();
-
-  /*
-  Group all hydrated pairs by token.
-  */
 
   const pairsByMint =
     new Map();
@@ -2242,13 +2212,6 @@ async function buildCandidates(
       .get(mint)
       .push(pair);
   }
-
-  /*
-  IMPORTANT:
-  Choose the highest-liquidity pair for each
-  token instead of letting arbitrary duplicate
-  pairs overwrite each other.
-  */
 
   for (
     const [
@@ -2695,10 +2658,6 @@ function updatePosition(
         high
       : 0;
 
-  /*
-  HARD STOP
-  */
-
   if (
     pnl <=
     STOP_LOSS
@@ -2716,10 +2675,6 @@ function updatePosition(
     };
   }
 
-  /*
-  Activate trailing protection.
-  */
-
   if (
     pnl >=
     TRAILING_ACTIVATION
@@ -2727,10 +2682,6 @@ function updatePosition(
     position.trailing_active =
       true;
   }
-
-  /*
-  TRAILING STOP
-  */
 
   if (
     position.trailing_active &&
@@ -2749,10 +2700,6 @@ function updatePosition(
       drawdown
     };
   }
-
-  /*
-  SHORT-TERM REVERSAL
-  */
 
   const buyPressure5 =
     calculateBuyPressure5m(
@@ -2794,10 +2741,6 @@ function updatePosition(
     position.reversal_confirmations =
       0;
   }
-
-  /*
-  Stronger profitable-position reversal.
-  */
 
   const hourlyPressure =
     calculateBuyPressure(
@@ -2900,13 +2843,6 @@ async function closePaperPosition(
     1
   );
 
-  /*
-  IMPORTANT:
-  Cooldown after selling too, so the
-  scanner cannot immediately rebuy the
-  same token on the next cycle.
-  */
-
   await setCooldown(
     env,
     position.mint
@@ -2984,13 +2920,6 @@ async function closePaperPosition(
 ============================================================
 OPEN POSITION MONITORING
 ============================================================
-
-Open positions are monitored independently
-of the ranking scanner.
-
-This means a held coin does NOT disappear
-just because its score falls.
-============================================================
 */
 
 async function getFreshPairForMint(
@@ -3067,12 +2996,6 @@ async function monitorOpenPositions(
         position.mint
       );
 
-    /*
-    If price lookup fails:
-    HOLD the position using its
-    last known price.
-    */
-
     if (!pair) {
       continue;
     }
@@ -3148,10 +3071,8 @@ function markPortfolio(
       );
 
     /*
-    Only replace price if a fresh
-    positive price exists.
-
-    NEVER set missing price to zero.
+    NEVER replace a valid last-known price
+    with zero.
     */
 
     if (
@@ -3224,11 +3145,6 @@ RUN PAPER ENGINE
 async function runPaperEngine(
   env
 ) {
-  /*
-  Make absolutely sure we remain
-  paper-only.
-  */
-
   if (
     PAPER_MODE !== true
   ) {
@@ -3243,8 +3159,7 @@ async function runPaperEngine(
     );
 
   /*
-  FIRST:
-  Monitor existing positions independently.
+  1. Monitor existing positions.
   */
 
   const sells =
@@ -3254,8 +3169,7 @@ async function runPaperEngine(
     );
 
   /*
-  SECOND:
-  General market scan.
+  2. Scan the market.
   */
 
   const scan =
@@ -3267,16 +3181,6 @@ async function runPaperEngine(
     scan.candidates;
 
   const buys = [];
-
-  /*
-  IMPORTANT:
-  An empty scanner result is NOT a signal
-  to sell or buy.
-
-  Existing positions are simply held at their
-  last known price if fresh pricing was
-  unavailable.
-  */
 
   let scannerStatus =
     "OK";
@@ -3295,8 +3199,7 @@ async function runPaperEngine(
   }
 
   /*
-  Only search for new entries when the scanner
-  actually returned candidates.
+  3. Search for new paper entries.
   */
 
   if (
@@ -3367,9 +3270,7 @@ async function runPaperEngine(
   }
 
   /*
-  Mark portfolio using the general scan.
-
-  Missing candidates do NOT become zero.
+  4. Mark portfolio.
   */
 
   const marked =
@@ -3491,7 +3392,7 @@ async function runPaperEngine(
 
 /*
 ============================================================
-SCAN
+SCAN / TEST
 ============================================================
 */
 
@@ -3564,6 +3465,12 @@ async function runScan(
         )
     }
   };
+}
+
+async function testScanner(
+  env
+) {
+  return runScan(env);
 }
 
 /*
@@ -3709,66 +3616,6 @@ async function getStatus(
       Object.keys(
         cooldowns
       ).length
-  };
-}
-
-/*
-============================================================
-TEST
-============================================================
-*/
-
-async function testScanner(
-  env
-) {
-  const scan =
-    await buildCandidates(
-      env
-    );
-
-  return {
-    ok: true,
-
-    bot:
-      BOT_NAME,
-
-    mode: {
-      type:
-        "PAPER",
-
-      transaction_execution:
-        false
-    },
-
-    message:
-      "Scanner test completed. No position was opened.",
-
-    scan: {
-      total_candidates:
-        scan.candidates.length,
-
-      risk_pass_candidates:
-        scan.candidates.filter(
-          x =>
-            x.risk.pass
-        ).length,
-
-      eligible_candidates:
-        scan.candidates.filter(
-          x =>
-            x.entry_quality &&
-            x.risk.pass
-        ).length,
-
-      source_counts:
-        scan.counts,
-
-      top_candidates:
-        scan.candidates.slice(
-          0,
-          10
-        )
-    }
   };
 }
 
