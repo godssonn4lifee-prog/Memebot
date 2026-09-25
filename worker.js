@@ -14,6 +14,7 @@ const BOT_NAME = "memebott";
   - Duplicate extreme 1h penalty removed.
   - No live transaction execution.
   - Gecko -> DexScreener hydration diagnostics enabled.
+  - Jupiter Price API v3 root-level response parsing fixed.
 */
 
 const PAPER_MODE = true;
@@ -1028,11 +1029,28 @@ async function getJupiterPrices(
     requested: 0,
     returned: 0,
     confirmed_candidates: 0,
+
     missing_prices: [],
     invalid_prices: [],
+
     error: null,
     http_status: null,
-    request_url: null
+    request_url: null,
+
+    response_shape:
+      null,
+
+    response_key_count:
+      0,
+
+    response_key_sample:
+      [],
+
+    root_level_response:
+      false,
+
+    nested_data_response:
+      false
   };
 
   if (!mints.length) {
@@ -1108,14 +1126,40 @@ async function getJupiterPrices(
     const data =
       await response.json();
 
-    const priceData =
-      data?.data;
+    /*
+      IMPORTANT:
+      Jupiter Price API v3 returns token mint addresses
+      directly as keys on the ROOT response object.
+
+      Example:
+
+      {
+        "MINT_ADDRESS": {
+          "usdPrice": 0.123,
+          "blockId": 123,
+          "decimals": 6
+        }
+      }
+
+      Older code incorrectly expected:
+
+      {
+        "data": {
+          "MINT_ADDRESS": {...}
+        }
+      }
+
+      That caused HTTP 200 responses to produce 0 prices.
+    */
 
     if (
-      !priceData ||
-      typeof priceData !==
-        "object"
+      !data ||
+      typeof data !== "object" ||
+      Array.isArray(data)
     ) {
+      diagnostics.response_shape =
+        "INVALID_NON_OBJECT";
+
       diagnostics.error =
         "JUPITER_INVALID_RESPONSE_SHAPE";
 
@@ -1123,6 +1167,88 @@ async function getJupiterPrices(
         prices,
         diagnostics
       };
+    }
+
+    const rootKeys =
+      Object.keys(data);
+
+    diagnostics.response_key_count =
+      rootKeys.length;
+
+    diagnostics.response_key_sample =
+      rootKeys.slice(0, 10);
+
+    /*
+      Prefer the documented v3 root-level response.
+    */
+    let priceData =
+      data;
+
+    diagnostics.root_level_response =
+      true;
+
+    diagnostics.response_shape =
+      "ROOT_LEVEL_MINT_MAP";
+
+    /*
+      Defensive compatibility:
+      If a nested data object ever appears, support it too,
+      but only when the root object does not look like a
+      mint -> price-record map.
+    */
+    const rootHasPriceRecords =
+      rootKeys.some(
+        key =>
+          data[key] &&
+          typeof data[key] === "object" &&
+          !Array.isArray(data[key]) &&
+          (
+            Object.prototype.hasOwnProperty.call(
+              data[key],
+              "usdPrice"
+            ) ||
+            Object.prototype.hasOwnProperty.call(
+              data[key],
+              "blockId"
+            ) ||
+            Object.prototype.hasOwnProperty.call(
+              data[key],
+              "decimals"
+            )
+          )
+      );
+
+    if (
+      !rootHasPriceRecords &&
+      data.data &&
+      typeof data.data === "object" &&
+      !Array.isArray(data.data)
+    ) {
+      priceData =
+        data.data;
+
+      diagnostics.root_level_response =
+        false;
+
+      diagnostics.nested_data_response =
+        true;
+
+      diagnostics.response_shape =
+        "NESTED_DATA_MINT_MAP";
+
+      const nestedKeys =
+        Object.keys(
+          priceData
+        );
+
+      diagnostics.response_key_count =
+        nestedKeys.length;
+
+      diagnostics.response_key_sample =
+        nestedKeys.slice(
+          0,
+          10
+        );
     }
 
     for (
@@ -1160,6 +1286,15 @@ async function getJupiterPrices(
       );
 
       diagnostics.returned++;
+    }
+
+    if (
+      diagnostics.returned === 0 &&
+      diagnostics.missing_prices.length ===
+        batch.length
+    ) {
+      diagnostics.error =
+        "JUPITER_RETURNED_200_BUT_NO_REQUESTED_MINTS_WERE_PRICED";
     }
   } catch (error) {
     diagnostics.error =
@@ -1842,14 +1977,6 @@ async function buildCandidates(
   sourceCounts.gecko_confirmed_tokens =
     geckoMints.length;
 
-  /*
-    Gecko candidates are already normalized into mint addresses.
-    These counters make sure we can distinguish:
-      - Gecko returned nothing
-      - Gecko returned malformed tokens
-      - Dex hydration failed
-      - Dex hydration succeeded but had no Solana pair
-  */
   sourceCounts.gecko_tokens_received =
     geckoMints.length;
 
@@ -4907,7 +5034,11 @@ export default {
 
               hydration:
                 result.scan
-                  .hydration_diagnostics
+                  .hydration_diagnostics,
+
+              jupiter:
+                result.scan
+                  .jupiter_diagnostics
             })
           );
         } catch (error) {
