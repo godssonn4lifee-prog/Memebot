@@ -13,7 +13,8 @@ const BOT_NAME = "memebott";
   - Existing safety filters remain intact.
   - Duplicate extreme 1h penalty removed.
   - No live transaction execution.
-  - Gecko -> DexScreener hydration diagnostics enabled.
+  - Discovery diagnostics enabled.
+  - DexScreener batch hydration enabled.
   - Jupiter Price API v3 root-level response parsing fixed.
   - Liquidity-source diagnostics enabled.
 */
@@ -203,57 +204,83 @@ async function fetchJson(url, options = {}) {
 }
 
 async function fetchJsonDiagnostic(url, options = {}) {
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      accept: "application/json",
-      ...(options.headers || {})
+  try {
+    const response = await fetch(url, {
+      ...options,
+      headers: {
+        accept: "application/json",
+        ...(options.headers || {})
+      }
+    });
+
+    const status = response.status;
+
+    if (!response.ok) {
+      let bodyText = "";
+
+      try {
+        bodyText = await response.text();
+      } catch {
+        bodyText = "";
+      }
+
+      return {
+        ok: false,
+        status,
+        data: null,
+        error:
+          `HTTP ${status}` +
+          (
+            bodyText
+              ? `: ${bodyText.slice(0, 500)}`
+              : ""
+          )
+      };
     }
-  });
-
-  const status = response.status;
-
-  if (!response.ok) {
-    let bodyText = "";
 
     try {
-      bodyText = await response.text();
-    } catch {
-      bodyText = "";
+      const data = await response.json();
+
+      return {
+        ok: true,
+        status,
+        data,
+        error: null
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        status,
+        data: null,
+        error:
+          `INVALID_JSON_RESPONSE: ${errorText(error)}`
+      };
     }
-
-    return {
-      ok: false,
-      status,
-      data: null,
-      error:
-        `HTTP ${status}` +
-        (
-          bodyText
-            ? `: ${bodyText.slice(0, 300)}`
-            : ""
-        )
-    };
-  }
-
-  try {
-    const data = await response.json();
-
-    return {
-      ok: true,
-      status,
-      data,
-      error: null
-    };
   } catch (error) {
     return {
       ok: false,
-      status,
+      status: null,
       data: null,
       error:
-        `INVALID_JSON_RESPONSE: ${errorText(error)}`
+        `FETCH_EXCEPTION: ${errorText(error)}`
     };
   }
+}
+
+function responseShape(value) {
+  if (Array.isArray(value)) {
+    return "array";
+  }
+
+  if (value === null) {
+    return "null";
+  }
+
+  if (typeof value === "object") {
+    return "object";
+  }
+
+  return typeof value;
 }
 
 /* ============================================================
@@ -496,63 +523,247 @@ function getPositionSize(equity) {
 }
 
 /* ============================================================
+   DISCOVERY DIAGNOSTICS
+   ============================================================ */
+
+function createDiscoveryDiagnostics() {
+  return {
+    dexscreener_profiles: {
+      attempted: true,
+      http_status: null,
+      response_shape: null,
+      total_items: 0,
+      solana_items: 0,
+      extracted_mints: 0,
+      error: null,
+      sample: []
+    },
+
+    dexscreener_boosts: {
+      attempted: true,
+      http_status: null,
+      response_shape: null,
+      total_items: 0,
+      solana_items: 0,
+      extracted_mints: 0,
+      error: null,
+      sample: []
+    },
+
+    dexscreener_top_boosts: {
+      attempted: true,
+      http_status: null,
+      response_shape: null,
+      total_items: 0,
+      solana_items: 0,
+      extracted_mints: 0,
+      error: null,
+      sample: []
+    },
+
+    dexscreener_search: {
+      attempted: 0,
+      queries: {},
+      total_pairs: 0,
+      solana_pairs: 0,
+      extracted_mints: 0,
+      errors: []
+    },
+
+    gecko_trending: {
+      attempted: true,
+      http_status: null,
+      response_shape: null,
+      pool_count: 0,
+      tokens_extracted: 0,
+      error: null,
+      sample: []
+    },
+
+    gecko_top_pools: {
+      attempted: true,
+      http_status: null,
+      response_shape: null,
+      pool_count: 0,
+      tokens_extracted: 0,
+      error: null,
+      sample: []
+    },
+
+    gecko_new_pools: {
+      attempted: true,
+      http_status: null,
+      response_shape: null,
+      pool_count: 0,
+      tokens_extracted: 0,
+      error: null,
+      sample: []
+    }
+  };
+}
+
+function discoveryItemSample(item) {
+  return {
+    chain_id:
+      item?.chainId ||
+      null,
+
+    token_address:
+      item?.tokenAddress ||
+      item?.address ||
+      null,
+
+    symbol:
+      item?.symbol ||
+      item?.baseToken?.symbol ||
+      null,
+
+    name:
+      item?.name ||
+      item?.baseToken?.name ||
+      null
+  };
+}
+
+/* ============================================================
    DEXSCREENER DISCOVERY
    ============================================================ */
 
 async function getDexDiscovery() {
-  const urls = [
-    `${DEX_BASE}/token-profiles/latest/v1`,
-    `${DEX_BASE}/token-boosts/latest/v1`
+  const diagnostics =
+    createDiscoveryDiagnostics();
+
+  const endpoints = [
+    {
+      key:
+        "dexscreener_profiles",
+
+      url:
+        `${DEX_BASE}/token-profiles/latest/v1`
+    },
+
+    {
+      key:
+        "dexscreener_boosts",
+
+      url:
+        `${DEX_BASE}/token-boosts/latest/v1`
+    },
+
+    {
+      key:
+        "dexscreener_top_boosts",
+
+      url:
+        `${DEX_BASE}/token-boosts/top/v1`
+    }
   ];
 
   const results = [];
 
-  for (const url of urls) {
-    try {
-      const data =
-        await fetchJson(url);
+  for (
+    const endpoint of
+    endpoints
+  ) {
+    const result =
+      await fetchJsonDiagnostic(
+        endpoint.url
+      );
+
+    const diagnostic =
+      diagnostics[
+        endpoint.key
+      ];
+
+    diagnostic.http_status =
+      result.status;
+
+    if (!result.ok) {
+      diagnostic.error =
+        result.error;
+
+      continue;
+    }
+
+    diagnostic.response_shape =
+      responseShape(
+        result.data
+      );
+
+    if (
+      !Array.isArray(
+        result.data
+      )
+    ) {
+      diagnostic.error =
+        "EXPECTED_ARRAY_RESPONSE";
+
+      continue;
+    }
+
+    diagnostic.total_items =
+      result.data.length;
+
+    diagnostic.sample =
+      result.data
+        .slice(0, 5)
+        .map(
+          discoveryItemSample
+        );
+
+    for (
+      const item of
+      result.data
+    ) {
+      const chainId =
+        String(
+          item?.chainId ||
+          ""
+        ).toLowerCase();
 
       if (
-        Array.isArray(data)
+        chainId !==
+        "solana"
       ) {
-        for (
-          const item of data
-        ) {
-          const chainId =
-            String(
-              item.chainId || ""
-            ).toLowerCase();
-
-          if (
-            chainId !== "solana"
-          ) {
-            continue;
-          }
-
-          const mint =
-            item.tokenAddress ||
-            item.address;
-
-          if (!mint) {
-            continue;
-          }
-
-          results.push({
-            mint,
-            source:
-              "DEXSCREENER"
-          });
-        }
+        continue;
       }
-    } catch {
-      /* Continue */
+
+      diagnostic.solana_items++;
+
+      const mint =
+        item?.tokenAddress ||
+        item?.address;
+
+      if (!mint) {
+        continue;
+      }
+
+      diagnostic.extracted_mints++;
+
+      results.push({
+        mint,
+
+        source:
+          endpoint.key ===
+          "dexscreener_top_boosts"
+            ? "DEXSCREENER_TOP_BOOSTS"
+            : endpoint.key ===
+              "dexscreener_boosts"
+              ? "DEXSCREENER_BOOSTS"
+              : "DEXSCREENER"
+      });
     }
   }
 
-  return results.slice(
-    0,
-    MAX_DEX_TOKENS_ANALYZED
-  );
+  return {
+    results:
+      results.slice(
+        0,
+        MAX_DEX_TOKENS_ANALYZED
+      ),
+
+    diagnostics
+  };
 }
 
 /* ============================================================
@@ -568,102 +779,356 @@ async function getDexSearch() {
 
   const results = [];
 
+  const diagnostics =
+    createDiscoveryDiagnostics()
+      .dexscreener_search;
+
   for (
     const query of
     queries
   ) {
-    try {
-      const data =
-        await fetchJson(
-          `${DEX_BASE}/latest/dex/search?q=${encodeURIComponent(query)}`
+    diagnostics.attempted++;
+
+    const queryDiagnostic = {
+      attempted: true,
+      http_status: null,
+      response_shape: null,
+      total_pairs: 0,
+      solana_pairs: 0,
+      extracted_mints: 0,
+      error: null,
+      sample: []
+    };
+
+    diagnostics.queries[
+      query
+    ] =
+      queryDiagnostic;
+
+    const result =
+      await fetchJsonDiagnostic(
+        `${DEX_BASE}/latest/dex/search?q=${encodeURIComponent(query)}`
+      );
+
+    queryDiagnostic.http_status =
+      result.status;
+
+    if (!result.ok) {
+      queryDiagnostic.error =
+        result.error;
+
+      diagnostics.errors.push({
+        query,
+        error:
+          result.error
+      });
+
+      continue;
+    }
+
+    queryDiagnostic.response_shape =
+      responseShape(
+        result.data
+      );
+
+    const pairs =
+      Array.isArray(
+        result.data?.pairs
+      )
+        ? result.data.pairs
+        : null;
+
+    if (!pairs) {
+      queryDiagnostic.error =
+        "EXPECTED_OBJECT_WITH_PAIRS_ARRAY";
+
+      diagnostics.errors.push({
+        query,
+        error:
+          queryDiagnostic.error
+      });
+
+      continue;
+    }
+
+    queryDiagnostic.total_pairs =
+      pairs.length;
+
+    diagnostics.total_pairs +=
+      pairs.length;
+
+    queryDiagnostic.sample =
+      pairs
+        .slice(0, 5)
+        .map(
+          pair => ({
+            chain_id:
+              pair?.chainId ||
+              null,
+
+            dex_id:
+              pair?.dexId ||
+              null,
+
+            pair_address:
+              pair?.pairAddress ||
+              null,
+
+            base_symbol:
+              pair?.baseToken?.symbol ||
+              null,
+
+            base_address:
+              pair?.baseToken?.address ||
+              null,
+
+            price_usd:
+              pair?.priceUsd ||
+              null,
+
+            liquidity_usd:
+              pair?.liquidity?.usd ??
+              null
+          })
         );
 
-      for (
-        const pair of
-        data.pairs || []
+    for (
+      const pair of
+      pairs
+    ) {
+      if (
+        String(
+          pair?.chainId ||
+          ""
+        ).toLowerCase() !==
+        "solana"
       ) {
-        if (
-          String(
-            pair.chainId || ""
-          ).toLowerCase() !==
-          "solana"
-        ) {
-          continue;
-        }
-
-        const mint =
-          pair.baseToken?.address;
-
-        if (!mint) {
-          continue;
-        }
-
-        results.push({
-          mint,
-          source:
-            "DEXSCREENER_SEARCH"
-        });
+        continue;
       }
-    } catch {
-      /* Continue */
+
+      queryDiagnostic.solana_pairs++;
+      diagnostics.solana_pairs++;
+
+      const mint =
+        pair?.baseToken?.address;
+
+      if (!mint) {
+        continue;
+      }
+
+      queryDiagnostic.extracted_mints++;
+      diagnostics.extracted_mints++;
+
+      results.push({
+        mint,
+
+        source:
+          "DEXSCREENER_SEARCH"
+      });
     }
   }
 
-  return results.slice(
-    0,
-    MAX_DEX_TOKENS_ANALYZED
-  );
+  return {
+    results:
+      results.slice(
+        0,
+        MAX_DEX_TOKENS_ANALYZED
+      ),
+
+    diagnostics
+  };
 }
 
 /* ============================================================
-   GECKOTERMINAL
+   GECKO HELPERS
+   ============================================================ */
+
+function extractGeckoMint(item) {
+  const id =
+    item?.relationships
+      ?.base_token
+      ?.data
+      ?.id;
+
+  if (id) {
+    return String(id)
+      .replace(
+        /^solana_/,
+        ""
+      );
+  }
+
+  const directAddress =
+    item?.attributes?.address ||
+    item?.address;
+
+  if (
+    directAddress
+  ) {
+    return String(
+      directAddress
+    );
+  }
+
+  return null;
+}
+
+function geckoPoolSample(item) {
+  return {
+    id:
+      item?.id ||
+      null,
+
+    type:
+      item?.type ||
+      null,
+
+    address:
+      item?.attributes?.address ||
+      null,
+
+    name:
+      item?.attributes?.name ||
+      null,
+
+    base_token_price_usd:
+      item?.attributes
+        ?.base_token_price_usd ||
+      null,
+
+    reserve_usd:
+      item?.attributes
+        ?.reserve_in_usd ||
+      null
+  };
+}
+
+/* ============================================================
+   GECKOTERMINAL DISCOVERY
    ============================================================ */
 
 async function getGeckoCandidates() {
   const mints =
     new Set();
 
-  try {
-    const trending =
-      await fetchJson(
-        `${GECKO_BASE}/networks/solana/trending_pools?page=1`
+  const diagnostics =
+    createDiscoveryDiagnostics();
+
+  async function readGeckoEndpoint(
+    key,
+    url
+  ) {
+    const diagnostic =
+      diagnostics[key];
+
+    const result =
+      await fetchJsonDiagnostic(
+        url,
+        {
+          headers: {
+            accept:
+              "application/json;version=20230203"
+          }
+        }
       );
+
+    diagnostic.http_status =
+      result.status;
+
+    if (!result.ok) {
+      diagnostic.error =
+        result.error;
+
+      return;
+    }
+
+    diagnostic.response_shape =
+      responseShape(
+        result.data
+      );
+
+    const items =
+      Array.isArray(
+        result.data?.data
+      )
+        ? result.data.data
+        : null;
+
+    if (!items) {
+      diagnostic.error =
+        "EXPECTED_OBJECT_WITH_DATA_ARRAY";
+
+      return;
+    }
+
+    diagnostic.pool_count =
+      items.length;
+
+    diagnostic.sample =
+      items
+        .slice(0, 5)
+        .map(
+          geckoPoolSample
+        );
 
     for (
       const item of
-      trending.data || []
+      items
     ) {
-      const address =
-        item.relationships
-          ?.base_token
-          ?.data
-          ?.id;
+      const mint =
+        extractGeckoMint(
+          item
+        );
 
-      if (!address) {
+      if (!mint) {
         continue;
       }
 
-      const mint =
-        String(address)
-          .replace(
-            /^solana_/,
-            ""
-          );
+      diagnostic.tokens_extracted++;
 
-      if (mint) {
-        mints.add(mint);
-      }
+      mints.add(
+        mint
+      );
     }
-  } catch {
-    /* Supplemental source */
   }
 
-  return [
-    ...mints
-  ].slice(
-    0,
-    MAX_GECKO_POOLS_ANALYZED
+  /*
+    Gecko's public API is rate-limited, so use trending first.
+    Only fall back when it produced no usable token addresses.
+  */
+  await readGeckoEndpoint(
+    "gecko_trending",
+    `${GECKO_BASE}/networks/solana/trending_pools?page=1`
   );
+
+  if (
+    mints.size === 0
+  ) {
+    await readGeckoEndpoint(
+      "gecko_top_pools",
+      `${GECKO_BASE}/networks/solana/pools?page=1&include=base_token`
+    );
+  }
+
+  if (
+    mints.size === 0
+  ) {
+    await readGeckoEndpoint(
+      "gecko_new_pools",
+      `${GECKO_BASE}/networks/solana/new_pools?page=1&include=base_token`
+    );
+  }
+
+  return {
+    mints: [
+      ...mints
+    ].slice(
+      0,
+      MAX_GECKO_POOLS_ANALYZED
+    ),
+
+    diagnostics
+  };
 }
 
 /* ============================================================
@@ -746,336 +1211,163 @@ function summarizeDexPair(
   };
 }
 
-async function getBestDexPair(
-  mint
+/* ============================================================
+   BATCH DEXSCREENER HYDRATION
+   ============================================================ */
+
+async function hydrateDexPairs(
+  mints
 ) {
+  const pairsByMint =
+    new Map();
+
+  const diagnostics = {
+    attempted:
+      mints.length,
+
+    http_status:
+      null,
+
+    response_shape:
+      null,
+
+    requested_mints:
+      mints.length,
+
+    returned_pairs:
+      0,
+
+    solana_pairs:
+      0,
+
+    error:
+      null
+  };
+
+  if (!mints.length) {
+    return {
+      pairsByMint,
+      diagnostics
+    };
+  }
+
   const url =
-    `${DEX_BASE}/latest/dex/tokens/${encodeURIComponent(mint)}`;
-
-  try {
-    const result =
-      await fetchJsonDiagnostic(
-        url
-      );
-
-    if (!result.ok) {
-      return {
-        pair: null,
-
-        diagnostic: {
-          mint,
-
-          status:
-            "HYDRATION_HTTP_ERROR",
-
-          http_status:
-            result.status,
-
-          error:
-            result.error
-        }
-      };
-    }
-
-    const data =
-      result.data;
-
-    if (
-      !data ||
-      !Array.isArray(
-        data.pairs
+    `${DEX_BASE}/tokens/v1/solana/${mints
+      .slice(
+        0,
+        30
       )
-    ) {
-      return {
-        pair: null,
+      .map(
+        encodeURIComponent
+      )
+      .join(",")}`;
 
-        diagnostic: {
-          mint,
+  const result =
+    await fetchJsonDiagnostic(
+      url
+    );
 
-          status:
-            "HYDRATION_INVALID_RESPONSE",
+  diagnostics.http_status =
+    result.status;
 
-          http_status:
-            result.status,
-
-          error:
-            "DEXSCREENER_RESPONSE_MISSING_PAIRS_ARRAY"
-        }
-      };
-    }
-
-    const allPairs =
-      data.pairs;
-
-    const solanaPairs =
-      allPairs
-        .filter(
-          pair =>
-            String(
-              pair.chainId || ""
-            ).toLowerCase() ===
-            "solana"
-        );
-
-    if (
-      solanaPairs.length === 0
-    ) {
-      return {
-        pair: null,
-
-        diagnostic: {
-          mint,
-
-          status:
-            "NO_SOLANA_PAIRS",
-
-          http_status:
-            result.status,
-
-          total_pairs:
-            allPairs.length,
-
-          solana_pairs:
-            0,
-
-          error:
-            "DEXSCREENER_RETURNED_NO_SOLANA_PAIRS"
-        }
-      };
-    }
-
-    /*
-      Sort primarily by liquidity.
-
-      When liquidity is equal or unavailable, use 24h
-      volume as a secondary signal. This makes the selected
-      pair more informative than simply taking the first
-      API-returned pair.
-
-      We DO NOT loosen any trading filter here.
-      This only improves pair selection/diagnostics.
-    */
-    const rankedPairs =
-      [...solanaPairs].sort(
-        (a, b) => {
-          const liquidityDifference =
-            safeNumber(
-              b.liquidity?.usd,
-              0
-            ) -
-            safeNumber(
-              a.liquidity?.usd,
-              0
-            );
-
-          if (
-            liquidityDifference !== 0
-          ) {
-            return liquidityDifference;
-          }
-
-          return (
-            safeNumber(
-              b.volume?.h24,
-              0
-            ) -
-            safeNumber(
-              a.volume?.h24,
-              0
-            )
-          );
-        }
-      );
-
-    const selectedPair =
-      rankedPairs[0];
-
-    const selectedIndex =
-      rankedPairs.indexOf(
-        selectedPair
-      );
-
-    const selectedLiquidityFieldPresent =
-      !!(
-        selectedPair.liquidity &&
-        Object.prototype.hasOwnProperty.call(
-          selectedPair.liquidity,
-          "usd"
-        )
-      );
-
-    const selectedRawLiquidity =
-      selectedLiquidityFieldPresent
-        ? selectedPair.liquidity.usd
-        : null;
-
-    const selectedLiquidity =
-      safeNumber(
-        selectedRawLiquidity,
-        0
-      );
-
-    const zeroLiquidityCount =
-      solanaPairs.filter(
-        pair =>
-          safeNumber(
-            pair.liquidity?.usd,
-            0
-          ) === 0
-      ).length;
-
-    const missingLiquidityCount =
-      solanaPairs.filter(
-        pair =>
-          !pair.liquidity ||
-          !Object.prototype.hasOwnProperty.call(
-            pair.liquidity,
-            "usd"
-          )
-      ).length;
-
-    const positiveLiquidityCount =
-      solanaPairs.filter(
-        pair =>
-          safeNumber(
-            pair.liquidity?.usd,
-            0
-          ) > 0
-      ).length;
-
-    const topPairDiagnostics =
-      rankedPairs
-        .slice(0, 5)
-        .map(
-          (pair, index) =>
-            summarizeDexPair(
-              pair,
-              index
-            )
-        );
-
-    let liquiditySource =
-      "DEXSCREENER_LIQUIDITY_USD";
-
-    if (
-      !selectedLiquidityFieldPresent
-    ) {
-      liquiditySource =
-        "DEXSCREENER_LIQUIDITY_FIELD_MISSING";
-    } else if (
-      selectedLiquidity <= 0
-    ) {
-      liquiditySource =
-        "DEXSCREENER_LIQUIDITY_USD_ZERO";
-    }
-
-    let selectionReason =
-      "HIGHEST_LIQUIDITY";
-
-    if (
-      selectedLiquidity <= 0 &&
-      positiveLiquidityCount === 0 &&
-      solanaPairs.length > 1
-    ) {
-      selectionReason =
-        "ALL_SOLANA_PAIRS_ZERO_OR_MISSING_LIQUIDITY";
-    } else if (
-      selectedLiquidity <= 0 &&
-      positiveLiquidityCount > 0
-    ) {
-      selectionReason =
-        "SELECTED_ZERO_LIQUIDITY_DESPITE_POSITIVE_ALTERNATIVE";
-    } else if (
-      selectedLiquidity > 0 &&
-      selectedIndex > 0
-    ) {
-      selectionReason =
-        "SELECTED_BY_LIQUIDITY_RANKING";
-    }
+  if (!result.ok) {
+    diagnostics.error =
+      result.error;
 
     return {
-      pair:
-        selectedPair,
-
-      diagnostic: {
-        mint,
-
-        status:
-          "HYDRATION_SUCCESS",
-
-        http_status:
-          result.status,
-
-        total_pairs:
-          allPairs.length,
-
-        solana_pairs:
-          solanaPairs.length,
-
-        positive_liquidity_pairs:
-          positiveLiquidityCount,
-
-        zero_liquidity_pairs:
-          zeroLiquidityCount,
-
-        missing_liquidity_pairs:
-          missingLiquidityCount,
-
-        selected_pair_rank:
-          selectedIndex + 1,
-
-        selected_pair_address:
-          selectedPair?.pairAddress ||
-          null,
-
-        selected_dex_id:
-          selectedPair?.dexId ||
-          null,
-
-        selected_pair_url:
-          selectedPair?.url ||
-          null,
-
-        selected_base_symbol:
-          selectedPair?.baseToken?.symbol ||
-          null,
-
-        selected_quote_symbol:
-          selectedPair?.quoteToken?.symbol ||
-          null,
-
-        selected_liquidity_raw:
-          selectedRawLiquidity,
-
-        selected_liquidity_usd:
-          selectedLiquidity,
-
-        selected_liquidity_field_present:
-          selectedLiquidityFieldPresent,
-
-        selected_liquidity_source:
-          liquiditySource,
-
-        selected_volume_24h_raw:
-          selectedPair?.volume?.h24 ??
-          null,
-
-        selected_volume_1h_raw:
-          selectedPair?.volume?.h1 ??
-          null,
-
-        selected_price_usd_raw:
-          selectedPair?.priceUsd ??
-          null,
-
-        selection_reason:
-          selectionReason,
-
-        top_pairs:
-          topPairDiagnostics
-      }
+      pairsByMint,
+      diagnostics
     };
-  } catch (error) {
+  }
+
+  diagnostics.response_shape =
+    responseShape(
+      result.data
+    );
+
+  if (
+    !Array.isArray(
+      result.data
+    )
+  ) {
+    diagnostics.error =
+      "EXPECTED_ARRAY_RESPONSE";
+
+    return {
+      pairsByMint,
+      diagnostics
+    };
+  }
+
+  diagnostics.returned_pairs =
+    result.data.length;
+
+  for (
+    const pair of
+    result.data
+  ) {
+    if (
+      String(
+        pair?.chainId ||
+        ""
+      ).toLowerCase() !==
+      "solana"
+    ) {
+      continue;
+    }
+
+    diagnostics.solana_pairs++;
+
+    const mint =
+      pair?.baseToken?.address;
+
+    if (!mint) {
+      continue;
+    }
+
+    if (
+      !pairsByMint.has(
+        mint
+      )
+    ) {
+      pairsByMint.set(
+        mint,
+        []
+      );
+    }
+
+    pairsByMint
+      .get(mint)
+      .push(pair);
+  }
+
+  return {
+    pairsByMint,
+    diagnostics
+  };
+}
+
+/* ============================================================
+   SELECT BEST PAIR FROM BATCH DATA
+   ============================================================ */
+
+function selectBestDexPair(
+  mint,
+  allPairs
+) {
+  const solanaPairs =
+    allPairs.filter(
+      pair =>
+        String(
+          pair?.chainId ||
+          ""
+        ).toLowerCase() ===
+        "solana"
+    );
+
+  if (
+    solanaPairs.length === 0
+  ) {
     return {
       pair: null,
 
@@ -1083,16 +1375,233 @@ async function getBestDexPair(
         mint,
 
         status:
-          "HYDRATION_EXCEPTION",
+          "NO_SOLANA_PAIRS",
 
-        http_status:
-          null,
+        total_pairs:
+          allPairs.length,
+
+        solana_pairs:
+          0,
 
         error:
-          errorText(error)
+          "NO_SOLANA_PAIRS"
       }
     };
   }
+
+  const rankedPairs =
+    [...solanaPairs].sort(
+      (a, b) => {
+        const liquidityDifference =
+          safeNumber(
+            b?.liquidity?.usd,
+            0
+          ) -
+          safeNumber(
+            a?.liquidity?.usd,
+            0
+          );
+
+        if (
+          liquidityDifference !== 0
+        ) {
+          return liquidityDifference;
+        }
+
+        return (
+          safeNumber(
+            b?.volume?.h24,
+            0
+          ) -
+          safeNumber(
+            a?.volume?.h24,
+            0
+          )
+        );
+      }
+    );
+
+  const selectedPair =
+    rankedPairs[0];
+
+  const selectedIndex =
+    rankedPairs.indexOf(
+      selectedPair
+    );
+
+  const selectedLiquidityFieldPresent =
+    !!(
+      selectedPair?.liquidity &&
+      Object.prototype.hasOwnProperty.call(
+        selectedPair.liquidity,
+        "usd"
+      )
+    );
+
+  const selectedRawLiquidity =
+    selectedLiquidityFieldPresent
+      ? selectedPair.liquidity.usd
+      : null;
+
+  const selectedLiquidity =
+    safeNumber(
+      selectedRawLiquidity,
+      0
+    );
+
+  const zeroLiquidityCount =
+    solanaPairs.filter(
+      pair =>
+        safeNumber(
+          pair?.liquidity?.usd,
+          0
+        ) === 0
+    ).length;
+
+  const missingLiquidityCount =
+    solanaPairs.filter(
+      pair =>
+        !pair?.liquidity ||
+        !Object.prototype.hasOwnProperty.call(
+          pair.liquidity,
+          "usd"
+        )
+    ).length;
+
+  const positiveLiquidityCount =
+    solanaPairs.filter(
+      pair =>
+        safeNumber(
+          pair?.liquidity?.usd,
+          0
+        ) > 0
+    ).length;
+
+  const topPairs =
+    rankedPairs
+      .slice(0, 5)
+      .map(
+        summarizeDexPair
+      );
+
+  let liquiditySource =
+    "DEXSCREENER_LIQUIDITY_USD";
+
+  if (
+    !selectedLiquidityFieldPresent
+  ) {
+    liquiditySource =
+      "DEXSCREENER_LIQUIDITY_FIELD_MISSING";
+  } else if (
+    selectedLiquidity <= 0
+  ) {
+    liquiditySource =
+      "DEXSCREENER_LIQUIDITY_USD_ZERO";
+  }
+
+  let selectionReason =
+    "HIGHEST_LIQUIDITY";
+
+  if (
+    selectedLiquidity <= 0 &&
+    positiveLiquidityCount === 0 &&
+    solanaPairs.length > 1
+  ) {
+    selectionReason =
+      "ALL_SOLANA_PAIRS_ZERO_OR_MISSING_LIQUIDITY";
+  } else if (
+    selectedLiquidity <= 0 &&
+    positiveLiquidityCount > 0
+  ) {
+    selectionReason =
+      "SELECTED_ZERO_LIQUIDITY_DESPITE_POSITIVE_ALTERNATIVE";
+  } else if (
+    selectedLiquidity > 0 &&
+    selectedIndex > 0
+  ) {
+    selectionReason =
+      "SELECTED_BY_LIQUIDITY_RANKING";
+  }
+
+  return {
+    pair:
+      selectedPair,
+
+    diagnostic: {
+      mint,
+
+      status:
+        "HYDRATION_SUCCESS",
+
+      total_pairs:
+        allPairs.length,
+
+      solana_pairs:
+        solanaPairs.length,
+
+      positive_liquidity_pairs:
+        positiveLiquidityCount,
+
+      zero_liquidity_pairs:
+        zeroLiquidityCount,
+
+      missing_liquidity_pairs:
+        missingLiquidityCount,
+
+      selected_pair_rank:
+        selectedIndex + 1,
+
+      selected_pair_address:
+        selectedPair?.pairAddress ||
+        null,
+
+      selected_dex_id:
+        selectedPair?.dexId ||
+        null,
+
+      selected_pair_url:
+        selectedPair?.url ||
+        null,
+
+      selected_base_symbol:
+        selectedPair?.baseToken?.symbol ||
+        null,
+
+      selected_quote_symbol:
+        selectedPair?.quoteToken?.symbol ||
+        null,
+
+      selected_liquidity_raw:
+        selectedRawLiquidity,
+
+      selected_liquidity_usd:
+        selectedLiquidity,
+
+      selected_liquidity_field_present:
+        selectedLiquidityFieldPresent,
+
+      selected_liquidity_source:
+        liquiditySource,
+
+      selected_volume_24h_raw:
+        selectedPair?.volume?.h24 ??
+        null,
+
+      selected_volume_1h_raw:
+        selectedPair?.volume?.h1 ??
+        null,
+
+      selected_price_usd_raw:
+        selectedPair?.priceUsd ??
+        null,
+
+      selection_reason:
+        selectionReason,
+
+      top_pairs:
+        topPairs
+    }
+  };
 }
 
 /* ============================================================
@@ -1363,10 +1872,15 @@ async function getJupiterPrices(
   const diagnostics = {
     requested: 0,
     returned: 0,
+    priced: 0,
     confirmed_candidates: 0,
+    mismatched_prices: 0,
 
     missing_prices: [],
     invalid_prices: [],
+
+    price_samples: [],
+    mismatch_samples: [],
 
     error: null,
     http_status: null,
@@ -1419,38 +1933,20 @@ async function getJupiterPrices(
         env.JUPITER_API_KEY;
     }
 
-    const response =
-      await fetch(
+    const result =
+      await fetchJsonDiagnostic(
         diagnostics.request_url,
         {
-          headers: {
-            accept:
-              "application/json",
-            ...headers
-          }
+          headers
         }
       );
 
     diagnostics.http_status =
-      response.status;
+      result.status;
 
-    if (!response.ok) {
-      let bodyText = "";
-
-      try {
-        bodyText =
-          await response.text();
-      } catch {
-        bodyText = "";
-      }
-
+    if (!result.ok) {
       diagnostics.error =
-        `HTTP ${response.status}` +
-        (
-          bodyText
-            ? `: ${bodyText.slice(0, 300)}`
-            : ""
-        );
+        result.error;
 
       return {
         prices,
@@ -1459,7 +1955,7 @@ async function getJupiterPrices(
     }
 
     const data =
-      await response.json();
+      result.data;
 
     if (
       !data ||
@@ -1586,6 +2082,17 @@ async function getJupiterPrices(
       );
 
       diagnostics.returned++;
+      diagnostics.priced++;
+
+      if (
+        diagnostics.price_samples.length < 10
+      ) {
+        diagnostics.price_samples.push({
+          mint,
+          usd_price:
+            price
+        });
+      }
     }
 
     if (
@@ -2235,23 +2742,38 @@ async function buildCandidates(
   const sourceCounts = {
     dexscreener_discovery: 0,
     dexscreener_search: 0,
+    dexscreener_top_boosts: 0,
+
     gecko_trending: 0,
     gecko_confirmed_tokens: 0,
+
     jupiter_price_checked: 0,
     jupiter_price_confirmed: 0,
+
     hydrated_pairs: 0,
 
     gecko_tokens_received: 0,
     gecko_tokens_with_address: 0,
+
     gecko_hydration_attempts: 0,
     gecko_hydration_successes: 0,
-    gecko_hydration_failures: 0
+    gecko_hydration_failures: 0,
+
+    dex_pairs_returned: 0,
+    dex_solana_pairs_returned: 0,
+
+    dex_zero_liquidity_pairs: 0,
+    dex_below_min_liquidity_pairs: 0
   };
 
   const hydrationDiagnostics = {
     attempted: 0,
     successes: 0,
     failures: 0,
+
+    batch_requests: 0,
+    batch_http_statuses: [],
+
     failure_reasons: {},
     samples: [],
 
@@ -2267,23 +2789,78 @@ async function buildCandidates(
     selected_pair_samples: []
   };
 
-  const dexDiscovery =
+  const discoveryDiagnostics =
+    createDiscoveryDiagnostics();
+
+  /* ==========================================================
+     DISCOVERY
+     ========================================================== */
+
+  const dexDiscoveryResult =
     await getDexDiscovery();
 
+  Object.assign(
+    discoveryDiagnostics.dexscreener_profiles,
+    dexDiscoveryResult.diagnostics.dexscreener_profiles
+  );
+
+  Object.assign(
+    discoveryDiagnostics.dexscreener_boosts,
+    dexDiscoveryResult.diagnostics.dexscreener_boosts
+  );
+
+  Object.assign(
+    discoveryDiagnostics.dexscreener_top_boosts,
+    dexDiscoveryResult.diagnostics.dexscreener_top_boosts
+  );
+
+  const dexDiscovery =
+    dexDiscoveryResult.results;
+
   sourceCounts.dexscreener_discovery =
-    dexDiscovery.length;
+    dexDiscovery.filter(
+      item =>
+        item.source ===
+        "DEXSCREENER"
+    ).length;
+
+  sourceCounts.dexscreener_top_boosts =
+    dexDiscovery.filter(
+      item =>
+        item.source ===
+        "DEXSCREENER_TOP_BOOSTS"
+    ).length;
+
+  const dexSearchResult =
+    await getDexSearch();
+
+  discoveryDiagnostics.dexscreener_search =
+    dexSearchResult.diagnostics;
 
   const dexSearch =
-    await getDexSearch();
+    dexSearchResult.results;
 
   sourceCounts.dexscreener_search =
     dexSearch.length;
 
-  const geckoMints =
+  const geckoResult =
     await getGeckoCandidates();
 
+  discoveryDiagnostics.gecko_trending =
+    geckoResult.diagnostics.gecko_trending;
+
+  discoveryDiagnostics.gecko_top_pools =
+    geckoResult.diagnostics.gecko_top_pools;
+
+  discoveryDiagnostics.gecko_new_pools =
+    geckoResult.diagnostics.gecko_new_pools;
+
+  const geckoMints =
+    geckoResult.mints;
+
   sourceCounts.gecko_trending =
-    geckoMints.length;
+    discoveryDiagnostics.gecko_trending
+      .tokens_extracted;
 
   sourceCounts.gecko_confirmed_tokens =
     geckoMints.length;
@@ -2294,7 +2871,11 @@ async function buildCandidates(
   sourceCounts.gecko_tokens_with_address =
     geckoMints.filter(Boolean).length;
 
-  const dexCandidates = [
+  /* ==========================================================
+     COMBINE / DEDUPE
+     ========================================================== */
+
+  const combined = [
     ...dexDiscovery,
     ...dexSearch,
     ...geckoMints.map(
@@ -2313,14 +2894,16 @@ async function buildCandidates(
 
   for (
     const item of
-    dexCandidates
+    combined
   ) {
     if (!item.mint) {
       continue;
     }
 
     if (
-      seen.has(item.mint)
+      seen.has(
+        item.mint
+      )
     ) {
       continue;
     }
@@ -2341,10 +2924,97 @@ async function buildCandidates(
     }
   }
 
+  /* ==========================================================
+     BATCH HYDRATION
+     ========================================================== */
+
+  const hydrationMints =
+    limited.map(
+      item =>
+        item.mint
+    );
+
+  const batchResults = [];
+
+  for (
+    let offset = 0;
+    offset < hydrationMints.length;
+    offset += 30
+  ) {
+    const batch =
+      hydrationMints.slice(
+        offset,
+        offset + 30
+      );
+
+    if (!batch.length) {
+      continue;
+    }
+
+    hydrationDiagnostics.batch_requests++;
+
+    const result =
+      await hydrateDexPairs(
+        batch
+      );
+
+    hydrationDiagnostics.batch_http_statuses.push({
+      batch:
+        hydrationDiagnostics.batch_requests,
+
+      requested:
+        batch.length,
+
+      http_status:
+        result.diagnostics.http_status,
+
+      returned_pairs:
+        result.diagnostics.returned_pairs,
+
+      solana_pairs:
+        result.diagnostics.solana_pairs,
+
+      error:
+        result.diagnostics.error
+    });
+
+    sourceCounts.dex_pairs_returned +=
+      result.diagnostics.returned_pairs;
+
+    sourceCounts.dex_solana_pairs_returned +=
+      result.diagnostics.solana_pairs;
+
+    batchResults.push(
+      result
+    );
+  }
+
+  const pairsByMint =
+    new Map();
+
+  for (
+    const batchResult of
+    batchResults
+  ) {
+    for (
+      const [
+        mint,
+        pairs
+      ] of
+      batchResult.pairsByMint
+    ) {
+      pairsByMint.set(
+        mint,
+        pairs
+      );
+    }
+  }
+
   const candidates = [];
 
   for (
-    const item of limited
+    const item of
+    limited
   ) {
     const isGecko =
       item.source ===
@@ -2352,12 +3022,19 @@ async function buildCandidates(
 
     if (isGecko) {
       sourceCounts.gecko_hydration_attempts++;
-      hydrationDiagnostics.attempted++;
     }
 
-    const pairResult =
-      await getBestDexPair(
+    hydrationDiagnostics.attempted++;
+
+    const allPairs =
+      pairsByMint.get(
         item.mint
+      ) || [];
+
+    const pairResult =
+      selectBestDexPair(
+        item.mint,
+        allPairs
       );
 
     const pair =
@@ -2371,6 +3048,8 @@ async function buildCandidates(
       pairDiagnostic.status ===
         "HYDRATION_SUCCESS"
     ) {
+      hydrationDiagnostics.successes++;
+
       hydrationDiagnostics.pairs_examined +=
         safeNumber(
           pairDiagnostic.solana_pairs
@@ -2391,21 +3070,36 @@ async function buildCandidates(
           pairDiagnostic.missing_liquidity_pairs
         );
 
-      const source =
+      sourceCounts.dex_zero_liquidity_pairs +=
+        safeNumber(
+          pairDiagnostic.zero_liquidity_pairs
+        );
+
+      if (
+        safeNumber(
+          pairDiagnostic.selected_liquidity_usd
+        ) <
+        MIN_LIQUIDITY_USD
+      ) {
+        sourceCounts.dex_below_min_liquidity_pairs++;
+      }
+
+      const liquiditySource =
         pairDiagnostic.selected_liquidity_source ||
         "UNKNOWN";
 
       hydrationDiagnostics.selected_liquidity_sources[
-        source
+        liquiditySource
       ] =
         (
           hydrationDiagnostics.selected_liquidity_sources[
-            source
+            liquiditySource
           ] || 0
         ) + 1;
 
       if (
-        hydrationDiagnostics.selected_pair_samples.length < 10
+        hydrationDiagnostics.selected_pair_samples.length <
+        10
       ) {
         hydrationDiagnostics.selected_pair_samples.push({
           mint:
@@ -2419,9 +3113,6 @@ async function buildCandidates(
 
           dex_id:
             pairDiagnostic.selected_dex_id,
-
-          pair_url:
-            pairDiagnostic.selected_pair_url,
 
           pair_count:
             pairDiagnostic.solana_pairs,
@@ -2462,128 +3153,107 @@ async function buildCandidates(
       }
 
       if (
-        pairDiagnostic.selected_liquidity_source ===
-        "DEXSCREENER_LIQUIDITY_USD_ZERO"
+        pairDiagnostic.selected_liquidity_usd <=
+        0 &&
+        hydrationDiagnostics.zero_liquidity_samples.length <
+        10
       ) {
-        if (
-          hydrationDiagnostics.zero_liquidity_samples.length < 10
-        ) {
-          hydrationDiagnostics.zero_liquidity_samples.push({
-            mint:
-              item.mint,
+        hydrationDiagnostics.zero_liquidity_samples.push({
+          mint:
+            item.mint,
 
-            symbol:
-              pairDiagnostic.selected_base_symbol,
+          symbol:
+            pairDiagnostic.selected_base_symbol,
 
-            pair_address:
-              pairDiagnostic.selected_pair_address,
+          pair_address:
+            pairDiagnostic.selected_pair_address,
 
-            dex_id:
-              pairDiagnostic.selected_dex_id,
+          dex_id:
+            pairDiagnostic.selected_dex_id,
 
-            liquidity_raw:
-              pairDiagnostic.selected_liquidity_raw,
+          liquidity_raw:
+            pairDiagnostic.selected_liquidity_raw,
 
-            volume_24h_raw:
-              pairDiagnostic.selected_volume_24h_raw,
+          volume_24h_raw:
+            pairDiagnostic.selected_volume_24h_raw,
 
-            volume_1h_raw:
-              pairDiagnostic.selected_volume_1h_raw,
+          volume_1h_raw:
+            pairDiagnostic.selected_volume_1h_raw,
 
-            pair_count:
-              pairDiagnostic.solana_pairs,
+          pair_count:
+            pairDiagnostic.solana_pairs,
 
-            positive_liquidity_pairs:
-              pairDiagnostic.positive_liquidity_pairs,
+          positive_liquidity_pairs:
+            pairDiagnostic.positive_liquidity_pairs,
 
-            selection_reason:
-              pairDiagnostic.selection_reason,
+          selection_reason:
+            pairDiagnostic.selection_reason,
 
-            top_pairs:
-              pairDiagnostic.top_pairs
-          });
-        }
+          top_pairs:
+            pairDiagnostic.top_pairs
+        });
       }
 
       if (
         pairDiagnostic.selected_liquidity_source ===
-        "DEXSCREENER_LIQUIDITY_FIELD_MISSING"
+        "DEXSCREENER_LIQUIDITY_FIELD_MISSING" &&
+        hydrationDiagnostics.missing_liquidity_samples.length <
+        10
       ) {
-        if (
-          hydrationDiagnostics.missing_liquidity_samples.length < 10
-        ) {
-          hydrationDiagnostics.missing_liquidity_samples.push({
-            mint:
-              item.mint,
+        hydrationDiagnostics.missing_liquidity_samples.push({
+          mint:
+            item.mint,
 
-            symbol:
-              pairDiagnostic.selected_base_symbol,
+          symbol:
+            pairDiagnostic.selected_base_symbol,
 
-            pair_address:
-              pairDiagnostic.selected_pair_address,
+          pair_address:
+            pairDiagnostic.selected_pair_address,
 
-            dex_id:
-              pairDiagnostic.selected_dex_id,
+          dex_id:
+            pairDiagnostic.selected_dex_id,
 
-            liquidity_raw:
-              pairDiagnostic.selected_liquidity_raw,
+          pair_count:
+            pairDiagnostic.solana_pairs,
 
-            volume_24h_raw:
-              pairDiagnostic.selected_volume_24h_raw,
+          selection_reason:
+            pairDiagnostic.selection_reason,
 
-            volume_1h_raw:
-              pairDiagnostic.selected_volume_1h_raw,
-
-            pair_count:
-              pairDiagnostic.solana_pairs,
-
-            positive_liquidity_pairs:
-              pairDiagnostic.positive_liquidity_pairs,
-
-            selection_reason:
-              pairDiagnostic.selection_reason,
-
-            top_pairs:
-              pairDiagnostic.top_pairs
-          });
-        }
+          top_pairs:
+            pairDiagnostic.top_pairs
+        });
       }
     }
 
     if (!pair) {
+      hydrationDiagnostics.failures++;
+
       if (isGecko) {
         sourceCounts.gecko_hydration_failures++;
-        hydrationDiagnostics.failures++;
+      }
 
-        const diagnostic =
-          pairResult.diagnostic || {
-            mint:
-              item.mint,
+      const reason =
+        pairDiagnostic?.status ||
+        "UNKNOWN_HYDRATION_FAILURE";
 
-            status:
-              "UNKNOWN_HYDRATION_FAILURE"
-          };
+      hydrationDiagnostics.failure_reasons[
+        reason
+      ] =
+        (
+          hydrationDiagnostics.failure_reasons[
+            reason
+          ] || 0
+        ) + 1;
 
-        const reason =
-          diagnostic.status ||
-          "UNKNOWN_HYDRATION_FAILURE";
-
-        hydrationDiagnostics.failure_reasons[
-          reason
-        ] =
-          (
-            hydrationDiagnostics.failure_reasons[
-              reason
-            ] || 0
-          ) + 1;
-
-        if (
-          hydrationDiagnostics.samples.length < 5
-        ) {
-          hydrationDiagnostics.samples.push(
-            diagnostic
-          );
-        }
+      if (
+        hydrationDiagnostics.samples.length <
+        10
+      ) {
+        hydrationDiagnostics.samples.push({
+          ...pairDiagnostic,
+          source:
+            item.source
+        });
       }
 
       continue;
@@ -2591,7 +3261,6 @@ async function buildCandidates(
 
     if (isGecko) {
       sourceCounts.gecko_hydration_successes++;
-      hydrationDiagnostics.successes++;
     }
 
     const candidate =
@@ -2602,19 +3271,16 @@ async function buildCandidates(
       );
 
     if (!candidate) {
-      if (isGecko) {
-        sourceCounts.gecko_hydration_failures++;
-        hydrationDiagnostics.failures++;
+      hydrationDiagnostics.failures++;
 
-        hydrationDiagnostics.failure_reasons[
-          "NORMALIZATION_FAILED"
-        ] =
-          (
-            hydrationDiagnostics.failure_reasons[
-              "NORMALIZATION_FAILED"
-            ] || 0
-          ) + 1;
-      }
+      hydrationDiagnostics.failure_reasons[
+        "NORMALIZATION_FAILED"
+      ] =
+        (
+          hydrationDiagnostics.failure_reasons[
+            "NORMALIZATION_FAILED"
+          ] || 0
+        ) + 1;
 
       continue;
     }
@@ -2731,6 +3397,37 @@ async function buildCandidates(
 
     candidate.jupiter_confirmation_status =
       confirmation.status;
+
+    if (
+      confirmation.status ===
+      "PRICE_MISMATCH"
+    ) {
+      jupiterDiagnostics.mismatched_prices++;
+
+      if (
+        jupiterDiagnostics.mismatch_samples.length <
+        10
+      ) {
+        jupiterDiagnostics.mismatch_samples.push({
+          mint:
+            candidate.mint,
+
+          dex_price:
+            candidate.price,
+
+          jupiter_price:
+            jupiterPrice,
+
+          difference_percent:
+            round(
+              safeNumber(
+                confirmation.difference
+              ) * 100,
+              2
+            )
+        });
+      }
+    }
   }
 
   sourceCounts.jupiter_price_confirmed =
@@ -2807,6 +3504,8 @@ async function buildCandidates(
       ),
 
     sourceCounts,
+
+    discoveryDiagnostics,
 
     jupiterDiagnostics,
 
@@ -4269,7 +4968,8 @@ function buildScanResult(
   sourceCounts,
   diagnostics,
   jupiterDiagnostics = null,
-  hydrationDiagnostics = null
+  hydrationDiagnostics = null,
+  discoveryDiagnostics = null
 ) {
   return {
     total_candidates:
@@ -4292,6 +4992,9 @@ function buildScanResult(
 
     rejection_diagnostics:
       diagnostics,
+
+    discovery_diagnostics:
+      discoveryDiagnostics,
 
     jupiter_diagnostics:
       jupiterDiagnostics,
@@ -4823,7 +5526,8 @@ async function runPaperEngine(
       scan.sourceCounts,
       diagnostics,
       scan.jupiterDiagnostics,
-      scan.hydrationDiagnostics
+      scan.hydrationDiagnostics,
+      scan.discoveryDiagnostics
     );
 
   const hadTrades =
@@ -5058,7 +5762,8 @@ async function runScanOnly(
         scan.sourceCounts,
         diagnostics,
         scan.jupiterDiagnostics,
-        scan.hydrationDiagnostics
+        scan.hydrationDiagnostics,
+        scan.discoveryDiagnostics
       ),
 
     storage_policy: {
@@ -5577,6 +6282,10 @@ export default {
 
               persistence:
                 result.persistence,
+
+              discovery:
+                result.scan
+                  .discovery_diagnostics,
 
               hydration:
                 result.scan
