@@ -15,7 +15,8 @@ const BOT_NAME = "memebott";
   - No live transaction execution.
   - Discovery diagnostics enabled.
   - DexScreener batch hydration enabled.
-  - Jupiter Price API v3 root-level response parsing fixed.
+  - Jupiter Price API v3 robust response parsing enabled.
+  - Jupiter fallback price diagnostics enabled.
   - Liquidity-source diagnostics enabled.
 */
 
@@ -124,6 +125,16 @@ const MAX_CANDIDATES = 30;
 const MAX_DEX_TOKENS_ANALYZED = 40;
 const MAX_GECKO_POOLS_ANALYZED = 20;
 const MAX_JUPITER_PRICE_CHECKS = 20;
+
+/*
+  Jupiter fallback is deliberately limited.
+
+  If the batch endpoint returns HTTP 200 but no usable prices,
+  we perform a small number of individual requests. This gives
+  us a real diagnostic signal without turning every scan into
+  a large number of API calls.
+*/
+const MAX_JUPITER_FALLBACK_CHECKS = 5;
 
 /* ============================================================
    API SETTINGS
@@ -1092,10 +1103,6 @@ async function getGeckoCandidates() {
     }
   }
 
-  /*
-    Gecko's public API is rate-limited, so use trending first.
-    Only fall back when it produced no usable token addresses.
-  */
   await readGeckoEndpoint(
     "gecko_trending",
     `${GECKO_BASE}/networks/solana/trending_pools?page=1`
@@ -1859,6 +1866,678 @@ function normalizeDexPair(
 }
 
 /* ============================================================
+   JUPITER PRICE VALUE EXTRACTION
+   ============================================================ */
+
+/*
+  Jupiter Price API responses have changed shape over time.
+  Keep parsing intentionally defensive.
+
+  Supported price fields:
+  - usdPrice
+  - priceUsd
+  - price
+  - usd_price
+
+  The value must resolve to a finite positive number.
+*/
+
+function extractJupiterPriceValue(
+  item
+) {
+  if (
+    item === null ||
+    item === undefined
+  ) {
+    return {
+      price: null,
+      field: null
+    };
+  }
+
+  if (
+    typeof item === "number"
+  ) {
+    return Number.isFinite(item) &&
+      item > 0
+      ? {
+          price: item,
+          field: "DIRECT_NUMBER"
+        }
+      : {
+          price: null,
+          field: "DIRECT_NUMBER"
+        };
+  }
+
+  if (
+    typeof item === "string"
+  ) {
+    const parsed =
+      Number(item);
+
+    return Number.isFinite(parsed) &&
+      parsed > 0
+      ? {
+          price: parsed,
+          field: "DIRECT_STRING"
+        }
+      : {
+          price: null,
+          field: "DIRECT_STRING"
+        };
+  }
+
+  if (
+    typeof item !== "object"
+  ) {
+    return {
+      price: null,
+      field: null
+    };
+  }
+
+  const fields = [
+    "usdPrice",
+    "priceUsd",
+    "price",
+    "usd_price"
+  ];
+
+  for (
+    const field of
+    fields
+  ) {
+    if (
+      Object.prototype.hasOwnProperty.call(
+        item,
+        field
+      )
+    ) {
+      const parsed =
+        Number(
+          item[field]
+        );
+
+      if (
+        Number.isFinite(
+          parsed
+        ) &&
+        parsed > 0
+      ) {
+        return {
+          price: parsed,
+          field
+        };
+      }
+    }
+  }
+
+  /*
+    Defensive support for an additional nested price object.
+  */
+  if (
+    item.price &&
+    typeof item.price ===
+      "object"
+  ) {
+    const nested =
+      extractJupiterPriceValue(
+        item.price
+      );
+
+    if (
+      nested.price !== null
+    ) {
+      return {
+        price:
+          nested.price,
+
+        field:
+          `price.${nested.field}`
+      };
+    }
+  }
+
+  return {
+    price: null,
+    field: null
+  };
+}
+
+/* ============================================================
+   JUPITER MINT KEY LOOKUP
+   ============================================================ */
+
+function findJupiterResponseItem(
+  priceData,
+  mint
+) {
+  if (
+    !priceData ||
+    typeof priceData !==
+      "object"
+  ) {
+    return {
+      item: null,
+      matchedKey: null
+    };
+  }
+
+  /*
+    Exact match first.
+  */
+  if (
+    Object.prototype.hasOwnProperty.call(
+      priceData,
+      mint
+    )
+  ) {
+    return {
+      item:
+        priceData[mint],
+
+      matchedKey:
+        mint
+    };
+  }
+
+  /*
+    Defensive case-insensitive lookup.
+
+    Solana base58 addresses are normally case-sensitive,
+    but this diagnostic layer should still tell us if an
+    upstream response altered key casing.
+  */
+  const lowerMint =
+    String(mint)
+      .toLowerCase();
+
+  for (
+    const key of
+    Object.keys(priceData)
+  ) {
+    if (
+      String(key)
+        .toLowerCase() ===
+      lowerMint
+    ) {
+      return {
+        item:
+          priceData[key],
+
+        matchedKey:
+          key
+      };
+    }
+  }
+
+  return {
+    item: null,
+    matchedKey: null
+  };
+}
+
+/* ============================================================
+   JUPITER RESPONSE MAP EXTRACTION
+   ============================================================ */
+
+function extractJupiterPriceMap(
+  data
+) {
+  const diagnostics = {
+    response_shape:
+      responseShape(data),
+
+    selected_shape:
+      null,
+
+    root_keys:
+      [],
+
+    root_key_count:
+      0,
+
+    root_key_sample:
+      [],
+
+    candidate_maps:
+      []
+  };
+
+  if (
+    !data ||
+    typeof data !== "object" ||
+    Array.isArray(data)
+  ) {
+    return {
+      priceData: null,
+      diagnostics
+    };
+  }
+
+  const rootKeys =
+    Object.keys(data);
+
+  diagnostics.root_keys =
+    rootKeys;
+
+  diagnostics.root_key_count =
+    rootKeys.length;
+
+  diagnostics.root_key_sample =
+    rootKeys.slice(0, 10);
+
+  /*
+    Candidate 1:
+    Root-level mint map.
+
+    Example:
+    {
+      "MintAddress": {
+        "usdPrice": "0.123"
+      }
+    }
+  */
+  const rootRecordKeys =
+    rootKeys.filter(
+      key => {
+        const item =
+          data[key];
+
+        return (
+          item &&
+          typeof item ===
+            "object" &&
+          !Array.isArray(item)
+        );
+      }
+    );
+
+  if (
+    rootRecordKeys.length > 0
+  ) {
+    const rootHasRecognizedPrice =
+      rootRecordKeys.some(
+        key =>
+          extractJupiterPriceValue(
+            data[key]
+          ).price !== null
+      );
+
+    if (
+      rootHasRecognizedPrice
+    ) {
+      diagnostics.candidate_maps.push(
+        "ROOT_LEVEL_MINT_MAP"
+      );
+
+      return {
+        priceData:
+          data,
+
+        diagnostics: {
+          ...diagnostics,
+
+          selected_shape:
+            "ROOT_LEVEL_MINT_MAP"
+        }
+      };
+    }
+  }
+
+  /*
+    Candidate 2:
+    Nested data map.
+  */
+  if (
+    data.data &&
+    typeof data.data ===
+      "object" &&
+    !Array.isArray(
+      data.data
+    )
+  ) {
+    const nestedKeys =
+      Object.keys(
+        data.data
+      );
+
+    const nestedHasRecognizedPrice =
+      nestedKeys.some(
+        key =>
+          extractJupiterPriceValue(
+            data.data[key]
+          ).price !== null
+      );
+
+    if (
+      nestedHasRecognizedPrice
+    ) {
+      diagnostics.candidate_maps.push(
+        "NESTED_DATA_MINT_MAP"
+      );
+
+      return {
+        priceData:
+          data.data,
+
+        diagnostics: {
+          ...diagnostics,
+
+          selected_shape:
+            "NESTED_DATA_MINT_MAP"
+        }
+      };
+    }
+  }
+
+  /*
+    Candidate 3:
+    Some API wrappers return a `prices` object.
+  */
+  if (
+    data.prices &&
+    typeof data.prices ===
+      "object" &&
+    !Array.isArray(
+      data.prices
+    )
+  ) {
+    const priceKeys =
+      Object.keys(
+        data.prices
+      );
+
+    const hasRecognizedPrice =
+      priceKeys.some(
+        key =>
+          extractJupiterPriceValue(
+            data.prices[key]
+          ).price !== null
+      );
+
+    if (
+      hasRecognizedPrice
+    ) {
+      diagnostics.candidate_maps.push(
+        "NESTED_PRICES_MINT_MAP"
+      );
+
+      return {
+        priceData:
+          data.prices,
+
+        diagnostics: {
+          ...diagnostics,
+
+          selected_shape:
+            "NESTED_PRICES_MINT_MAP"
+        }
+      };
+    }
+  }
+
+  /*
+    Candidate 4:
+    A direct single-token record.
+    This is mostly useful for fallback diagnostics.
+  */
+  const directPrice =
+    extractJupiterPriceValue(
+      data
+    );
+
+  if (
+    directPrice.price !== null
+  ) {
+    diagnostics.candidate_maps.push(
+      "DIRECT_PRICE_RECORD"
+    );
+
+    return {
+      priceData:
+        {
+          __DIRECT__:
+            data
+        },
+
+      diagnostics: {
+        ...diagnostics,
+
+        selected_shape:
+          "DIRECT_PRICE_RECORD"
+      }
+    };
+  }
+
+  return {
+    priceData: null,
+
+    diagnostics: {
+      ...diagnostics,
+
+      selected_shape:
+        "NO_RECOGNIZED_PRICE_MAP"
+    }
+  };
+}
+
+/* ============================================================
+   JUPITER SINGLE PRICE REQUEST
+   ============================================================ */
+
+async function getJupiterSinglePrice(
+  mint,
+  env
+) {
+  const diagnostics = {
+    mint,
+
+    attempted:
+      true,
+
+    http_status:
+      null,
+
+    response_shape:
+      null,
+
+    response_key_count:
+      0,
+
+    response_key_sample:
+      [],
+
+    matched_key:
+      null,
+
+    selected_shape:
+      null,
+
+    price_field:
+      null,
+
+    price:
+      null,
+
+    error:
+      null
+  };
+
+  const prices =
+    new Map();
+
+  const url =
+    `${JUPITER_PRICE_API}?ids=${encodeURIComponent(
+      mint
+    )}`;
+
+  try {
+    const headers = {};
+
+    if (
+      env.JUPITER_API_KEY
+    ) {
+      headers["x-api-key"] =
+        env.JUPITER_API_KEY;
+    }
+
+    const result =
+      await fetchJsonDiagnostic(
+        url,
+        {
+          headers
+        }
+      );
+
+    diagnostics.http_status =
+      result.status;
+
+    if (!result.ok) {
+      diagnostics.error =
+        result.error;
+
+      return {
+        prices,
+        diagnostics
+      };
+    }
+
+    diagnostics.response_shape =
+      responseShape(
+        result.data
+      );
+
+    if (
+      result.data &&
+      typeof result.data ===
+        "object" &&
+      !Array.isArray(
+        result.data
+      )
+    ) {
+      const rootKeys =
+        Object.keys(
+          result.data
+        );
+
+      diagnostics.response_key_count =
+        rootKeys.length;
+
+      diagnostics.response_key_sample =
+        rootKeys.slice(0, 10);
+    }
+
+    const extracted =
+      extractJupiterPriceMap(
+        result.data
+      );
+
+    diagnostics.selected_shape =
+      extracted.diagnostics
+        .selected_shape;
+
+    if (
+      extracted.priceData
+    ) {
+      if (
+        extracted.diagnostics
+          .selected_shape ===
+        "DIRECT_PRICE_RECORD"
+      ) {
+        const direct =
+          extractJupiterPriceValue(
+            result.data
+          );
+
+        if (
+          direct.price !== null
+        ) {
+          prices.set(
+            mint,
+            direct.price
+          );
+
+          diagnostics.matched_key =
+            "__DIRECT__";
+
+          diagnostics.price_field =
+            direct.field;
+
+          diagnostics.price =
+            direct.price;
+
+          return {
+            prices,
+            diagnostics
+          };
+        }
+      } else {
+        const match =
+          findJupiterResponseItem(
+            extracted.priceData,
+            mint
+          );
+
+        diagnostics.matched_key =
+          match.matchedKey;
+
+        if (
+          match.item
+        ) {
+          const parsed =
+            extractJupiterPriceValue(
+              match.item
+            );
+
+          if (
+            parsed.price !== null
+          ) {
+            prices.set(
+              mint,
+              parsed.price
+            );
+
+            diagnostics.price_field =
+              parsed.field;
+
+            diagnostics.price =
+              parsed.price;
+
+            return {
+              prices,
+              diagnostics
+            };
+          }
+
+          diagnostics.error =
+            "JUPITER_SINGLE_TOKEN_MATCHED_BUT_PRICE_FIELD_INVALID";
+        } else {
+          diagnostics.error =
+            "JUPITER_SINGLE_TOKEN_RESPONSE_MISSING_REQUESTED_MINT";
+        }
+      }
+    }
+
+    if (
+      !diagnostics.error
+    ) {
+      diagnostics.error =
+        "JUPITER_SINGLE_TOKEN_NO_USABLE_PRICE";
+    }
+  } catch (error) {
+    diagnostics.error =
+      errorText(error);
+  }
+
+  return {
+    prices,
+    diagnostics
+  };
+}
+
+/* ============================================================
    JUPITER SUPPLEMENTAL PRICE CHECK
    ============================================================ */
 
@@ -1889,6 +2568,9 @@ async function getJupiterPrices(
     response_shape:
       null,
 
+    selected_response_shape:
+      null,
+
     response_key_count:
       0,
 
@@ -1899,7 +2581,28 @@ async function getJupiterPrices(
       false,
 
     nested_data_response:
-      false
+      false,
+
+    fallback_attempted:
+      false,
+
+    fallback_checked:
+      0,
+
+    fallback_priced:
+      0,
+
+    fallback_samples:
+      [],
+
+    fallback_errors:
+      [],
+
+    fallback_misses:
+      [],
+
+    price_fields_seen:
+      []
   };
 
   if (!mints.length) {
@@ -1918,10 +2621,23 @@ async function getJupiterPrices(
   diagnostics.requested =
     batch.length;
 
+  /*
+    Construct the URL explicitly.
+
+    The previous implementation encoded the entire comma-separated
+    string before adding it to the URL. URLSearchParams is used here
+    so the query is formed consistently.
+  */
+  const query =
+    new URLSearchParams();
+
+  query.set(
+    "ids",
+    batch.join(",")
+  );
+
   diagnostics.request_url =
-    `${JUPITER_PRICE_API}?ids=${encodeURIComponent(
-      batch.join(",")
-    )}`;
+    `${JUPITER_PRICE_API}?${query.toString()}`;
 
   try {
     const headers = {};
@@ -1983,124 +2699,291 @@ async function getJupiterPrices(
     diagnostics.response_key_sample =
       rootKeys.slice(0, 10);
 
-    let priceData =
-      data;
+    const extracted =
+      extractJupiterPriceMap(
+        data
+      );
 
-    diagnostics.root_level_response =
-      true;
+    diagnostics.selected_response_shape =
+      extracted.diagnostics
+        .selected_shape;
 
     diagnostics.response_shape =
-      "ROOT_LEVEL_MINT_MAP";
-
-    const rootHasPriceRecords =
-      rootKeys.some(
-        key =>
-          data[key] &&
-          typeof data[key] === "object" &&
-          !Array.isArray(data[key]) &&
-          (
-            Object.prototype.hasOwnProperty.call(
-              data[key],
-              "usdPrice"
-            ) ||
-            Object.prototype.hasOwnProperty.call(
-              data[key],
-              "blockId"
-            ) ||
-            Object.prototype.hasOwnProperty.call(
-              data[key],
-              "decimals"
-            )
-          )
-      );
+      extracted.diagnostics
+        .response_shape;
 
     if (
-      !rootHasPriceRecords &&
-      data.data &&
-      typeof data.data === "object" &&
-      !Array.isArray(data.data)
+      extracted.diagnostics
+        .selected_shape ===
+      "ROOT_LEVEL_MINT_MAP"
     ) {
-      priceData =
-        data.data;
-
       diagnostics.root_level_response =
-        false;
+        true;
+    }
 
+    if (
+      extracted.diagnostics
+        .selected_shape ===
+      "NESTED_DATA_MINT_MAP"
+    ) {
       diagnostics.nested_data_response =
         true;
-
-      diagnostics.response_shape =
-        "NESTED_DATA_MINT_MAP";
-
-      const nestedKeys =
-        Object.keys(
-          priceData
-        );
-
-      diagnostics.response_key_count =
-        nestedKeys.length;
-
-      diagnostics.response_key_sample =
-        nestedKeys.slice(
-          0,
-          10
-        );
     }
 
-    for (
-      const mint of batch
+    /*
+      Parse the discovered mint map.
+    */
+    if (
+      extracted.priceData
     ) {
-      const item =
-        priceData[mint];
-
-      if (!item) {
-        diagnostics.missing_prices.push(
-          mint
-        );
-
-        continue;
-      }
-
-      const price =
-        safeNumber(
-          item.usdPrice
-        );
-
-      if (
-        price <= 0
+      for (
+        const mint of batch
       ) {
-        diagnostics.invalid_prices.push(
-          mint
-        );
+        const match =
+          findJupiterResponseItem(
+            extracted.priceData,
+            mint
+          );
 
-        continue;
-      }
+        if (
+          !match.item
+        ) {
+          diagnostics.missing_prices.push(
+            mint
+          );
 
-      prices.set(
-        mint,
-        price
-      );
+          continue;
+        }
 
-      diagnostics.returned++;
-      diagnostics.priced++;
+        const parsed =
+          extractJupiterPriceValue(
+            match.item
+          );
 
-      if (
-        diagnostics.price_samples.length < 10
-      ) {
-        diagnostics.price_samples.push({
+        if (
+          parsed.price === null
+        ) {
+          diagnostics.invalid_prices.push(
+            mint
+          );
+
+          continue;
+        }
+
+        prices.set(
           mint,
-          usd_price:
-            price
-        });
+          parsed.price
+        );
+
+        diagnostics.returned++;
+        diagnostics.priced++;
+
+        if (
+          parsed.field &&
+          !diagnostics.price_fields_seen.includes(
+            parsed.field
+          )
+        ) {
+          diagnostics.price_fields_seen.push(
+            parsed.field
+          );
+        }
+
+        if (
+          diagnostics.price_samples.length < 10
+        ) {
+          diagnostics.price_samples.push({
+            mint,
+            matched_key:
+              match.matchedKey,
+
+            usd_price:
+              parsed.price,
+
+            price_field:
+              parsed.field
+          });
+        }
+      }
+    } else {
+      /*
+        The API returned 200 JSON but we couldn't identify
+        any recognized price map.
+      */
+      diagnostics.error =
+        "JUPITER_RETURNED_200_BUT_NO_RECOGNIZED_PRICE_MAP";
+
+      diagnostics.missing_prices =
+        batch.slice();
+    }
+
+    /*
+      FALLBACK
+
+      If the batch endpoint returned HTTP 200 but yielded zero
+      usable prices, query a small number individually.
+
+      This is intentionally limited. The goal is to establish
+      whether the batch response shape is the problem, whether
+      particular mints are unsupported, or whether Jupiter is
+      returning no prices for the tokens.
+    */
+    if (
+      prices.size === 0 &&
+      batch.length > 0
+    ) {
+      diagnostics.fallback_attempted =
+        true;
+
+      const fallbackBatch =
+        batch.slice(
+          0,
+          MAX_JUPITER_FALLBACK_CHECKS
+        );
+
+      for (
+        const mint of
+        fallbackBatch
+      ) {
+        const fallback =
+          await getJupiterSinglePrice(
+            mint,
+            env
+          );
+
+        diagnostics.fallback_checked++;
+
+        const fallbackPrice =
+          fallback.prices.get(
+            mint
+          );
+
+        if (
+          fallbackPrice
+        ) {
+          prices.set(
+            mint,
+            fallbackPrice
+          );
+
+          diagnostics.fallback_priced++;
+
+          if (
+            diagnostics.fallback_samples.length <
+            10
+          ) {
+            diagnostics.fallback_samples.push({
+              mint,
+
+              price:
+                fallbackPrice,
+
+              price_field:
+                fallback.diagnostics
+                  .price_field,
+
+              matched_key:
+                fallback.diagnostics
+                  .matched_key,
+
+              selected_shape:
+                fallback.diagnostics
+                  .selected_shape,
+
+              http_status:
+                fallback.diagnostics
+                  .http_status
+            });
+          }
+
+          if (
+            !diagnostics.price_fields_seen.includes(
+              fallback.diagnostics
+                .price_field
+            )
+          ) {
+            diagnostics.price_fields_seen.push(
+              fallback.diagnostics
+                .price_field
+            );
+          }
+        } else {
+          diagnostics.fallback_misses.push(
+            {
+              mint,
+
+              http_status:
+                fallback.diagnostics
+                  .http_status,
+
+              response_shape:
+                fallback.diagnostics
+                  .response_shape,
+
+              selected_shape:
+                fallback.diagnostics
+                  .selected_shape,
+
+              matched_key:
+                fallback.diagnostics
+                  .matched_key,
+
+              error:
+                fallback.diagnostics
+                  .error
+            }
+          );
+
+          if (
+            fallback.diagnostics.error
+          ) {
+            diagnostics.fallback_errors.push({
+              mint,
+
+              error:
+                fallback.diagnostics
+                  .error
+            });
+          }
+        }
+      }
+
+      /*
+        Recalculate the aggregate counts after fallback.
+      */
+      diagnostics.returned =
+        prices.size;
+
+      diagnostics.priced =
+        prices.size;
+
+      /*
+        Any fallback-resolved mint is no longer truly missing.
+      */
+      diagnostics.missing_prices =
+        diagnostics.missing_prices.filter(
+          mint =>
+            !prices.has(mint)
+        );
+
+      diagnostics.invalid_prices =
+        diagnostics.invalid_prices.filter(
+          mint =>
+            !prices.has(mint)
+        );
+
+      if (
+        prices.size > 0
+      ) {
+        diagnostics.error =
+          null;
       }
     }
 
     if (
-      diagnostics.returned === 0 &&
-      diagnostics.missing_prices.length ===
-        batch.length
+      diagnostics.returned === 0
     ) {
-      diagnostics.error =
+      diagnostics.error ||=
         "JUPITER_RETURNED_200_BUT_NO_REQUESTED_MINTS_WERE_PRICED";
     }
   } catch (error) {
@@ -2123,14 +3006,25 @@ function addJupiterConfirmation(
   jupiterPrice
 ) {
   if (
-    !jupiterPrice ||
-    !candidate.price
+    !jupiterPrice
   ) {
     return {
       confirmed: false,
       difference: null,
       status:
         "NO_JUPITER_PRICE"
+    };
+  }
+
+  if (
+    !candidate.price ||
+    candidate.price <= 0
+  ) {
+    return {
+      confirmed: false,
+      difference: null,
+      status:
+        "NO_DEX_PRICE"
     };
   }
 
@@ -3438,6 +4332,20 @@ async function buildCandidates(
 
   jupiterDiagnostics.confirmed_candidates =
     sourceCounts.jupiter_price_confirmed;
+
+  /*
+    If we have a Jupiter price but no Dex price, expose this
+    explicitly instead of silently calling it a mismatch.
+  */
+  jupiterDiagnostics.no_dex_price_candidates =
+    candidates.filter(
+      candidate =>
+        candidate.jupiter_price &&
+        (
+          !candidate.price ||
+          candidate.price <= 0
+        )
+    ).length;
 
   /* ==========================================================
      SCORE CANDIDATES
