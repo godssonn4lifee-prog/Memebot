@@ -2,7 +2,7 @@ const BOT_NAME = "memebott";
 
 /*
   ============================================================
-  MEMEBOTT — PAPER TRADING ONLY
+   MEMEBOTT — PAPER TRADING ONLY
   ============================================================
 
   Strategy revision:
@@ -13,6 +13,7 @@ const BOT_NAME = "memebott";
   - Existing safety filters remain intact.
   - Duplicate extreme 1h penalty removed.
   - No live transaction execution.
+  - Gecko -> DexScreener hydration diagnostics enabled.
 */
 
 const PAPER_MODE = true;
@@ -197,6 +198,67 @@ async function fetchJson(url, options = {}) {
   }
 
   return await response.json();
+}
+
+/*
+  Diagnostic fetch used only where we need the HTTP status
+  and a small response-body sample.
+*/
+async function fetchJsonDiagnostic(
+  url,
+  options = {}
+) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      accept: "application/json",
+      ...(options.headers || {})
+    }
+  });
+
+  const status = response.status;
+
+  if (!response.ok) {
+    let bodyText = "";
+
+    try {
+      bodyText = await response.text();
+    } catch {
+      bodyText = "";
+    }
+
+    return {
+      ok: false,
+      status,
+      data: null,
+      error:
+        `HTTP ${status}` +
+        (
+          bodyText
+            ? `: ${bodyText.slice(0, 300)}`
+            : ""
+        )
+    };
+  }
+
+  try {
+    const data = await response.json();
+
+    return {
+      ok: true,
+      status,
+      data,
+      error: null
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status,
+      data: null,
+      error:
+        `INVALID_JSON_RESPONSE: ${errorText(error)}`
+    };
+  }
 }
 
 /* ============================================================
@@ -421,7 +483,8 @@ function getPositionSize(equity) {
     POSITION_SIZE_TIERS[0].amount;
 
   for (
-    const tier of POSITION_SIZE_TIERS
+    const tier of
+    POSITION_SIZE_TIERS
   ) {
     if (
       equity >= tier.equity
@@ -609,20 +672,72 @@ async function getGeckoCandidates() {
 }
 
 /* ============================================================
-   BEST DEX PAIR
+   BEST DEX PAIR — DIAGNOSTIC VERSION
    ============================================================ */
 
 async function getBestDexPair(
   mint
 ) {
+  const url =
+    `${DEX_BASE}/latest/dex/tokens/${encodeURIComponent(mint)}`;
+
   try {
-    const data =
-      await fetchJson(
-        `${DEX_BASE}/latest/dex/tokens/${encodeURIComponent(mint)}`
+    const result =
+      await fetchJsonDiagnostic(
+        url
       );
 
-    const pairs =
-      (data.pairs || [])
+    if (!result.ok) {
+      return {
+        pair: null,
+
+        diagnostic: {
+          mint,
+
+          status:
+            "HYDRATION_HTTP_ERROR",
+
+          http_status:
+            result.status,
+
+          error:
+            result.error
+        }
+      };
+    }
+
+    const data =
+      result.data;
+
+    if (
+      !data ||
+      !Array.isArray(
+        data.pairs
+      )
+    ) {
+      return {
+        pair: null,
+
+        diagnostic: {
+          mint,
+
+          status:
+            "HYDRATION_INVALID_RESPONSE",
+
+          http_status:
+            result.status,
+
+          error:
+            "DEXSCREENER_RESPONSE_MISSING_PAIRS_ARRAY"
+        }
+      };
+    }
+
+    const allPairs =
+      data.pairs;
+
+    const solanaPairs =
+      allPairs
         .filter(
           pair =>
             String(
@@ -640,9 +755,78 @@ async function getBestDexPair(
             )
         );
 
-    return pairs[0] || null;
-  } catch {
-    return null;
+    if (
+      solanaPairs.length === 0
+    ) {
+      return {
+        pair: null,
+
+        diagnostic: {
+          mint,
+
+          status:
+            "NO_SOLANA_PAIRS",
+
+          http_status:
+            result.status,
+
+          total_pairs:
+            allPairs.length,
+
+          solana_pairs:
+            0,
+
+          error:
+            "DEXSCREENER_RETURNED_NO_SOLANA_PAIRS"
+        }
+      };
+    }
+
+    return {
+      pair:
+        solanaPairs[0],
+
+      diagnostic: {
+        mint,
+
+        status:
+          "HYDRATION_SUCCESS",
+
+        http_status:
+          result.status,
+
+        total_pairs:
+          allPairs.length,
+
+        solana_pairs:
+          solanaPairs.length,
+
+        pair_address:
+          solanaPairs[0]?.pairAddress ||
+          null,
+
+        dex_id:
+          solanaPairs[0]?.dexId ||
+          null
+      }
+    };
+  } catch (error) {
+    return {
+      pair: null,
+
+      diagnostic: {
+        mint,
+
+        status:
+          "HYDRATION_EXCEPTION",
+
+        http_status:
+          null,
+
+        error:
+          errorText(error)
+      }
+    };
   }
 }
 
@@ -867,10 +1051,6 @@ async function getJupiterPrices(
   diagnostics.requested =
     batch.length;
 
-  /*
-    API key is NOT included in the diagnostic URL.
-    Mint addresses are public and safe to expose.
-  */
   diagnostics.request_url =
     `${JUPITER_PRICE_API}?ids=${encodeURIComponent(
       batch.join(",")
@@ -1624,7 +1804,21 @@ async function buildCandidates(
     gecko_confirmed_tokens: 0,
     jupiter_price_checked: 0,
     jupiter_price_confirmed: 0,
-    hydrated_pairs: 0
+    hydrated_pairs: 0,
+
+    gecko_tokens_received: 0,
+    gecko_tokens_with_address: 0,
+    gecko_hydration_attempts: 0,
+    gecko_hydration_successes: 0,
+    gecko_hydration_failures: 0
+  };
+
+  const hydrationDiagnostics = {
+    attempted: 0,
+    successes: 0,
+    failures: 0,
+    failure_reasons: {},
+    samples: []
   };
 
   const dexDiscovery =
@@ -1647,6 +1841,20 @@ async function buildCandidates(
 
   sourceCounts.gecko_confirmed_tokens =
     geckoMints.length;
+
+  /*
+    Gecko candidates are already normalized into mint addresses.
+    These counters make sure we can distinguish:
+      - Gecko returned nothing
+      - Gecko returned malformed tokens
+      - Dex hydration failed
+      - Dex hydration succeeded but had no Solana pair
+  */
+  sourceCounts.gecko_tokens_received =
+    geckoMints.length;
+
+  sourceCounts.gecko_tokens_with_address =
+    geckoMints.filter(Boolean).length;
 
   const dexCandidates = [
     ...dexDiscovery,
@@ -1700,13 +1908,65 @@ async function buildCandidates(
   for (
     const item of limited
   ) {
-    const pair =
+    const isGecko =
+      item.source ===
+      "GECKOTERMINAL";
+
+    if (isGecko) {
+      sourceCounts.gecko_hydration_attempts++;
+      hydrationDiagnostics.attempted++;
+    }
+
+    const pairResult =
       await getBestDexPair(
         item.mint
       );
 
+    const pair =
+      pairResult.pair;
+
     if (!pair) {
+      if (isGecko) {
+        sourceCounts.gecko_hydration_failures++;
+        hydrationDiagnostics.failures++;
+
+        const diagnostic =
+          pairResult.diagnostic || {
+            mint:
+              item.mint,
+
+            status:
+              "UNKNOWN_HYDRATION_FAILURE"
+          };
+
+        const reason =
+          diagnostic.status ||
+          "UNKNOWN_HYDRATION_FAILURE";
+
+        hydrationDiagnostics.failure_reasons[
+          reason
+        ] =
+          (
+            hydrationDiagnostics.failure_reasons[
+              reason
+            ] || 0
+          ) + 1;
+
+        if (
+          hydrationDiagnostics.samples.length < 5
+        ) {
+          hydrationDiagnostics.samples.push(
+            diagnostic
+          );
+        }
+      }
+
       continue;
+    }
+
+    if (isGecko) {
+      sourceCounts.gecko_hydration_successes++;
+      hydrationDiagnostics.successes++;
     }
 
     const candidate =
@@ -1716,6 +1976,20 @@ async function buildCandidates(
       );
 
     if (!candidate) {
+      if (isGecko) {
+        sourceCounts.gecko_hydration_failures++;
+        hydrationDiagnostics.failures++;
+
+        hydrationDiagnostics.failure_reasons[
+          "NORMALIZATION_FAILED"
+        ] =
+          (
+            hydrationDiagnostics.failure_reasons[
+              "NORMALIZATION_FAILED"
+            ] || 0
+          ) + 1;
+      }
+
       continue;
     }
 
@@ -1753,6 +2027,17 @@ async function buildCandidates(
     );
   }
 
+  hydrationDiagnostics.failure_reasons =
+    Object.fromEntries(
+      Object.entries(
+        hydrationDiagnostics.failure_reasons
+      ).sort(
+        (a, b) =>
+          b[1] -
+          a[1]
+      )
+    );
+
   /* ==========================================================
      JUPITER PRICE CHECK
      ========================================================== */
@@ -1782,10 +2067,6 @@ async function buildCandidates(
   const jupiterDiagnostics =
     jupiterResult.diagnostics;
 
-  /*
-    Determine actual confirmations by comparing the Jupiter
-    price against the hydrated DexScreener price.
-  */
   for (
     const candidate of
     candidates
@@ -1890,7 +2171,9 @@ async function buildCandidates(
 
     sourceCounts,
 
-    jupiterDiagnostics
+    jupiterDiagnostics,
+
+    hydrationDiagnostics
   };
 }
 
@@ -3348,7 +3631,8 @@ function buildScanResult(
   candidates,
   sourceCounts,
   diagnostics,
-  jupiterDiagnostics = null
+  jupiterDiagnostics = null,
+  hydrationDiagnostics = null
 ) {
   return {
     total_candidates:
@@ -3374,6 +3658,9 @@ function buildScanResult(
 
     jupiter_diagnostics:
       jupiterDiagnostics,
+
+    hydration_diagnostics:
+      hydrationDiagnostics,
 
     top_candidates:
       candidates
@@ -3862,7 +4149,8 @@ async function runPaperEngine(
       candidates,
       scan.sourceCounts,
       diagnostics,
-      scan.jupiterDiagnostics
+      scan.jupiterDiagnostics,
+      scan.hydrationDiagnostics
     );
 
   const hadTrades =
@@ -4096,7 +4384,8 @@ async function runScanOnly(
         candidates,
         scan.sourceCounts,
         diagnostics,
-        scan.jupiterDiagnostics
+        scan.jupiterDiagnostics,
+        scan.hydrationDiagnostics
       ),
 
     storage_policy: {
@@ -4614,7 +4903,11 @@ export default {
                   .eligible_candidates,
 
               persistence:
-                result.persistence
+                result.persistence,
+
+              hydration:
+                result.scan
+                  .hydration_diagnostics
             })
           );
         } catch (error) {
