@@ -38,27 +38,10 @@ const CHECKPOINT_INTERVAL_SECONDS = 300;
 
 /* ============================================================
    CANDIDATE MEMORY
-   ============================================================
-
-   This is deliberately compact.
-
-   The bot remembers only a small number of promising
-   candidates and only their recent market observations.
-
-   It does NOT persist the entire scanner result.
-*/
+   ============================================================ */
 
 const MAX_MEMORY_CANDIDATES = 12;
 const MAX_MEMORY_OBSERVATIONS = 4;
-
-/*
-  Candidates need repeated observations before historical
-  momentum can contribute strongly to an entry.
-
-  At least two observations means we can compare:
-    observation N-1
-    observation N
-*/
 const MIN_HISTORY_OBSERVATIONS = 2;
 
 /* ============================================================
@@ -90,21 +73,7 @@ const PROFIT_REVERSAL_SELL_RATIO = 1.20;
 
 const MIN_ENTRY_SCORE = 45;
 const MIN_MOMENTUM_SCORE = 5;
-
-/*
-  Historical setup score.
-
-  This does NOT replace the main score.
-
-  It rewards improvement across observations rather than
-  simply rewarding a token that has already moved heavily.
-*/
 const MIN_SETUP_SCORE = 5;
-
-/*
-  Historical confirmation can add points, but cannot
-  override the existing safety filters.
-*/
 const MAX_HISTORICAL_SETUP_BONUS = 15;
 
 /* ============================================================
@@ -252,10 +221,6 @@ function createEmptyPortfolio() {
 
     cooldowns: {},
 
-    /*
-      Compact candidate memory.
-      This is intentionally separate from full scan output.
-    */
     market_memory: {},
 
     created_at:
@@ -286,10 +251,6 @@ async function loadPortfolio(env) {
     const portfolio =
       JSON.parse(raw);
 
-    /*
-      Keep schema version 3 so the existing paper account
-      is not intentionally wiped.
-    */
     if (
       safeNumber(
         portfolio.schema_version
@@ -322,15 +283,8 @@ async function loadPortfolio(env) {
     portfolio.last_persist_reason ||=
       null;
 
-    /*
-      Legacy versions stored the entire scan here.
-      Never carry that large object forward.
-    */
     delete portfolio.last_scan;
 
-    /*
-      Clean malformed memory entries.
-    */
     cleanupMarketMemory(
       portfolio
     );
@@ -398,9 +352,6 @@ async function savePortfolio(
   const payload =
     cloneObject(portfolio);
 
-  /*
-    Never persist scan diagnostics.
-  */
   delete payload.last_scan;
 
   payload.updated_at =
@@ -419,9 +370,6 @@ async function savePortfolio(
     JSON.stringify(payload)
   );
 
-  /*
-    Only update the live object after KV confirms success.
-  */
   portfolio.updated_at =
     payload.updated_at;
 
@@ -889,11 +837,25 @@ async function getJupiterPrices(
   mints,
   env
 ) {
-  const result =
+  const prices =
     new Map();
 
+  const diagnostics = {
+    requested: 0,
+    returned: 0,
+    confirmed_candidates: 0,
+    missing_prices: [],
+    invalid_prices: [],
+    error: null,
+    http_status: null,
+    request_url: null
+  };
+
   if (!mints.length) {
-    return result;
+    return {
+      prices,
+      diagnostics
+    };
   }
 
   const batch =
@@ -902,10 +864,19 @@ async function getJupiterPrices(
       MAX_JUPITER_PRICE_CHECKS
     );
 
-  try {
-    const url =
-      `${JUPITER_PRICE_API}?ids=${batch.join(",")}`;
+  diagnostics.requested =
+    batch.length;
 
+  /*
+    API key is NOT included in the diagnostic URL.
+    Mint addresses are public and safe to expose.
+  */
+  diagnostics.request_url =
+    `${JUPITER_PRICE_API}?ids=${encodeURIComponent(
+      batch.join(",")
+    )}`;
+
+  try {
     const headers = {};
 
     if (
@@ -915,19 +886,76 @@ async function getJupiterPrices(
         env.JUPITER_API_KEY;
     }
 
-    const data =
-      await fetchJson(
-        url,
-        { headers }
+    const response =
+      await fetch(
+        diagnostics.request_url,
+        {
+          headers: {
+            accept:
+              "application/json",
+            ...headers
+          }
+        }
       );
+
+    diagnostics.http_status =
+      response.status;
+
+    if (!response.ok) {
+      let bodyText = "";
+
+      try {
+        bodyText =
+          await response.text();
+      } catch {
+        bodyText = "";
+      }
+
+      diagnostics.error =
+        `HTTP ${response.status}` +
+        (
+          bodyText
+            ? `: ${bodyText.slice(0, 300)}`
+            : ""
+        );
+
+      return {
+        prices,
+        diagnostics
+      };
+    }
+
+    const data =
+      await response.json();
+
+    const priceData =
+      data?.data;
+
+    if (
+      !priceData ||
+      typeof priceData !==
+        "object"
+    ) {
+      diagnostics.error =
+        "JUPITER_INVALID_RESPONSE_SHAPE";
+
+      return {
+        prices,
+        diagnostics
+      };
+    }
 
     for (
       const mint of batch
     ) {
       const item =
-        data?.data?.[mint];
+        priceData[mint];
 
       if (!item) {
+        diagnostics.missing_prices.push(
+          mint
+        );
+
         continue;
       }
 
@@ -936,22 +964,36 @@ async function getJupiterPrices(
           item.usdPrice
         );
 
-      if (price > 0) {
-        result.set(
-          mint,
-          price
+      if (
+        price <= 0
+      ) {
+        diagnostics.invalid_prices.push(
+          mint
         );
+
+        continue;
       }
+
+      prices.set(
+        mint,
+        price
+      );
+
+      diagnostics.returned++;
     }
-  } catch {
-    /* Supplemental only */
+  } catch (error) {
+    diagnostics.error =
+      errorText(error);
   }
 
-  return result;
+  return {
+    prices,
+    diagnostics
+  };
 }
 
 /* ============================================================
-   SOURCE CROSS-CHECK
+   JUPITER PRICE CONFIRMATION
    ============================================================ */
 
 function addJupiterConfirmation(
@@ -964,7 +1006,9 @@ function addJupiterConfirmation(
   ) {
     return {
       confirmed: false,
-      difference: null
+      difference: null,
+      status:
+        "NO_JUPITER_PRICE"
     };
   }
 
@@ -975,11 +1019,18 @@ function addJupiterConfirmation(
     ) /
     candidate.price;
 
-  return {
-    confirmed:
-      difference <= 0.15,
+  const confirmed =
+    difference <= 0.15;
 
-    difference
+  return {
+    confirmed,
+
+    difference,
+
+    status:
+      confirmed
+        ? "CONFIRMED"
+        : "PRICE_MISMATCH"
   };
 }
 
@@ -994,13 +1045,6 @@ function analyzeMarketShape(
 
   let penalty = 0;
 
-  /*
-    FIX:
-    The old build applied two penalties to the exact same
-    EXTREME_1H_MOVE condition.
-
-    One condition is sufficient here.
-  */
   if (
     candidate.change_1h >=
     EXTREME_1H_MOVE
@@ -1709,6 +1753,10 @@ async function buildCandidates(
     );
   }
 
+  /* ==========================================================
+     JUPITER PRICE CHECK
+     ========================================================== */
+
   const jupiterMints =
     candidates
       .slice(
@@ -1722,15 +1770,22 @@ async function buildCandidates(
   sourceCounts.jupiter_price_checked =
     jupiterMints.length;
 
-  const jupiterPrices =
+  const jupiterResult =
     await getJupiterPrices(
       jupiterMints,
       env
     );
 
-  sourceCounts.jupiter_price_confirmed =
-    jupiterPrices.size;
+  const jupiterPrices =
+    jupiterResult.prices;
 
+  const jupiterDiagnostics =
+    jupiterResult.diagnostics;
+
+  /*
+    Determine actual confirmations by comparing the Jupiter
+    price against the hydrated DexScreener price.
+  */
   for (
     const candidate of
     candidates
@@ -1755,7 +1810,23 @@ async function buildCandidates(
 
     candidate.jupiter_price_difference =
       confirmation.difference;
+
+    candidate.jupiter_confirmation_status =
+      confirmation.status;
   }
+
+  sourceCounts.jupiter_price_confirmed =
+    candidates.filter(
+      candidate =>
+        candidate.jupiter_confirmed
+    ).length;
+
+  jupiterDiagnostics.confirmed_candidates =
+    sourceCounts.jupiter_price_confirmed;
+
+  /* ==========================================================
+     SCORE CANDIDATES
+     ========================================================== */
 
   for (
     const candidate of
@@ -1817,7 +1888,9 @@ async function buildCandidates(
         MAX_CANDIDATES
       ),
 
-    sourceCounts
+    sourceCounts,
+
+    jupiterDiagnostics
   };
 }
 
@@ -1825,11 +1898,6 @@ async function buildCandidates(
    MARKET MEMORY
    ============================================================ */
 
-/*
-  Only store fields needed to compare short-term movement.
-
-  This keeps KV payloads small.
-*/
 function createMemoryObservation(
   candidate
 ) {
@@ -1887,13 +1955,6 @@ function createMemoryObservation(
 function memoryCandidatePriority(
   candidate
 ) {
-  /*
-    Prefer candidates that are already passing basic risk
-    checks or are close to doing so.
-
-    This prevents memory from filling with obviously dead
-    or unusable tokens.
-  */
   let priority = 0;
 
   if (
@@ -1946,10 +2007,6 @@ function shouldRememberCandidate(
     return false;
   }
 
-  /*
-    Memory should focus on candidates that have at least
-    some realistic chance of becoming eligible.
-  */
   if (
     candidate.risk_pass ||
     candidate.score >= 35 ||
@@ -2050,18 +2107,6 @@ function getCandidateMemory(
   );
 }
 
-/*
-  Historical setup analysis.
-
-  We are deliberately looking for:
-    - price movement strengthening
-    - buy pressure strengthening
-    - 1h trend recovering
-    - volume increasing
-    - liquidity remaining healthy
-
-  We are NOT looking for the largest raw percentage gain.
-*/
 function evaluateHistoricalSetup(
   candidate,
   memory
@@ -2192,15 +2237,6 @@ function evaluateHistoricalSetup(
 
   let score = 0;
 
-  /*
-    5m acceleration.
-
-    Example:
-      +2% -> +6%
-
-    is much more interesting than:
-      +12% -> +6%
-  */
   if (
     delta5m >= 0.01
   ) {
@@ -2211,9 +2247,6 @@ function evaluateHistoricalSetup(
     );
   }
 
-  /*
-    Stronger short-term acceleration.
-  */
   if (
     delta5m >= 0.03
   ) {
@@ -2224,13 +2257,6 @@ function evaluateHistoricalSetup(
     );
   }
 
-  /*
-    1h recovery.
-
-    This is especially useful for setups like the REVS
-    pattern we observed earlier:
-      mildly negative 1h trend + positive short-term move.
-  */
   if (
     delta1h >= 0.01
   ) {
@@ -2241,9 +2267,6 @@ function evaluateHistoricalSetup(
     );
   }
 
-  /*
-    Improving 5m buy pressure.
-  */
   if (
     deltaBuy5m >= 0.05
   ) {
@@ -2254,9 +2277,6 @@ function evaluateHistoricalSetup(
     );
   }
 
-  /*
-    Improving hourly buy pressure.
-  */
   if (
     deltaBuy1h >= 0.03
   ) {
@@ -2267,12 +2287,6 @@ function evaluateHistoricalSetup(
     );
   }
 
-  /*
-    Increasing hourly volume.
-
-    Require both an absolute increase and meaningful
-    relative growth.
-  */
   const previousVolume =
     safeNumber(
       previous.volume_1h
@@ -2292,9 +2306,6 @@ function evaluateHistoricalSetup(
     );
   }
 
-  /*
-    Liquidity should not be collapsing while momentum rises.
-  */
   if (
     current.liquidity > 0 &&
     previous.liquidity > 0
@@ -2314,12 +2325,6 @@ function evaluateHistoricalSetup(
     }
   }
 
-  /*
-    A setup becomes confirmed when multiple independent
-    improvement signals exist.
-
-    We don't require every signal.
-  */
   const hasMomentumImprovement =
     delta5m >= 0.01;
 
@@ -2348,13 +2353,6 @@ function evaluateHistoricalSetup(
       MAX_HISTORICAL_SETUP_BONUS
     );
 
-  /*
-    Historical setup contributes a controlled bonus to the
-    main score.
-
-    It can help a candidate cross the entry threshold, but
-    it cannot rescue a candidate that fails risk assessment.
-  */
   if (
     result.confirmed
   ) {
@@ -2368,14 +2366,6 @@ function evaluateHistoricalSetup(
   return result;
 }
 
-/*
-  Update memory after a scan.
-
-  Important:
-  This changes the in-memory portfolio but does not itself
-  perform a KV write. The normal persistence controller
-  decides when the memory gets stored.
-*/
 function updateMarketMemory(
   portfolio,
   candidates
@@ -2436,10 +2426,6 @@ function updateMarketMemory(
       continue;
     }
 
-    /*
-      Avoid storing duplicate observations if two runs happen
-      to execute almost simultaneously.
-    */
     const observations =
       Array.isArray(
         existing.observations
@@ -2490,13 +2476,6 @@ function updateMarketMemory(
       );
   }
 
-  /*
-    Remove memory entries that are no longer among the
-    strongest remembered candidates.
-
-    We retain entries that have useful history, but cap the
-    total size.
-  */
   const entries =
     Object.entries(
       portfolio.market_memory
@@ -2529,13 +2508,6 @@ function updateMarketMemory(
     trimmed;
 }
 
-/*
-  Apply historical setup scoring after the current snapshot
-  has been scored.
-
-  This intentionally happens after the normal score/risk/entry
-  calculations so the historical signal cannot bypass risk.
-*/
 function applyHistoricalSetup(
   portfolio,
   candidates
@@ -2574,10 +2546,6 @@ function applyHistoricalSetup(
     candidate.setup_deltas =
       setup.deltas;
 
-    /*
-      Historical setup improves the main score only after
-      confirmation.
-    */
     if (
       setup.confirmed &&
       setup.setup_bonus > 0
@@ -2591,10 +2559,6 @@ function applyHistoricalSetup(
         );
     }
 
-    /*
-      Re-evaluate entry threshold with the adjusted score.
-      Risk remains independently enforced.
-    */
     const entry =
       evaluateEntryQuality(
         candidate
@@ -2606,13 +2570,6 @@ function applyHistoricalSetup(
     candidate.entry_reasons =
       entry.reasons;
 
-    /*
-      Important:
-      An historical setup bonus is NOT enough by itself to
-      create an entry.
-
-      The candidate must have at least two observations.
-    */
     if (
       candidate.entry_eligible &&
       !candidate.setup_confirmed
@@ -3390,7 +3347,8 @@ function markPortfolio(
 function buildScanResult(
   candidates,
   sourceCounts,
-  diagnostics
+  diagnostics,
+  jupiterDiagnostics = null
 ) {
   return {
     total_candidates:
@@ -3413,6 +3371,9 @@ function buildScanResult(
 
     rejection_diagnostics:
       diagnostics,
+
+    jupiter_diagnostics:
+      jupiterDiagnostics,
 
     top_candidates:
       candidates
@@ -3542,7 +3503,23 @@ function buildScanResult(
               candidate.sources,
 
             jupiter_confirmed:
-              candidate.jupiter_confirmed
+              candidate.jupiter_confirmed,
+
+            jupiter_price:
+              candidate.jupiter_price,
+
+            jupiter_price_difference:
+              candidate.jupiter_price_difference ===
+              null
+                ? null
+                : round(
+                    candidate.jupiter_price_difference *
+                      100,
+                    2
+                  ),
+
+            jupiter_confirmation_status:
+              candidate.jupiter_confirmation_status
           })
         )
   };
@@ -3564,10 +3541,6 @@ async function runPaperEngine(
   const portfolio =
     await loadPortfolio(env);
 
-  /*
-    Snapshot allows us to roll back a paper trade if the
-    resulting portfolio cannot be persisted.
-  */
   const beforeRun =
     cloneObject(
       portfolio
@@ -3585,12 +3558,6 @@ async function runPaperEngine(
       portfolio
     );
 
-  /*
-    ==========================================================
-    SCAN
-    ==========================================================
-  */
-
   const scan =
     await buildCandidates(
       env
@@ -3599,35 +3566,15 @@ async function runPaperEngine(
   const candidates =
     scan.candidates;
 
-  /*
-    ==========================================================
-    HISTORICAL SETUP ANALYSIS
-    ==========================================================
-  */
-
-  /*
-    Analyze the previous memory BEFORE adding this scan's
-    observation. Otherwise the current observation would be
-    compared against itself.
-  */
   applyHistoricalSetup(
     portfolio,
     candidates
   );
 
-  /*
-    Now append the current observations for future scans.
-  */
   updateMarketMemory(
     portfolio,
     candidates
   );
-
-  /*
-    ==========================================================
-    MONITOR EXISTING POSITIONS
-    ==========================================================
-  */
 
   for (
     const position of [
@@ -3661,10 +3608,6 @@ async function runPaperEngine(
     if (
       decision.sell
     ) {
-      /*
-        If persistence is not currently available, do not
-        execute a paper sell that cannot safely be saved.
-      */
       if (
         !persistenceReady
       ) {
@@ -3698,12 +3641,6 @@ async function runPaperEngine(
     }
   }
 
-  /*
-    ==========================================================
-    NEW ENTRY
-    ==========================================================
-  */
-
   let buysRemaining =
     MAX_NEW_BUYS_PER_RUN;
 
@@ -3734,15 +3671,6 @@ async function runPaperEngine(
           )
       );
 
-    /*
-      Sort by:
-        1. setup confirmation strength
-        2. final score
-        3. base score
-
-      This prioritizes an improving setup over a token that
-      merely has a large static score.
-    */
     eligible.sort(
       (a, b) => {
         const setupDifference =
@@ -3856,12 +3784,6 @@ async function runPaperEngine(
     }
   }
 
-  /*
-    ==========================================================
-    MARK AFTER TRADES
-    ==========================================================
-  */
-
   const portfolioMark =
     markPortfolio(
       portfolio,
@@ -3872,12 +3794,6 @@ async function runPaperEngine(
     calculateAccountingCheck(
       portfolio
     );
-
-  /*
-    ==========================================================
-    DIAGNOSTICS
-    ==========================================================
-  */
 
   const diagnostics =
     buildRejectionDiagnostics(
@@ -3941,24 +3857,13 @@ async function runPaperEngine(
     }
   }
 
-  /*
-    ==========================================================
-    SCAN RESULT
-    ==========================================================
-  */
-
   const scanResult =
     buildScanResult(
       candidates,
       scan.sourceCounts,
-      diagnostics
+      diagnostics,
+      scan.jupiterDiagnostics
     );
-
-  /*
-    ==========================================================
-    PERSISTENCE DECISION
-    ==========================================================
-  */
 
   const hadTrades =
     buys.length > 0 ||
@@ -3977,11 +3882,6 @@ async function runPaperEngine(
       "NOT_NEEDED"
   };
 
-  /*
-    A trade MUST be persisted.
-    If that fails, roll the in-memory paper account back
-    so the bot never reports a trade that cannot be recovered.
-  */
   if (hadTrades) {
     persistence.attempted =
       true;
@@ -4195,7 +4095,8 @@ async function runScanOnly(
       buildScanResult(
         candidates,
         scan.sourceCounts,
-        diagnostics
+        diagnostics,
+        scan.jupiterDiagnostics
       ),
 
     storage_policy: {
@@ -4420,10 +4321,6 @@ async function resetPaper(
   const portfolio =
     createEmptyPortfolio();
 
-  /*
-    Force is intentional here because RESET is an explicit
-    user action rather than an automatic scan.
-  */
   const persistence =
     await savePortfolio(
       env,
@@ -4518,10 +4415,6 @@ export default {
         );
       }
 
-      /*
-        HEALTH
-      */
-
       if (
         path === "/" ||
         path === "/health"
@@ -4543,10 +4436,6 @@ export default {
         });
       }
 
-      /*
-        FULL PAPER ENGINE
-      */
-
       if (
         path === "/run"
       ) {
@@ -4559,10 +4448,6 @@ export default {
           result
         );
       }
-
-      /*
-        SCAN ONLY
-      */
 
       if (
         path === "/scan"
@@ -4577,10 +4462,6 @@ export default {
         );
       }
 
-      /*
-        STATUS
-      */
-
       if (
         path === "/status"
       ) {
@@ -4593,10 +4474,6 @@ export default {
           result
         );
       }
-
-      /*
-        RESET
-      */
 
       if (
         path === "/reset"
@@ -4649,15 +4526,6 @@ export default {
         404
       );
     } catch (error) {
-      /*
-        IMPORTANT:
-        Do NOT write the error back to KV.
-
-        If the original problem is KV quota exhaustion,
-        another KV write here would only make the problem
-        worse.
-      */
-
       console.error(
         JSON.stringify({
           bot:
@@ -4699,17 +4567,6 @@ export default {
       );
     }
   },
-
-  /*
-    ==========================================================
-    CLOUDFLARE CRON
-    ==========================================================
-
-    Keep the existing one-minute cron.
-
-    Scanning frequency and KV persistence frequency are
-    separate.
-  */
 
   async scheduled(
     event,
@@ -4761,11 +4618,6 @@ export default {
             })
           );
         } catch (error) {
-          /*
-            Log only.
-            Never attempt another KV write here.
-          */
-
           console.error(
             JSON.stringify({
               cron:
