@@ -15,6 +15,7 @@ const BOT_NAME = "memebott";
   - No live transaction execution.
   - Gecko -> DexScreener hydration diagnostics enabled.
   - Jupiter Price API v3 root-level response parsing fixed.
+  - Liquidity-source diagnostics enabled.
 */
 
 const PAPER_MODE = true;
@@ -201,14 +202,7 @@ async function fetchJson(url, options = {}) {
   return await response.json();
 }
 
-/*
-  Diagnostic fetch used only where we need the HTTP status
-  and a small response-body sample.
-*/
-async function fetchJsonDiagnostic(
-  url,
-  options = {}
-) {
+async function fetchJsonDiagnostic(url, options = {}) {
   const response = await fetch(url, {
     ...options,
     headers: {
@@ -673,8 +667,84 @@ async function getGeckoCandidates() {
 }
 
 /* ============================================================
-   BEST DEX PAIR — DIAGNOSTIC VERSION
+   BEST DEX PAIR — LIQUIDITY DIAGNOSTIC VERSION
    ============================================================ */
+
+function summarizeDexPair(
+  pair,
+  index
+) {
+  const hasLiquidityField =
+    !!(
+      pair &&
+      pair.liquidity &&
+      Object.prototype.hasOwnProperty.call(
+        pair.liquidity,
+        "usd"
+      )
+    );
+
+  const rawLiquidity =
+    hasLiquidityField
+      ? pair.liquidity.usd
+      : null;
+
+  const normalizedLiquidity =
+    safeNumber(
+      rawLiquidity,
+      0
+    );
+
+  return {
+    rank:
+      index + 1,
+
+    pair_address:
+      pair?.pairAddress ||
+      null,
+
+    dex_id:
+      pair?.dexId ||
+      null,
+
+    url:
+      pair?.url ||
+      null,
+
+    base_symbol:
+      pair?.baseToken?.symbol ||
+      null,
+
+    quote_symbol:
+      pair?.quoteToken?.symbol ||
+      null,
+
+    liquidity_field_present:
+      hasLiquidityField,
+
+    liquidity_raw:
+      rawLiquidity,
+
+    liquidity_usd:
+      normalizedLiquidity,
+
+    volume_24h_raw:
+      pair?.volume?.h24 ??
+      null,
+
+    volume_1h_raw:
+      pair?.volume?.h1 ??
+      null,
+
+    price_usd_raw:
+      pair?.priceUsd ??
+      null,
+
+    pair_created_at:
+      pair?.pairCreatedAt ??
+      null
+  };
+}
 
 async function getBestDexPair(
   mint
@@ -745,15 +815,6 @@ async function getBestDexPair(
               pair.chainId || ""
             ).toLowerCase() ===
             "solana"
-        )
-        .sort(
-          (a, b) =>
-            safeNumber(
-              b.liquidity?.usd
-            ) -
-            safeNumber(
-              a.liquidity?.usd
-            )
         );
 
     if (
@@ -783,9 +844,158 @@ async function getBestDexPair(
       };
     }
 
+    /*
+      Sort primarily by liquidity.
+
+      When liquidity is equal or unavailable, use 24h
+      volume as a secondary signal. This makes the selected
+      pair more informative than simply taking the first
+      API-returned pair.
+
+      We DO NOT loosen any trading filter here.
+      This only improves pair selection/diagnostics.
+    */
+    const rankedPairs =
+      [...solanaPairs].sort(
+        (a, b) => {
+          const liquidityDifference =
+            safeNumber(
+              b.liquidity?.usd,
+              0
+            ) -
+            safeNumber(
+              a.liquidity?.usd,
+              0
+            );
+
+          if (
+            liquidityDifference !== 0
+          ) {
+            return liquidityDifference;
+          }
+
+          return (
+            safeNumber(
+              b.volume?.h24,
+              0
+            ) -
+            safeNumber(
+              a.volume?.h24,
+              0
+            )
+          );
+        }
+      );
+
+    const selectedPair =
+      rankedPairs[0];
+
+    const selectedIndex =
+      rankedPairs.indexOf(
+        selectedPair
+      );
+
+    const selectedLiquidityFieldPresent =
+      !!(
+        selectedPair.liquidity &&
+        Object.prototype.hasOwnProperty.call(
+          selectedPair.liquidity,
+          "usd"
+        )
+      );
+
+    const selectedRawLiquidity =
+      selectedLiquidityFieldPresent
+        ? selectedPair.liquidity.usd
+        : null;
+
+    const selectedLiquidity =
+      safeNumber(
+        selectedRawLiquidity,
+        0
+      );
+
+    const zeroLiquidityCount =
+      solanaPairs.filter(
+        pair =>
+          safeNumber(
+            pair.liquidity?.usd,
+            0
+          ) === 0
+      ).length;
+
+    const missingLiquidityCount =
+      solanaPairs.filter(
+        pair =>
+          !pair.liquidity ||
+          !Object.prototype.hasOwnProperty.call(
+            pair.liquidity,
+            "usd"
+          )
+      ).length;
+
+    const positiveLiquidityCount =
+      solanaPairs.filter(
+        pair =>
+          safeNumber(
+            pair.liquidity?.usd,
+            0
+          ) > 0
+      ).length;
+
+    const topPairDiagnostics =
+      rankedPairs
+        .slice(0, 5)
+        .map(
+          (pair, index) =>
+            summarizeDexPair(
+              pair,
+              index
+            )
+        );
+
+    let liquiditySource =
+      "DEXSCREENER_LIQUIDITY_USD";
+
+    if (
+      !selectedLiquidityFieldPresent
+    ) {
+      liquiditySource =
+        "DEXSCREENER_LIQUIDITY_FIELD_MISSING";
+    } else if (
+      selectedLiquidity <= 0
+    ) {
+      liquiditySource =
+        "DEXSCREENER_LIQUIDITY_USD_ZERO";
+    }
+
+    let selectionReason =
+      "HIGHEST_LIQUIDITY";
+
+    if (
+      selectedLiquidity <= 0 &&
+      positiveLiquidityCount === 0 &&
+      solanaPairs.length > 1
+    ) {
+      selectionReason =
+        "ALL_SOLANA_PAIRS_ZERO_OR_MISSING_LIQUIDITY";
+    } else if (
+      selectedLiquidity <= 0 &&
+      positiveLiquidityCount > 0
+    ) {
+      selectionReason =
+        "SELECTED_ZERO_LIQUIDITY_DESPITE_POSITIVE_ALTERNATIVE";
+    } else if (
+      selectedLiquidity > 0 &&
+      selectedIndex > 0
+    ) {
+      selectionReason =
+        "SELECTED_BY_LIQUIDITY_RANKING";
+    }
+
     return {
       pair:
-        solanaPairs[0],
+        selectedPair,
 
       diagnostic: {
         mint,
@@ -802,13 +1012,67 @@ async function getBestDexPair(
         solana_pairs:
           solanaPairs.length,
 
-        pair_address:
-          solanaPairs[0]?.pairAddress ||
+        positive_liquidity_pairs:
+          positiveLiquidityCount,
+
+        zero_liquidity_pairs:
+          zeroLiquidityCount,
+
+        missing_liquidity_pairs:
+          missingLiquidityCount,
+
+        selected_pair_rank:
+          selectedIndex + 1,
+
+        selected_pair_address:
+          selectedPair?.pairAddress ||
           null,
 
-        dex_id:
-          solanaPairs[0]?.dexId ||
-          null
+        selected_dex_id:
+          selectedPair?.dexId ||
+          null,
+
+        selected_pair_url:
+          selectedPair?.url ||
+          null,
+
+        selected_base_symbol:
+          selectedPair?.baseToken?.symbol ||
+          null,
+
+        selected_quote_symbol:
+          selectedPair?.quoteToken?.symbol ||
+          null,
+
+        selected_liquidity_raw:
+          selectedRawLiquidity,
+
+        selected_liquidity_usd:
+          selectedLiquidity,
+
+        selected_liquidity_field_present:
+          selectedLiquidityFieldPresent,
+
+        selected_liquidity_source:
+          liquiditySource,
+
+        selected_volume_24h_raw:
+          selectedPair?.volume?.h24 ??
+          null,
+
+        selected_volume_1h_raw:
+          selectedPair?.volume?.h1 ??
+          null,
+
+        selected_price_usd_raw:
+          selectedPair?.priceUsd ??
+          null,
+
+        selection_reason:
+          selectionReason,
+
+        top_pairs:
+          topPairDiagnostics
       }
     };
   } catch (error) {
@@ -837,11 +1101,26 @@ async function getBestDexPair(
 
 function normalizeDexPair(
   pair,
-  mint
+  mint,
+  pairDiagnostic = null
 ) {
   if (!pair) {
     return null;
   }
+
+  const liquidityFieldPresent =
+    !!(
+      pair.liquidity &&
+      Object.prototype.hasOwnProperty.call(
+        pair.liquidity,
+        "usd"
+      )
+    );
+
+  const rawLiquidity =
+    liquidityFieldPresent
+      ? pair.liquidity.usd
+      : null;
 
   const price =
     safeNumber(
@@ -850,7 +1129,7 @@ function normalizeDexPair(
 
   const liquidity =
     safeNumber(
-      pair.liquidity?.usd
+      rawLiquidity
     );
 
   const volume24h =
@@ -933,6 +1212,21 @@ function normalizeDexPair(
   const priceChange =
     pair.priceChange || {};
 
+  let liquiditySource =
+    "DEXSCREENER_LIQUIDITY_USD";
+
+  if (
+    !liquidityFieldPresent
+  ) {
+    liquiditySource =
+      "DEXSCREENER_LIQUIDITY_FIELD_MISSING";
+  } else if (
+    liquidity <= 0
+  ) {
+    liquiditySource =
+      "DEXSCREENER_LIQUIDITY_USD_ZERO";
+  }
+
   return {
     mint,
 
@@ -950,11 +1244,28 @@ function normalizeDexPair(
     liquidity_usd:
       liquidity,
 
+    liquidity_raw:
+      rawLiquidity,
+
+    liquidity_field_present:
+      liquidityFieldPresent,
+
+    liquidity_source:
+      liquiditySource,
+
     volume_24h_usd:
       volume24h,
 
     volume_1h_usd:
       volume1h,
+
+    volume_24h_raw:
+      pair.volume?.h24 ??
+      null,
+
+    volume_1h_raw:
+      pair.volume?.h1 ??
+      null,
 
     change_5m:
       safeNumber(
@@ -1010,6 +1321,30 @@ function normalizeDexPair(
 
     url:
       pair.url ||
+      null,
+
+    pair_count:
+      pairDiagnostic?.solana_pairs ||
+      null,
+
+    positive_liquidity_pair_count:
+      pairDiagnostic?.positive_liquidity_pairs ||
+      null,
+
+    zero_liquidity_pair_count:
+      pairDiagnostic?.zero_liquidity_pairs ||
+      null,
+
+    missing_liquidity_pair_count:
+      pairDiagnostic?.missing_liquidity_pairs ||
+      null,
+
+    selected_pair_rank:
+      pairDiagnostic?.selected_pair_rank ||
+      null,
+
+    liquidity_selection_reason:
+      pairDiagnostic?.selection_reason ||
       null
   };
 }
@@ -1126,32 +1461,6 @@ async function getJupiterPrices(
     const data =
       await response.json();
 
-    /*
-      IMPORTANT:
-      Jupiter Price API v3 returns token mint addresses
-      directly as keys on the ROOT response object.
-
-      Example:
-
-      {
-        "MINT_ADDRESS": {
-          "usdPrice": 0.123,
-          "blockId": 123,
-          "decimals": 6
-        }
-      }
-
-      Older code incorrectly expected:
-
-      {
-        "data": {
-          "MINT_ADDRESS": {...}
-        }
-      }
-
-      That caused HTTP 200 responses to produce 0 prices.
-    */
-
     if (
       !data ||
       typeof data !== "object" ||
@@ -1178,9 +1487,6 @@ async function getJupiterPrices(
     diagnostics.response_key_sample =
       rootKeys.slice(0, 10);
 
-    /*
-      Prefer the documented v3 root-level response.
-    */
     let priceData =
       data;
 
@@ -1190,12 +1496,6 @@ async function getJupiterPrices(
     diagnostics.response_shape =
       "ROOT_LEVEL_MINT_MAP";
 
-    /*
-      Defensive compatibility:
-      If a nested data object ever appears, support it too,
-      but only when the root object does not look like a
-      mint -> price-record map.
-    */
     const rootHasPriceRecords =
       rootKeys.some(
         key =>
@@ -1953,7 +2253,18 @@ async function buildCandidates(
     successes: 0,
     failures: 0,
     failure_reasons: {},
-    samples: []
+    samples: [],
+
+    pairs_examined: 0,
+    pairs_with_positive_liquidity: 0,
+    pairs_with_zero_liquidity: 0,
+    pairs_with_missing_liquidity: 0,
+
+    zero_liquidity_samples: [],
+    missing_liquidity_samples: [],
+
+    selected_liquidity_sources: {},
+    selected_pair_samples: []
   };
 
   const dexDiscovery =
@@ -2052,6 +2363,193 @@ async function buildCandidates(
     const pair =
       pairResult.pair;
 
+    const pairDiagnostic =
+      pairResult.diagnostic;
+
+    if (
+      pairDiagnostic &&
+      pairDiagnostic.status ===
+        "HYDRATION_SUCCESS"
+    ) {
+      hydrationDiagnostics.pairs_examined +=
+        safeNumber(
+          pairDiagnostic.solana_pairs
+        );
+
+      hydrationDiagnostics.pairs_with_positive_liquidity +=
+        safeNumber(
+          pairDiagnostic.positive_liquidity_pairs
+        );
+
+      hydrationDiagnostics.pairs_with_zero_liquidity +=
+        safeNumber(
+          pairDiagnostic.zero_liquidity_pairs
+        );
+
+      hydrationDiagnostics.pairs_with_missing_liquidity +=
+        safeNumber(
+          pairDiagnostic.missing_liquidity_pairs
+        );
+
+      const source =
+        pairDiagnostic.selected_liquidity_source ||
+        "UNKNOWN";
+
+      hydrationDiagnostics.selected_liquidity_sources[
+        source
+      ] =
+        (
+          hydrationDiagnostics.selected_liquidity_sources[
+            source
+          ] || 0
+        ) + 1;
+
+      if (
+        hydrationDiagnostics.selected_pair_samples.length < 10
+      ) {
+        hydrationDiagnostics.selected_pair_samples.push({
+          mint:
+            item.mint,
+
+          symbol:
+            pairDiagnostic.selected_base_symbol,
+
+          pair_address:
+            pairDiagnostic.selected_pair_address,
+
+          dex_id:
+            pairDiagnostic.selected_dex_id,
+
+          pair_url:
+            pairDiagnostic.selected_pair_url,
+
+          pair_count:
+            pairDiagnostic.solana_pairs,
+
+          positive_liquidity_pairs:
+            pairDiagnostic.positive_liquidity_pairs,
+
+          zero_liquidity_pairs:
+            pairDiagnostic.zero_liquidity_pairs,
+
+          missing_liquidity_pairs:
+            pairDiagnostic.missing_liquidity_pairs,
+
+          selected_pair_rank:
+            pairDiagnostic.selected_pair_rank,
+
+          liquidity_raw:
+            pairDiagnostic.selected_liquidity_raw,
+
+          liquidity_usd:
+            pairDiagnostic.selected_liquidity_usd,
+
+          liquidity_field_present:
+            pairDiagnostic.selected_liquidity_field_present,
+
+          liquidity_source:
+            pairDiagnostic.selected_liquidity_source,
+
+          volume_24h_raw:
+            pairDiagnostic.selected_volume_24h_raw,
+
+          volume_1h_raw:
+            pairDiagnostic.selected_volume_1h_raw,
+
+          selection_reason:
+            pairDiagnostic.selection_reason
+        });
+      }
+
+      if (
+        pairDiagnostic.selected_liquidity_source ===
+        "DEXSCREENER_LIQUIDITY_USD_ZERO"
+      ) {
+        if (
+          hydrationDiagnostics.zero_liquidity_samples.length < 10
+        ) {
+          hydrationDiagnostics.zero_liquidity_samples.push({
+            mint:
+              item.mint,
+
+            symbol:
+              pairDiagnostic.selected_base_symbol,
+
+            pair_address:
+              pairDiagnostic.selected_pair_address,
+
+            dex_id:
+              pairDiagnostic.selected_dex_id,
+
+            liquidity_raw:
+              pairDiagnostic.selected_liquidity_raw,
+
+            volume_24h_raw:
+              pairDiagnostic.selected_volume_24h_raw,
+
+            volume_1h_raw:
+              pairDiagnostic.selected_volume_1h_raw,
+
+            pair_count:
+              pairDiagnostic.solana_pairs,
+
+            positive_liquidity_pairs:
+              pairDiagnostic.positive_liquidity_pairs,
+
+            selection_reason:
+              pairDiagnostic.selection_reason,
+
+            top_pairs:
+              pairDiagnostic.top_pairs
+          });
+        }
+      }
+
+      if (
+        pairDiagnostic.selected_liquidity_source ===
+        "DEXSCREENER_LIQUIDITY_FIELD_MISSING"
+      ) {
+        if (
+          hydrationDiagnostics.missing_liquidity_samples.length < 10
+        ) {
+          hydrationDiagnostics.missing_liquidity_samples.push({
+            mint:
+              item.mint,
+
+            symbol:
+              pairDiagnostic.selected_base_symbol,
+
+            pair_address:
+              pairDiagnostic.selected_pair_address,
+
+            dex_id:
+              pairDiagnostic.selected_dex_id,
+
+            liquidity_raw:
+              pairDiagnostic.selected_liquidity_raw,
+
+            volume_24h_raw:
+              pairDiagnostic.selected_volume_24h_raw,
+
+            volume_1h_raw:
+              pairDiagnostic.selected_volume_1h_raw,
+
+            pair_count:
+              pairDiagnostic.solana_pairs,
+
+            positive_liquidity_pairs:
+              pairDiagnostic.positive_liquidity_pairs,
+
+            selection_reason:
+              pairDiagnostic.selection_reason,
+
+            top_pairs:
+              pairDiagnostic.top_pairs
+          });
+        }
+      }
+    }
+
     if (!pair) {
       if (isGecko) {
         sourceCounts.gecko_hydration_failures++;
@@ -2099,7 +2597,8 @@ async function buildCandidates(
     const candidate =
       normalizeDexPair(
         pair,
-        item.mint
+        item.mint,
+        pairDiagnostic
       );
 
     if (!candidate) {
@@ -2158,6 +2657,17 @@ async function buildCandidates(
     Object.fromEntries(
       Object.entries(
         hydrationDiagnostics.failure_reasons
+      ).sort(
+        (a, b) =>
+          b[1] -
+          a[1]
+      )
+    );
+
+  hydrationDiagnostics.selected_liquidity_sources =
+    Object.fromEntries(
+      Object.entries(
+        hydrationDiagnostics.selected_liquidity_sources
       ).sort(
         (a, b) =>
           b[1] -
@@ -3835,6 +4345,42 @@ function buildScanResult(
                 candidate.liquidity_usd,
                 2
               ),
+
+            liquidity_raw:
+              candidate.liquidity_raw,
+
+            liquidity_field_present:
+              candidate.liquidity_field_present,
+
+            liquidity_source:
+              candidate.liquidity_source,
+
+            pair_address:
+              candidate.pair_address,
+
+            dex_id:
+              candidate.dex_id,
+
+            pair_url:
+              candidate.url,
+
+            pair_count:
+              candidate.pair_count,
+
+            positive_liquidity_pair_count:
+              candidate.positive_liquidity_pair_count,
+
+            zero_liquidity_pair_count:
+              candidate.zero_liquidity_pair_count,
+
+            missing_liquidity_pair_count:
+              candidate.missing_liquidity_pair_count,
+
+            selected_pair_rank:
+              candidate.selected_pair_rank,
+
+            liquidity_selection_reason:
+              candidate.liquidity_selection_reason,
 
             volume_24h_usd:
               round(
