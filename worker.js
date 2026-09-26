@@ -71,15 +71,15 @@ const MIN_TOKEN_PRICE = 0.00000001;
 const MIN_LIQUIDITY_USD = 15000;
 const MIN_VOLUME_24H_USD = 10000;
 const MIN_VOLUME_1H_USD = 1000;
-/* ============================================================ CHASE PROTECTION
+/* ============================================================ CHASE
+PROTECTION
  ============================================================ */
 const MAX_5M_GAIN = 0.15;
 const MAX_1H_GAIN = 0.45;
 const MAX_6H_GAIN = 1.00;
 const MAX_24H_GAIN = 5.00;
 /* ============================================================
- NEW TOKEN PROTECTION
- ============================================================ */
+ NEW TOKEN PROTECTION ============================================================ */
 const NEW_TOKEN_MAX_AGE_DAYS = 1;
 const NEW_TOKEN_MIN_LIQUIDITY_USD = 25000;
 /* ============================================================
@@ -106,8 +106,7 @@ const MAX_JUPITER_PRICE_CHECKS = 20;
  a large number of API calls.
 */
 const MAX_JUPITER_FALLBACK_CHECKS = 5;
-/* ============================================================
- API SETTINGS
+/* ============================================================ API SETTINGS
  ============================================================ */
 const DEX_BASE = "https://api.dexscreener.com";
 const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
@@ -195,8 +194,7 @@ if (!response.ok) {
  : ""
  )
  };
-}
-try {
+}try {
  const data = await response.json();
  return {
  ok: true,
@@ -216,8 +214,7 @@ try {
  } catch (error) {
  return {
  ok: false,
- status: null,
- data: null,
+ status: null, data: null,
  error:
  `FETCH_EXCEPTION: ${errorText(error)}`
  };
@@ -305,8 +302,7 @@ async function loadPortfolio(env) {
  }
 }
 /* ============================================================
- PERSISTENCE CONTROL
- ============================================================ */
+ PERSISTENCE CONTROL ============================================================ */
 function persistenceAgeMs(portfolio) {
  const last =
  safeNumber(
@@ -326,8 +322,7 @@ function canPersistNow(portfolio) {
 function checkpointDue(portfolio) {
  return (
  persistenceAgeMs(portfolio) >=
- CHECKPOINT_INTERVAL_SECONDS * 1000
- );
+ CHECKPOINT_INTERVAL_SECONDS * 1000 );
 }
 async function savePortfolio(
  env,
@@ -415,8 +410,7 @@ function getPositionSize(equity) {
  }
  }
  return Math.min(
- amount,
- MAX_PAPER_POSITION_USD );
+ amount, MAX_PAPER_POSITION_USD );
 }
 /* ============================================================
  DISCOVERY DIAGNOSTICS
@@ -436,50 +430,49 @@ function createDiscoveryDiagnostics() {
  dexscreener_boosts: {
  attempted: true,
  http_status: null,
- response_shape: null,
- total_items: 0,
- solana_items: 0,
- extracted_mints: 0,
- error: null,
- sample: []
- },
- dexscreener_top_boosts: {
- attempted: true,
- http_status: null,
- response_shape: null,
- total_items: 0,
- solana_items: 0,
- extracted_mints: 0,
- error: null,
- sample: []
- },
- dexscreener_search: {
- attempted: 0,
- queries: {},
- total_pairs: 0,
- solana_pairs: 0,
- extracted_mints: 0,
- errors: []
- },
- gecko_trending: {
- attempted: true,
- http_status: null,
- response_shape: null,
- pool_count: 0,
- tokens_extracted: 0,
- error: null,
- sample: []
- },
- gecko_top_pools: {
- attempted: true,
- http_status: null,
- response_shape: null,
- pool_count: 0,
- tokens_extracted: 0,
- error: null,
- sample: []
- },
- gecko_new_pools: {
+response_shape: null,total_items: 0,
+solana_items: 0,
+extracted_mints: 0,
+error: null,
+sample: []
+},
+dexscreener_top_boosts: {
+attempted: true,
+http_status: null,
+response_shape: null,
+total_items: 0,
+solana_items: 0,
+extracted_mints: 0,
+error: null,
+sample: []
+},
+dexscreener_search: {
+attempted: 0,
+queries: {},
+total_pairs: 0,
+solana_pairs: 0,
+extracted_mints: 0,
+errors: []
+},
+gecko_trending: {
+attempted: true,
+http_status: null,
+response_shape: null,
+pool_count: 0,
+tokens_extracted: 0,
+error: null,
+sample: []
+},
+gecko_top_pools: {
+attempted: true,
+http_status: null,
+response_shape: null,
+pool_count: 0,
+tokens_extracted: 0,
+error: null,
+sample: []
+},
+gecko_new_pools: {
  attempted: true,
  http_status: null,
  response_shape: null,
@@ -525,8 +518,7 @@ async function getDexDiscovery() {
  key:
  "dexscreener_boosts",
  url:
- `${DEX_BASE}/token-boosts/latest/v1`
- },
+ `${DEX_BASE}/token-boosts/latest/v1` },
  {
  key:
  "dexscreener_top_boosts",
@@ -546,8 +538,7 @@ for (
  const diagnostic =
  diagnostics[
  endpoint.key
- ];
- diagnostic.http_status =
+ ]; diagnostic.http_status =
  result.status;
  if (!result.ok) {
  diagnostic.error =
@@ -635,8 +626,7 @@ const diagnostics =
 for (
  const query of
  queries
-){
- diagnostics.attempted++;
+){ diagnostics.attempted++;
  const queryDiagnostic = {
  attempted: true,
  http_status: null,
@@ -656,8 +646,7 @@ for (
  );
  queryDiagnostic.http_status =
  result.status;
- if (!result.ok) {
- queryDiagnostic.error =
+ if (!result.ok) { queryDiagnostic.error =
  result.error;
  diagnostics.errors.push({
  query,
@@ -745,8 +734,7 @@ for (
  "DEXSCREENER_SEARCH"
  });
  }
- }
- return {
+ } return {
  results:
  results.slice(
  0,
@@ -766,8 +754,7 @@ function extractGeckoMint(item) {
  ?.id;
  if (id) {
  return String(id)
- .replace(
- /^solana_/,
+ .replace( /^solana_/,
  ""
  );
  }
@@ -855,8 +842,7 @@ diagnostic.pool_count =
  items.length;
 diagnostic.sample =
  items
- .slice(0, 5)
- .map(
+ .slice(0, 5) .map(
  geckoPoolSample
  );
 for (
@@ -876,8 +862,7 @@ for (
  );
  }
  }
- await readGeckoEndpoint(
- "gecko_trending",
+ await readGeckoEndpoint( "gecko_trending",
  `${GECKO_BASE}/networks/solana/trending_pools?page=1`
  );
  if (
@@ -907,6 +892,86 @@ for (
  };
 }
 /* ============================================================
+ GECKOTERMINAL TOKEN LIQUIDITY FALLBACK
+ ------------------------------------------------------------
+ DexScreener can omit liquidity.usd for some Solana/Pump.fun
+ pairs. Do not treat a missing field as confirmed zero liquidity.
+ Use GeckoTerminal's token-level total reserve only as a
+ conservative fallback for those candidates. The existing
+ liquidity thresholds remain unchanged.
+ ============================================================ */
+async function getGeckoTokenLiquidity(mints) {
+ const uniqueMints = unique(mints).slice(0, 30);
+ const diagnostics = {
+ attempted: uniqueMints.length > 0,
+ requested: uniqueMints.length,
+ http_status: null,
+ response_shape: null,
+ returned: 0,
+ resolved: 0,
+ missing: [],
+ invalid: [],
+ error: null,
+ samples: []
+ };
+ const liquidityByMint = new Map();
+ if (!uniqueMints.length) {
+ return { liquidityByMint, diagnostics };
+ }
+ const url =
+ `${GECKO_BASE}/networks/solana/tokens/multi/${uniqueMints
+ .map(encodeURIComponent)
+ .join(",")}`;
+ const result = await fetchJsonDiagnostic(
+ url,
+ {
+ headers: {
+ accept: "application/json;version=20230203"
+ }
+ }
+ );
+ diagnostics.http_status = result.status;
+ if (!result.ok) {
+ diagnostics.error = result.error;
+ return { liquidityByMint, diagnostics };
+ }
+ diagnostics.response_shape = responseShape(result.data);
+ const items = Array.isArray(result.data?.data)
+ ? result.data.data
+ : null;
+ if (!items) {
+ diagnostics.error = "EXPECTED_OBJECT_WITH_DATA_ARRAY";
+ return { liquidityByMint, diagnostics };
+ }
+ diagnostics.returned = items.length;
+ for (const item of items) {
+ const id = item?.attributes?.address ||
+ (item?.id ? String(item.id).replace(/^solana_/, "") : null);
+ if (!id) continue;
+ const reserve = safeNumber(
+ item?.attributes?.total_reserve_in_usd,
+ 0 );
+ if (reserve > 0) {
+ liquidityByMint.set(id, reserve);
+ diagnostics.resolved++;
+ if (diagnostics.samples.length < 10) {
+ diagnostics.samples.push({
+ mint: id,
+ symbol: item?.attributes?.symbol || null,
+ total_reserve_in_usd: reserve
+ });
+ }
+ } else if (diagnostics.missing.length < 10) {
+ diagnostics.missing.push(id);
+ }
+ }
+ for (const mint of uniqueMints) {
+ if (!liquidityByMint.has(mint) && diagnostics.missing.length < 10) {
+ diagnostics.missing.push(mint);
+ }
+ }
+ return { liquidityByMint, diagnostics };}
+/* ============================================================
  BEST DEX PAIR — LIQUIDITY DIAGNOSTIC VERSION
  ============================================================ */
 function summarizeDexPair(
@@ -920,50 +985,50 @@ function summarizeDexPair(
  Object.prototype.hasOwnProperty.call(
  pair.liquidity,
  "usd"
- )
- );
- const rawLiquidity =
- hasLiquidityField
- ? pair.liquidity.usd
- : null;
- const normalizedLiquidity = safeNumber(
- rawLiquidity,
- 0
- );
- return {
- rank:
- index + 1,
- pair_address:
- pair?.pairAddress ||
- null,
- dex_id:
- pair?.dexId ||
- null,
- url:
- pair?.url ||
- null,
- base_symbol:
- pair?.baseToken?.symbol ||
- null,
- quote_symbol:
- pair?.quoteToken?.symbol ||
- null,
- liquidity_field_present:
- hasLiquidityField,
- liquidity_raw:
- rawLiquidity,
- liquidity_usd:
- normalizedLiquidity,
- volume_24h_raw:
- pair?.volume?.h24 ??
- null,
- volume_1h_raw:
- pair?.volume?.h1 ??
- null,
- price_usd_raw:
- pair?.priceUsd ??
- null,
- pair_created_at:
+)
+);
+const rawLiquidity =
+hasLiquidityField
+? pair.liquidity.usd
+: null;
+const normalizedLiquidity = safeNumber(
+rawLiquidity,
+0
+);
+return {
+rank:
+index + 1,
+pair_address:
+pair?.pairAddress ||
+null,
+dex_id:
+pair?.dexId ||
+null,
+url:
+pair?.url ||
+null,
+base_symbol:
+pair?.baseToken?.symbol ||
+null,
+quote_symbol:
+pair?.quoteToken?.symbol ||
+null,
+liquidity_field_present:
+hasLiquidityField,
+liquidity_raw:
+rawLiquidity,
+liquidity_usd:
+normalizedLiquidity,
+volume_24h_raw:
+pair?.volume?.h24 ??
+null,
+volume_1h_raw:
+pair?.volume?.h1 ??
+null,
+price_usd_raw:
+pair?.priceUsd ??
+null,
+pair_created_at:
  pair?.pairCreatedAt ??
  null
  };
@@ -992,8 +1057,7 @@ async function hydrateDexPairs(
  null
 };
 if (!mints.length) {
- return {
- pairsByMint,
+ return { pairsByMint,
  diagnostics
  };
 }
@@ -1013,8 +1077,7 @@ const result =
  );
 diagnostics.http_status =
  result.status;
-if (!result.ok) {
- diagnostics.error =
+if (!result.ok) { diagnostics.error =
  result.error;
  return {
  pairsByMint,
@@ -1102,8 +1165,7 @@ if (
  status:
  "NO_SOLANA_PAIRS",
  total_pairs:
- allPairs.length,
- solana_pairs:
+ allPairs.length, solana_pairs:
  0,
  error:
  "NO_SOLANA_PAIRS"
@@ -1123,8 +1185,7 @@ const rankedPairs =
  0
  );
  if (
- liquidityDifference !== 0
- ){
+ liquidityDifference !== 0 ){
  return liquidityDifference;
  }
  return ( safeNumber(
@@ -1212,8 +1273,7 @@ if (
  positiveLiquidityCount === 0 &&
  solanaPairs.length > 1
 ){
- selectionReason =
- "ALL_SOLANA_PAIRS_ZERO_OR_MISSING_LIQUIDITY";
+ selectionReason = "ALL_SOLANA_PAIRS_ZERO_OR_MISSING_LIQUIDITY";
 } else if (
  selectedLiquidity <= 0 && positiveLiquidityCount > 0
 ){
@@ -1233,8 +1293,7 @@ return {
  mint,
  status:
  "HYDRATION_SUCCESS",
-total_pairs:
- allPairs.length,
+total_pairs: allPairs.length,
 solana_pairs:
  solanaPairs.length,
 positive_liquidity_pairs:
@@ -1322,8 +1381,7 @@ const volume1h =
  safeNumber(
  pair.volume?.h1
  );
-const tx5m =
- pair.txns?.m5 || {};
+const tx5m = pair.txns?.m5 || {};
 const tx1h =
  pair.txns?.h1 || {};
 const buys5m =
@@ -1343,8 +1401,7 @@ const sells1h =
  tx1h.sells
  );
 const total5m =
- buys5m +
- sells5m;
+ buys5m + sells5m;
 const total1h =
  buys1h +
  sells1h;
@@ -1432,8 +1489,7 @@ change_24h:
  safeNumber(
  priceChange.h24
  ) / 100,
-buys_5m:
- buys5m,
+buys_5m: buys5m,
 sells_5m:
  sells5m,
 buys_1h:
@@ -1453,8 +1509,7 @@ pair_address:
  null,
 dex_id:
  pair.dexId ||
- null,
-url:
+ null,url:
  pair.url ||
  null,
 pair_count:
@@ -1542,8 +1597,7 @@ if (
 const fields = [
  "usdPrice",
  "priceUsd",
- "price",
- "usd_price"
+ "price", "usd_price"
 ];
 for (
  const field of
@@ -1563,8 +1617,7 @@ for (
  parsed
  ) &&
  parsed > 0
- ){
- return {
+ ){ return {
  price: parsed,
  field
  };
@@ -1652,8 +1705,7 @@ for (
  return {
  item:
  priceData[key],
- matchedKey:
- key
+ matchedKey: key
  };
  }
  }
@@ -1673,8 +1725,7 @@ function extractJupiterPriceMap(
  responseShape(data),
  selected_shape:
  null,
- root_keys:
- [],
+ root_keys: [],
  root_key_count:
  0,
  root_key_sample:
@@ -1762,8 +1813,7 @@ if (
  )
 ){
  const nestedKeys =
- Object.keys(
- data.data
+ Object.keys( data.data
  );
  const nestedHasRecognizedPrice =
  nestedKeys.some(
@@ -1783,8 +1833,7 @@ if (
  data.data,
  diagnostics: {
  ...diagnostics,
- selected_shape:
- "NESTED_DATA_MINT_MAP" }
+ selected_shape: "NESTED_DATA_MINT_MAP" }
  };
  }
 }
@@ -1872,8 +1921,7 @@ async function getJupiterSinglePrice(
  env
 ){
  const diagnostics = {
- mint,
- attempted:
+ mint, attempted:
  true,
  http_status:
  null,
@@ -1893,8 +1941,7 @@ async function getJupiterSinglePrice(
  null,
  error:
  null
- };
- const prices =
+ }; const prices =
  new Map();
  const url =
  `${JUPITER_PRICE_API}?ids=${encodeURIComponent(
@@ -1982,8 +2029,7 @@ if (
  diagnostics
  };
  }
-} else {
- const match =
+} else { const match =
  findJupiterResponseItem(
  extracted.priceData,
  mint
@@ -2003,8 +2049,7 @@ if (
  mint,
  parsed.price
  );
- diagnostics.price_field =
- parsed.field;
+ diagnostics.price_field = parsed.field;
  diagnostics.price =
  parsed.price;
  return {
@@ -2092,8 +2137,7 @@ if (!mints.length) {
 const batch =
  mints.slice(
  0,
- MAX_JUPITER_PRICE_CHECKS
- );
+ MAX_JUPITER_PRICE_CHECKS );
 diagnostics.requested =
  batch.length;
 /*
@@ -2113,8 +2157,7 @@ diagnostics.request_url =
 try {
  const headers = {};
  if (
- env.JUPITER_API_KEY
- ){
+ env.JUPITER_API_KEY ){
  headers["x-api-key"] =
  env.JUPITER_API_KEY;
  }
@@ -2196,50 +2239,48 @@ if (
  extracted.priceData,
  mint
  );
- if (
- !match.item
- ){
- diagnostics.missing_prices.push(
- mint
- );
- continue;
- }
- const parsed =
- extractJupiterPriceValue(
- match.item );
- if (
- parsed.price === null
- ){
- diagnostics.invalid_prices.push(
- mint
- );
- continue;
- }
- prices.set(
- mint,
- parsed.price
- );
- diagnostics.returned++;
- diagnostics.priced++;
- if (
- parsed.field &&
- !diagnostics.price_fields_seen.includes(
- parsed.field
- )
- ){
- diagnostics.price_fields_seen.push(
- parsed.field
- );
- }
- if (
- diagnostics.price_samples.length < 10
- ){
- diagnostics.price_samples.push({
- mint,
- matched_key:
- match.matchedKey,
- usd_price:
- parsed.price,
+if (
+!match.item
+){
+diagnostics.missing_prices.push(
+mint
+);
+continue;}
+const parsed =
+extractJupiterPriceValue(
+match.item );
+if (
+parsed.price === null
+){
+diagnostics.invalid_prices.push(
+mint
+);
+continue;
+}
+prices.set(
+mint,
+parsed.price
+);
+diagnostics.returned++;
+diagnostics.priced++;
+if (
+parsed.field &&
+!diagnostics.price_fields_seen.includes(parsed.field
+)
+){
+diagnostics.price_fields_seen.push(
+parsed.field
+);
+}
+if (
+diagnostics.price_samples.length < 10
+){
+diagnostics.price_samples.push({
+mint,
+matched_key:
+match.matchedKey,
+usd_price:
+parsed.price,
  price_field:
  parsed.field
  });
@@ -2312,8 +2353,7 @@ if (
  .matched_key,
  selected_shape:
  fallback.diagnostics
- .selected_shape,
- http_status:
+ .selected_shape, http_status:
  fallback.diagnostics
  .http_status
  });
@@ -2333,8 +2373,7 @@ if (
  diagnostics.fallback_misses.push(
  {
  mint,
- http_status:
- fallback.diagnostics
+ http_status: fallback.diagnostics
  .http_status,
  response_shape:
  fallback.diagnostics
@@ -2422,8 +2461,7 @@ function addJupiterConfirmation(
  if (
  !candidate.price ||
  candidate.price <= 0
- ){
- return {
+ ){ return {
  confirmed: false,
  difference: null,
  status:
@@ -2443,8 +2481,7 @@ function addJupiterConfirmation(
  difference,
  status:
  confirmed
- ? "CONFIRMED"
- : "PRICE_MISMATCH"
+ ? "CONFIRMED" : "PRICE_MISMATCH"
  };
 }
 /* ============================================================
@@ -2532,8 +2569,7 @@ function scoreCandidate(
  ){
  momentum += 5;
  }
- if (
- candidate.change_1h > 0
+ if ( candidate.change_1h > 0
  ){
  momentum += 5;
  }
@@ -2553,8 +2589,7 @@ momentum =
  0,
  20
  );
-breakdown.momentum =
- momentum;
+breakdown.momentum = momentum;
 let volume = 0;
 if (
  candidate.volume_24h_usd >=
@@ -2642,8 +2677,7 @@ if (
 if (
  candidate.buy_pressure_1h >=
  0.50){
- buyPressure += 4;
-}
+ buyPressure += 4;}
 if (
  candidate.buy_pressure_1h >=
  0.60
@@ -2663,8 +2697,7 @@ if (
  candidate.change_5m > 0 &&
  candidate.change_1h > 0
 ){
- acceleration += 3;
-}
+ acceleration += 3;}
 if (
  candidate.change_1h >
  candidate.change_6h
@@ -2752,8 +2785,7 @@ const shape =
 }
 /* ============================================================
  ENTRY QUALITY
- ============================================================ */
-function evaluateEntryQuality(
+ ============================================================ */function evaluateEntryQuality(
  candidate
 ){
  const reasons = [];
@@ -2773,8 +2805,7 @@ function evaluateEntryQuality(
  "LOW_1H_VOLUME"
  );
  }
- if (
- candidate.momentum_score <
+ if ( candidate.momentum_score <
  MIN_MOMENTUM_SCORE
  ){
  reasons.push(
@@ -2862,8 +2893,7 @@ function assessRisk(
  MIN_TOKEN_PRICE
  ){
  reasons.push(
- "INVALID_PRICE"
- );
+ "INVALID_PRICE" );
  }
  if (
  candidate.liquidity_usd <
@@ -2883,8 +2913,7 @@ if (
 }
 if (
  candidate.volume_1h_usd <
- MIN_VOLUME_1H_USD
-){
+ MIN_VOLUME_1H_USD){
  reasons.push(
  "LOW_1H_VOLUME"
  );
@@ -2961,7 +2990,19 @@ const hydrationDiagnostics = {
  zero_liquidity_samples: [],
  missing_liquidity_samples: [],
  selected_liquidity_sources: {},
- selected_pair_samples: []
+ selected_pair_samples: [],
+ gecko_liquidity_fallback: {
+ attempted: false,
+ requested: 0,
+ http_status: null,
+ response_shape: null,
+ returned: 0,
+ resolved: 0,
+ missing: [],
+ invalid: [],
+ error: null,
+ applied: 0, samples: []
+ }
 };
 const discoveryDiagnostics =
  createDiscoveryDiagnostics();
@@ -2980,8 +3021,7 @@ Object.assign(
 );
 Object.assign(
  discoveryDiagnostics.dexscreener_top_boosts,
- dexDiscoveryResult.diagnostics.dexscreener_top_boosts
-);
+ dexDiscoveryResult.diagnostics.dexscreener_top_boosts);
 const dexDiscovery =
  dexDiscoveryResult.results;
 sourceCounts.dexscreener_discovery =
@@ -3069,8 +3109,7 @@ for (
 /* ==========================================================
  BATCH HYDRATION
  ========================================================== */
-const hydrationMints =
- limited.map( item =>
+const hydrationMints = limited.map( item =>
  item.mint
  );
 const batchResults = [];
@@ -3090,8 +3129,7 @@ for (
  hydrationDiagnostics.batch_requests++;
  const result =
  await hydrateDexPairs(
- batch
- );
+ batch );
  hydrationDiagnostics.batch_http_statuses.push({
  batch:
  hydrationDiagnostics.batch_requests,
@@ -3179,8 +3217,7 @@ hydrationDiagnostics.pairs_with_missing_liquidity +=
  safeNumber(
  pairDiagnostic.missing_liquidity_pairs
  );
-sourceCounts.dex_zero_liquidity_pairs +=
- safeNumber(
+sourceCounts.dex_zero_liquidity_pairs += safeNumber(
  pairDiagnostic.zero_liquidity_pairs
  );
 if (
@@ -3200,8 +3237,7 @@ hydrationDiagnostics.selected_liquidity_sources[
  (
  hydrationDiagnostics.selected_liquidity_sources[
  liquiditySource
- ] || 0
- ) + 1;
+ ] || 0 ) + 1;
 if (
  hydrationDiagnostics.selected_pair_samples.length <
  10
@@ -3289,8 +3325,7 @@ if (
  pairDiagnostic.solana_pairs,
  selection_reason:
  pairDiagnostic.selection_reason,
- top_pairs:
- pairDiagnostic.top_pairs
+ top_pairs: pairDiagnostic.top_pairs
  });
  }
 }
@@ -3310,8 +3345,7 @@ if (!pair) {
  reason
  ] || 0
  ) + 1;
- if (
- hydrationDiagnostics.samples.length <
+ if ( hydrationDiagnostics.samples.length <
  10
  ){
  hydrationDiagnostics.samples.push({
@@ -3369,8 +3403,56 @@ if (!candidate) {
  candidate
  );
 }
-hydrationDiagnostics.failure_reasons =
- Object.fromEntries(
+/* ==========================================================
+ GECKOTERMINAL LIQUIDITY FALLBACK
+ ----------------------------------------------------------
+ Only candidates whose DexScreener liquidity field is missing
+ or non-positive are eligible for this fallback. A positive
+ GeckoTerminal reserve does not lower any existing threshold.
+ ========================================================== */
+const liquidityFallbackMints = candidates
+ .filter(candidate =>
+ !candidate.liquidity_field_present ||
+ safeNumber(candidate.liquidity_usd) <= 0
+ )
+ .map(candidate => candidate.mint);
+const geckoLiquidityResult =
+ await getGeckoTokenLiquidity(
+ liquidityFallbackMints
+ );
+hydrationDiagnostics.gecko_liquidity_fallback =
+ {
+ ...geckoLiquidityResult.diagnostics,
+ applied: 0
+ };
+for (const candidate of candidates) {
+ if (candidate.liquidity_field_present &&
+ safeNumber(candidate.liquidity_usd) > 0) {
+ continue;
+ }
+ const fallbackLiquidity =
+ geckoLiquidityResult.liquidityByMint.get(
+ candidate.mint
+ ); if (!Number.isFinite(fallbackLiquidity) ||
+ fallbackLiquidity <= 0) {
+ continue;
+ }
+ candidate.liquidity_usd = fallbackLiquidity;
+ candidate.liquidity_raw = fallbackLiquidity;
+ candidate.liquidity_source =
+ "GECKOTERMINAL_TOTAL_RESERVE_USD_FALLBACK";
+ candidate.liquidity_fallback_used = true;
+ hydrationDiagnostics.gecko_liquidity_fallback.applied++;
+ if (hydrationDiagnostics.gecko_liquidity_fallback.samples.length < 10) {
+ hydrationDiagnostics.gecko_liquidity_fallback.samples.push({
+ mint: candidate.mint,
+ symbol: candidate.symbol,
+ liquidity_usd: fallbackLiquidity,
+ dex_liquidity_source: "DEXSCREENER_LIQUIDITY_FIELD_MISSING_OR_ZERO"
+ });
+ }
+}
+hydrationDiagnostics.failure_reasons = Object.fromEntries(
  Object.entries(
  hydrationDiagnostics.failure_reasons
  ).sort(
@@ -3458,8 +3540,7 @@ for (
  )
  });
  }
- }
-}
+ }}
 sourceCounts.jupiter_price_confirmed =
  candidates.filter(
  candidate =>
@@ -3479,8 +3560,7 @@ jupiterDiagnostics.no_dex_price_candidates =
  !candidate.price ||
  candidate.price <= 0
  )
- ).length;
-/* ==========================================================
+ ).length;/* ==========================================================
  SCORE CANDIDATES
  ========================================================== */
 for (
@@ -3568,8 +3648,7 @@ function createMemoryObservation(
  ),
  liquidity:
  safeNumber(
- candidate.liquidity_usd
- ),
+ candidate.liquidity_usd ),
  buy_pressure_5m:
  safeNumber(
  candidate.buy_pressure_5m
@@ -3589,8 +3668,7 @@ function memoryCandidatePriority(
  ){
  priority += 100;
  }
- if (
- candidate.entry_eligible
+ if ( candidate.entry_eligible
  ){
  priority += 40;
  }
@@ -3648,50 +3726,49 @@ function cleanupMarketMemory(
  }
  const entries =
  Object.entries(
- portfolio.market_memory
- );
- const cleaned = {};
- for (
- const [mint, memory]
- of entries
- ){
- if (
- !mint ||
- !memory ||
- !Array.isArray(
- memory.observations
- )
- ){
- continue;
- }
- const observations =
- memory.observations
- .filter(
- observation =>
- observation &&
- safeNumber(
- observation.time
- ) > 0 &&
- safeNumber(
- observation.price
- )>0
- )
- .slice(
- -MAX_MEMORY_OBSERVATIONS
- );
- if (
- !observations.length
- ){
- continue;
- }
- cleaned[mint] = {
- symbol:
- memory.symbol ||
- "UNKNOWN",
- name:
- memory.name ||
- "UNKNOWN",
- priority: safeNumber(
+portfolio.market_memory
+);
+const cleaned = {};
+for (
+const [mint, memory]
+of entries
+){
+if (
+!mint ||
+!memory ||
+!Array.isArray(
+memory.observations
+)
+){
+continue;
+}
+const observations =
+memory.observations
+.filter(
+observation =>
+observation &&
+safeNumber(
+observation.time
+) > 0 &&
+safeNumber(
+observation.price
+)>0
+)
+.slice(
+-MAX_MEMORY_OBSERVATIONS
+);if (
+!observations.length
+){
+continue;
+}
+cleaned[mint] = {
+symbol:
+memory.symbol ||
+"UNKNOWN",
+name:
+memory.name ||
+"UNKNOWN",
+priority: safeNumber(
  memory.priority
  ),
  observations
@@ -3699,8 +3776,7 @@ function cleanupMarketMemory(
 }
  portfolio.market_memory =
  cleaned;
-}
-function getCandidateMemory(
+}function getCandidateMemory(
  portfolio,
  mint
 ){
@@ -3788,8 +3864,7 @@ const deltaBuy1h =
  current.buy_pressure_1h -
  safeNumber(
  previous.buy_pressure_1h
- );
-const deltaLiquidity =
+ );const deltaLiquidity =
  current.liquidity -
  safeNumber(
  previous.liquidity
@@ -3809,8 +3884,7 @@ result.deltas = {
  deltaLiquidity
 };
 let score = 0;
-if (
- delta5m >= 0.01
+if ( delta5m >= 0.01
 ){
  score += 3;
  result.signals.push(
@@ -3898,8 +3972,7 @@ result.confirmed =
  hasPressureImprovement
  );
 result.setup_score =
- clamp(
- score,
+ clamp( score,
  0,
  MAX_HISTORICAL_SETUP_BONUS
  );
@@ -3919,8 +3992,7 @@ function updateMarketMemory(
 ){
  cleanupMarketMemory(
  portfolio
- );
- const ranked =
+ ); const ranked =
  candidates
  .filter(
  shouldRememberCandidate
@@ -4008,8 +4080,7 @@ if (
 const entries =
  Object.entries(
  portfolio.market_memory
- );
-entries.sort(
+ );entries.sort(
  (a, b) =>
  safeNumber(
  b[1]?.priority
@@ -4029,8 +4100,7 @@ entries.sort(
  trimmed[mint] =
  memory;
  }
- portfolio.market_memory =
- trimmed;
+ portfolio.market_memory = trimmed;
 }
 function applyHistoricalSetup(
  portfolio,
@@ -4118,8 +4188,7 @@ function countReasons(
  ) + 1;
  }
  }
- return Object.fromEntries(
- Object.entries(counts)
+ return Object.fromEntries( Object.entries(counts)
  .sort(
  (a, b) =>
  b[1] - a[1]
@@ -4139,8 +4208,7 @@ function buildRejectionDiagnostics(
  x =>
  x.risk_pass &&
  !x.entry_eligible
- );
- const eligible =
+ ); const eligible =
  candidates.filter(
  x =>
  x.risk_pass &&
@@ -4228,8 +4296,7 @@ function paperBuy(
  ok: false,
  reason:
  "MAX_POSITIONS"
- };
- }
+ }; }
  const availableCash =
  portfolio.cash_usd -
  MIN_CASH_RESERVE_USD;
@@ -4249,8 +4316,7 @@ function paperBuy(
  p.mint ===
  candidate.mint
  )
- ){
- return {
+ ){ return {
  ok: false,
  reason:
  "ALREADY_HOLDING"
@@ -4338,8 +4404,7 @@ addHistory(
  "ENTRY_ELIGIBLE_HISTORICAL_SETUP"
  }
  );
- return {
- ok: true,
+ return { ok: true,
  position };
 }
 /* ============================================================
@@ -4359,8 +4424,7 @@ function paperSell(
  const proceeds =
  position.quantity *
  price;
- const pnl =
- proceeds -
+ const pnl = proceeds -
  position.invested_usd;
  const pnlPercent =
  position.invested_usd > 0
@@ -4448,8 +4512,7 @@ position.pnl_usd =
 if (
  price >
  safeNumber(
- position.peak_price,
- position.entry_price
+ position.peak_price, position.entry_price
  )
 ){
  position.peak_price =
@@ -4469,8 +4532,7 @@ if (
 }
 if (
  pnl >=
- TRAILING_ACTIVATION
-){
+ TRAILING_ACTIVATION){
  position.trailing_active =
  true;
 }
@@ -4558,8 +4620,7 @@ if (
 }
 /* ============================================================
  ACCOUNTING CHECK
- ============================================================ */
-function calculateAccountingCheck(
+ ============================================================ */function calculateAccountingCheck(
  portfolio
 ){
  const openInvested =
@@ -4579,8 +4640,7 @@ function calculateAccountingCheck(
  openInvested;
  const difference =
  actual -
- expected;
- return {
+ expected; return {
  actual_basis_usd:
  round(
  actual,
@@ -4616,50 +4676,50 @@ function markPortfolio(
  candidate.mint,
  candidate
  ]
- )
- );
- let positionValue = 0;
- let unrealizedPnl = 0;
- for (
- const position of
- portfolio.positions
- ){
- const candidate =
- byMint.get(
- position.mint
- );
- if (candidate) {
- position.current_price =
- candidate.price; const pnl =
- position.entry_price > 0
- ?(
- candidate.price -
- position.entry_price
- )/
- position.entry_price
- : 0;
- position.pnl_percent =
- pnl;
- position.pnl_usd =
- position.invested_usd *
- pnl;
- positionValue +=
- position.invested_usd *
- (1 + pnl);
- unrealizedPnl +=
- position.pnl_usd;
- } else {
- positionValue +=
- position.invested_usd *
- (
- 1+
- safeNumber(
- position.pnl_percent
- )
- );
- unrealizedPnl +=
- safeNumber(
- position.pnl_usd
+)
+);
+let positionValue = 0;
+let unrealizedPnl = 0;
+for (
+const position of
+portfolio.positions
+){
+const candidate =
+byMint.get(
+position.mint
+);
+if (candidate) {
+position.current_price =
+candidate.price; const pnl =
+position.entry_price > 0
+?(
+candidate.price -
+position.entry_price
+)/
+position.entry_price
+: 0;
+position.pnl_percent =
+pnl;
+position.pnl_usd =
+position.invested_usd *
+pnl;
+positionValue +=
+position.invested_usd *
+(1 + pnl);
+unrealizedPnl +=
+position.pnl_usd;
+} else {
+positionValue +=
+position.invested_usd *
+(
+1+
+safeNumber(
+position.pnl_percent
+)
+);
+unrealizedPnl +=
+safeNumber(
+position.pnl_usd
  );
  }
 }
@@ -4668,8 +4728,7 @@ const equity =
  positionValue;
 const totalPnl =
  portfolio.realized_pnl_usd +
- unrealizedPnl;
-const returnPercent =
+ unrealizedPnl;const returnPercent =
  STARTING_CASH_USD > 0
  ? totalPnl /
  STARTING_CASH_USD
@@ -4689,8 +4748,7 @@ return {
  round(
  equity,
  8
- ),
- realized_pnl_usd:
+ ), realized_pnl_usd:
  round(
  portfolio.realized_pnl_usd,
  8
@@ -4778,8 +4836,7 @@ history_observations:
 setup_signals:
  candidate.setup_signals,
 liquidity_usd:
- round(
- candidate.liquidity_usd,
+ round( candidate.liquidity_usd,
  2
  ),
 liquidity_raw:
@@ -4799,8 +4856,7 @@ pair_count:
 positive_liquidity_pair_count:
  candidate.positive_liquidity_pair_count,
 zero_liquidity_pair_count:
- candidate.zero_liquidity_pair_count,
-missing_liquidity_pair_count:
+ candidate.zero_liquidity_pair_count,missing_liquidity_pair_count:
  candidate.missing_liquidity_pair_count,
 selected_pair_rank:
  candidate.selected_pair_rank,
@@ -4888,8 +4944,7 @@ entry_reasons:
  candidate.jupiter_confirmation_status
  })
  )
- };
-}
+ };}
 /* ============================================================
  RUN PAPER ENGINE
  ============================================================ */
@@ -4909,8 +4964,7 @@ async function runPaperEngine(
  );
 const buys = [];const sells = [];
 const blockedSells = [];
-let importantStateChanged =
- false;
+let importantStateChanged = false;
 const persistenceReady =
  canPersistNow(
  portfolio
@@ -4998,8 +5052,7 @@ if (
  candidate.risk_pass &&
  candidate.entry_eligible &&
  candidate.setup_confirmed &&
- candidate.history_observations >=
- MIN_HISTORY_OBSERVATIONS &&
+ candidate.history_observations >= MIN_HISTORY_OBSERVATIONS &&
  !isOnCooldown(
  portfolio,
  candidate.mint
@@ -5019,8 +5072,7 @@ if (
  safeNumber(
  a.setup_score
  );
- if (
- setupDifference !== 0
+ if ( setupDifference !== 0
  ){
  return setupDifference;
  }
@@ -5108,8 +5160,7 @@ const portfolioMark =
 const accounting =
  calculateAccountingCheck(
  portfolio
- );
-const diagnostics =
+ );const diagnostics =
  buildRejectionDiagnostics(
  candidates
  );
@@ -5129,8 +5180,7 @@ if (
  buys.length === 0
 ){
  if (
- portfolio.positions.length >=
- MAX_POSITIONS
+ portfolio.positions.length >= MAX_POSITIONS
  ){
  noTradeReason =
  "MAX_POSITIONS_REACHED";
@@ -5218,8 +5268,7 @@ if (hadTrades) {
  try {
  persistence =
  await savePortfolio(
- env,
- portfolio,
+ env, portfolio,
  "IMPORTANT_STATE_CHANGE"
  );
  } catch (error) {
@@ -5239,8 +5288,7 @@ if (hadTrades) {
 ){
  persistence.attempted =
  true;
- try {
- persistence =
+ try { persistence =
  await savePortfolio(
  env,
  portfolio,
@@ -5328,8 +5376,7 @@ persistence,
  scanResult
  };
 }
-/* ============================================================
- TEST SCAN
+/* ============================================================ TEST SCAN
  ============================================================ */
 async function runScanOnly(
  env
@@ -5349,8 +5396,7 @@ async function runScanOnly(
  bot: BOT_NAME,
  mode: {
  type:
- "LIVE_BETA",
- transaction_execution:
+ "LIVE_BETA", transaction_execution:
  TRANSACTION_EXECUTION,
  execution: liveBetaExecutionStatus()
  },
@@ -5438,8 +5484,7 @@ storage: {
  last_persist_at:
  portfolio.last_persist_at ||
  null,
- last_persist_reason:
- portfolio.last_persist_reason ||
+ last_persist_reason: portfolio.last_persist_reason ||
  null,
  min_persist_interval_seconds:
  MIN_PERSIST_INTERVAL_SECONDS,
@@ -5459,8 +5504,7 @@ market_memory: {
  memoryEntries.length,
  max_candidates:
  MAX_MEMORY_CANDIDATES,
- max_observations_per_candidate:
- MAX_MEMORY_OBSERVATIONS,
+ max_observations_per_candidate: MAX_MEMORY_OBSERVATIONS,
  entries:
  memoryEntries.map(
  ([mint, memory]) => ({
@@ -5548,8 +5592,7 @@ async function resetPaper(
  BOT_NAME,
  mode: {
  type:
- "LIVE_BETA",
- transaction_execution:
+ "LIVE_BETA", transaction_execution:
  TRANSACTION_EXECUTION,
  execution: liveBetaExecutionStatus()
  },
@@ -5569,8 +5612,7 @@ async function resetPaper(
 function jsonResponse(
  body,
  status = 200
-){
- return new Response(
+){ return new Response(
  JSON.stringify(
  body,
  null,
@@ -5658,8 +5700,7 @@ if (
  const result =
  await getStatus(
  env
- );
- return jsonResponse(
+ ); return jsonResponse(
  result
  );
 }
@@ -5679,8 +5720,7 @@ if (
  ok: false,
  error:
  "Reset requires ?confirm=RESET"
- },
- 400
+ }, 400
  );
  } const result =
  await resetPaper(
@@ -5768,8 +5808,7 @@ async scheduled(
  equity:
  result.portfolio
  .equity_usd,
- eligible:
- result.scan
+ eligible: result.scan
  .eligible_candidates,
  persistence:
  result.persistence,
@@ -5789,8 +5828,7 @@ async scheduled(
  JSON.stringify({
  cron:
  true,
- bot:
- BOT_NAME,
+ bot: BOT_NAME,
  type:
  "CRON_ERROR",
  error:
@@ -5803,4 +5841,3 @@ async scheduled(
  })()
  );
  }
-};
