@@ -22,6 +22,7 @@ Live execution configuration:
   transaction is not left behind a throttled paper-style save.
 - Existing PAPER portfolio state is NOT reused as live positions.
 - Jupiter price/quote/swap execution remains the live route.
+- Solana legacy and versioned v0 transactions are supported.
 ============================================================
 */
 
@@ -2436,6 +2437,152 @@ function cleanupCooldowns(
 }
 
 /* ============================================================
+SELL REASON
+============================================================ */
+function getSellReason(
+  position,
+  candidate
+) {
+  const entryPrice =
+    safeNumber(
+      position.entry_price_usd
+    );
+
+  const currentPrice =
+    safeNumber(
+      candidate.price_usd
+    );
+
+  if (
+    entryPrice <= 0 ||
+    currentPrice <= 0
+  ) {
+    return null;
+  }
+
+  const pnlRatio =
+    (
+      currentPrice -
+      entryPrice
+    ) /
+    entryPrice;
+
+  if (
+    pnlRatio <=
+    STOP_LOSS
+  ) {
+    return "STOP_LOSS";
+  }
+
+  if (
+    currentPrice >
+    safeNumber(
+      position.peak_price_usd,
+      entryPrice
+    )
+  ) {
+    position.peak_price_usd =
+      currentPrice;
+  }
+
+  if (
+    !position.trailing_active &&
+    currentPrice >=
+      entryPrice *
+        (
+          1 +
+          TRAILING_ACTIVATION
+        )
+  ) {
+    position.trailing_active =
+      true;
+  }
+
+  if (
+    position.trailing_active &&
+    currentPrice <=
+      safeNumber(
+        position.peak_price_usd,
+        currentPrice
+      ) *
+        (
+          1 -
+          TRAILING_STOP
+        )
+  ) {
+    return "TRAILING_STOP";
+  }
+
+  const shortTermRatio =
+    safeNumber(
+      candidate.change_5m
+    );
+
+  const hourlyRatio =
+    safeNumber(
+      candidate.change_1h
+    );
+
+  if (
+    pnlRatio > 0 &&
+    shortTermRatio <=
+      -(
+        1 -
+        1 /
+          SHORT_TERM_SELL_RATIO
+      )
+  ) {
+    position.reversal_confirmations =
+      safeNumber(
+        position.reversal_confirmations
+      ) + 1;
+  } else if (
+    pnlRatio > 0 &&
+    hourlyRatio <=
+      -(
+        1 -
+        1 /
+          HOURLY_SELL_RATIO
+      )
+  ) {
+    position.reversal_confirmations =
+      safeNumber(
+        position.reversal_confirmations
+      ) + 1;
+  } else {
+    position.reversal_confirmations = 0;
+  }
+
+  if (
+    pnlRatio > 0 &&
+    position.reversal_confirmations >=
+      REVERSAL_CONFIRMATIONS_REQUIRED
+  ) {
+    return "REVERSAL";
+  }
+
+  if (
+    pnlRatio >=
+    0.025
+  ) {
+    return "PROFIT_TARGET";
+  }
+
+  if (
+    pnlRatio >=
+      0.01 &&
+    safeNumber(
+      candidate.change_1h
+    ) <=
+      -0.10
+  ) {
+    return "PROFIT_REVERSAL";
+  }
+
+  return null;
+}
+
+/* ============================================================
 BASE58
 ============================================================ */
 const BASE58_ALPHABET =
@@ -2883,6 +3030,41 @@ function readCompactU16(
   };
 }
 
+/*
+============================================================
+SOLANA TRANSACTION SIGNING
+
+Supports:
+- Legacy Solana transactions
+- Versioned transaction format v0
+
+Important:
+The signatures section is identical in structure for both
+formats. The difference is that a versioned message begins
+with a version prefix byte:
+
+  0xxxxxxx = legacy message header
+  1xxxxxxx = versioned message
+
+For v0:
+  message[0] = 0x80 | version
+  message[1] = numRequiredSignatures
+  message[2] = numReadonlySignedAccounts
+  message[3] = numReadonlyUnsignedAccounts
+  message[4...] = account-key shortvec
+
+For legacy:
+  message[0] = numRequiredSignatures
+  message[1] = numReadonlySignedAccounts
+  message[2] = numReadonlyUnsignedAccounts
+  message[3...] = account-key shortvec
+
+We only need the message header/account section to verify
+that the fee payer matches the configured wallet. The
+signature itself is generated over the complete serialized
+message exactly as supplied by Jupiter.
+============================================================
+*/
 async function signSolanaTransaction(
   serializedTransaction,
   walletSecret
@@ -2910,11 +3092,26 @@ async function signSolanaTransaction(
     );
   }
 
+  const signaturesStart =
+    nextOffset;
+
+  const messageStart =
+    signaturesStart +
+    signatureCount *
+      64;
+
+  if (
+    messageStart >=
+    transaction.length
+  ) {
+    throw new Error(
+      "SOLANA_MESSAGE_OFFSET_OUT_OF_RANGE"
+    );
+  }
+
   const message =
     transaction.slice(
-      nextOffset +
-        signatureCount *
-          64
+      messageStart
     );
 
   if (
@@ -2925,8 +3122,83 @@ async function signSolanaTransaction(
     );
   }
 
-  const numRequiredSignatures =
+  /*
+  Detect legacy vs versioned transaction.
+
+  A versioned message has its high bit set. Jupiter commonly
+  returns version 0 transactions, represented by 0x80 here.
+  */
+  const firstMessageByte =
     message[0];
+
+  const isVersioned =
+    (
+      firstMessageByte &
+      0x80
+    ) !== 0;
+
+  let messageHeaderOffset;
+  let accountCountOffset;
+
+  if (
+    isVersioned
+  ) {
+    const version =
+      firstMessageByte &
+      0x7f;
+
+    if (
+      version !== 0
+    ) {
+      throw new Error(
+        `UNSUPPORTED_SOLANA_TRANSACTION_VERSION_${version}`
+      );
+    }
+
+    /*
+    Versioned message layout:
+
+      byte 0:
+        version prefix
+
+      byte 1:
+        numRequiredSignatures
+
+      byte 2:
+        numReadonlySignedAccounts
+
+      byte 3:
+        numReadonlyUnsignedAccounts
+
+      byte 4:
+        account-key shortvec begins
+    */
+    messageHeaderOffset = 1;
+    accountCountOffset = 4;
+  } else {
+    /*
+    Legacy message layout:
+
+      byte 0:
+        numRequiredSignatures
+
+      byte 1:
+        numReadonlySignedAccounts
+
+      byte 2:
+        numReadonlyUnsignedAccounts
+
+      byte 3:
+        account-key shortvec begins
+    */
+    messageHeaderOffset = 0;
+    accountCountOffset = 3;
+  }
+
+  const numRequiredSignatures =
+    message[
+      messageHeaderOffset
+    ];
 
   if (
     numRequiredSignatures !==
@@ -2940,11 +3212,19 @@ async function signSolanaTransaction(
   const accountCountResult =
     readCompactU16(
       message,
-      3
+      accountCountOffset
     );
 
   const accountCount =
     accountCountResult.value;
+
+  if (
+    accountCount < 1
+  ) {
+    throw new Error(
+      "SOLANA_TRANSACTION_HAS_NO_ACCOUNT_KEYS"
+    );
+  }
 
   const accountStart =
     accountCountResult.nextOffset;
@@ -2963,6 +3243,9 @@ async function signSolanaTransaction(
     );
   }
 
+  /*
+  Solana's first account key is the fee payer.
+  */
   const feePayer =
     message.slice(
       accountStart,
@@ -2975,25 +3258,44 @@ async function signSolanaTransaction(
       64
     );
 
-  if (
+  const feePayerBase58 =
     base58Encode(
       feePayer
-    ) !==
+    );
+
+  const configuredWalletBase58 =
     base58Encode(
       walletPublicKey
-    )
+    );
+
+  if (
+    feePayerBase58 !==
+    configuredWalletBase58
   ) {
     throw new Error(
       "TRANSACTION_FEE_PAYER_DOES_NOT_MATCH_CONFIGURED_WALLET"
     );
   }
 
+  /*
+  The WALLET_PRIVATE_KEY is expected to be a standard Solana
+  64-byte secret-key representation:
+
+    bytes 0-31  = Ed25519 private seed
+    bytes 32-63 = public key
+  */
   const privateSeed =
     walletSecret.slice(
       0,
       32
     );
 
+  /*
+  PKCS#8 wrapper for an Ed25519 private key.
+
+  This is compatible with Web Crypto's Ed25519 implementation
+  available in the Cloudflare Worker runtime.
+  */
   const pkcs8Prefix =
     new Uint8Array([
       0x30,
@@ -3042,6 +3344,12 @@ async function signSolanaTransaction(
       ["sign"]
     );
 
+  /*
+  CRITICAL:
+  Ed25519 signs the complete serialized Solana message,
+  starting at messageStart. The version prefix, if present,
+  is part of that message and MUST be included.
+  */
   const signature =
     new Uint8Array(
       await crypto.subtle.sign(
@@ -3059,6 +3367,12 @@ async function signSolanaTransaction(
     );
   }
 
+  /*
+  Preserve the original transaction byte-for-byte and replace
+  only the first signature slot.
+
+  This works for both legacy and v0 transactions.
+  */
   const signed =
     new Uint8Array(
       transaction.length
@@ -3070,7 +3384,7 @@ async function signSolanaTransaction(
 
   signed.set(
     signature,
-    nextOffset
+    signaturesStart
   );
 
   return bytesToBase64(
