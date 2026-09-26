@@ -2,115 +2,76 @@ const BOT_NAME = "memebott";
 
 /*
 ============================================================
-MEMEBOTT — LIVE TRADING
+MEMEBOTT — LEAN LIVE TRADING
 ============================================================
-Live execution configuration:
-- PAPER_MODE is OFF.
-- TRANSACTION_EXECUTION is ON.
-- Scheduled runs can execute live trades automatically.
-- HTTP /run and /reset remain authorization-gated.
-- Maximum live trade remains $2.
-- Maximum live bankroll tracked by this worker remains $20.
-- 0.01 SOL on-chain reserve is preserved.
-- Maximum 7 simultaneous positions.
-- Maximum 1 new buy per scan.
-- Existing scanner, scoring, momentum, liquidity, memory,
-  cooldown, stop-loss, trailing-stop, and reversal logic remain.
-- Live transactions are signed locally with WALLET_PRIVATE_KEY.
-- Live transactions are broadcast through SOLANA_RPC_URL.
-- Successful live trades force KV persistence so a successful
-  transaction is not left behind a throttled paper-style save.
-- Existing PAPER portfolio state is NOT reused as live positions.
-- Jupiter price/quote/swap execution remains the live route.
-- Solana legacy and versioned v0 transactions are supported.
+LIVE ONLY
+
+- Jupiter price / quote / swap execution
+- DexScreener discovery
+- $20 maximum tracked bankroll
+- $2 maximum live trade
+- $10 minimum ledger cash reserve
+- 0.01 SOL on-chain reserve
+- Maximum 7 positions
+- Maximum 1 new buy per run
+- Stop loss / trailing stop / reversal protection
+- Candidate scoring and short-term market memory
+- KV persistence
+- Scheduled automatic execution
+- HTTP /run and /reset require LIVE_EXECUTION_TOKEN
 ============================================================
 */
 
-const PAPER_MODE = false;
+/* ============================================================
+CONFIG
+============================================================ */
+
 const LIVE_BETA_MODE = true;
 const TRANSACTION_EXECUTION = true;
-const PAPER_SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 5;
 
-/* ============================================================
-BASIC SETTINGS
-============================================================ */
 const STARTING_CASH_USD = 20;
 const MIN_CASH_RESERVE_USD = 10;
+const MAX_LIVE_BANKROLL_USD = 20;
+
 const MAX_POSITIONS = 7;
 const MAX_NEW_BUYS_PER_RUN = 1;
-const MAX_PAPER_POSITION_USD = 2;
 const MAX_LIVE_TRADE_USD = 2;
 const COOLDOWN_SECONDS = 60;
 
-/* ============================================================
-LIVE WALLET PROTECTION
-============================================================ */
 const MIN_SOL_RESERVE = 0.01;
-const MAX_LIVE_BANKROLL_USD = 20;
 
-/* ============================================================
-KV PROTECTION
-============================================================ */
 const MIN_PERSIST_INTERVAL_SECONDS = 120;
 const CHECKPOINT_INTERVAL_SECONDS = 300;
 
-/* ============================================================
-CANDIDATE MEMORY
-============================================================ */
 const MAX_MEMORY_CANDIDATES = 12;
 const MAX_MEMORY_OBSERVATIONS = 4;
 const MIN_HISTORY_OBSERVATIONS = 2;
 
-/* ============================================================
-PROGRESSIVE PAPER POSITION SIZING
-============================================================ */
-const POSITION_SIZE_TIERS = [
-  { equity: 0, amount: 2 },
-  { equity: 1000000, amount: 2 }
-];
-
-/* ============================================================
-EXIT PROTECTION
-============================================================ */
 const STOP_LOSS = -0.01;
 const TRAILING_ACTIVATION = 0.01;
 const TRAILING_STOP = 0.03;
 const REVERSAL_CONFIRMATIONS_REQUIRED = 2;
 const PROFIT_REVERSAL_SELL_RATIO = 1.20;
 
-/* ============================================================
-ENTRY SETTINGS
-============================================================ */
 const MIN_ENTRY_SCORE = 45;
 const MIN_MOMENTUM_SCORE = 5;
 const MIN_SETUP_SCORE = 5;
 const MAX_HISTORICAL_SETUP_BONUS = 15;
 
-/* ============================================================
-MARKET FILTERS
-============================================================ */
 const MIN_TOKEN_PRICE = 0.00000001;
 const MIN_LIQUIDITY_USD = 15000;
 const MIN_VOLUME_24H_USD = 10000;
 const MIN_VOLUME_1H_USD = 1000;
 
-/* ============================================================
-CHASE PROTECTION
-============================================================ */
 const MAX_5M_GAIN = 0.15;
 const MAX_1H_GAIN = 0.45;
 const MAX_6H_GAIN = 1.00;
 const MAX_24H_GAIN = 5.00;
 
-/* ============================================================
-NEW TOKEN PROTECTION
-============================================================ */
 const NEW_TOKEN_MAX_AGE_DAYS = 1;
 const NEW_TOKEN_MIN_LIQUIDITY_USD = 25000;
 
-/* ============================================================
-MARKET SHAPE
-============================================================ */
 const EXTREME_1H_MOVE = 0.50;
 const STRONG_NEGATIVE_6H = -0.15;
 const STRONG_NEGATIVE_5M = -0.03;
@@ -118,19 +79,11 @@ const BOUNCE_5M = 0.07;
 const SHORT_TERM_SELL_RATIO = 1.50;
 const HOURLY_SELL_RATIO = 1.43;
 
-/* ============================================================
-SCANNER LIMITS
-============================================================ */
 const MAX_CANDIDATES = 30;
 const MAX_DEX_TOKENS_ANALYZED = 20;
 const MAX_JUPITER_PRICE_CHECKS = 20;
-const MAX_JUPITER_FALLBACK_CHECKS = 2;
 
-/* ============================================================
-API SETTINGS
-============================================================ */
 const DEX_BASE = "https://api.dexscreener.com";
-const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
 const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";
 const JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote";
 const JUPITER_SWAP_API = "https://quote-api.jup.ag/v6/swap";
@@ -138,9 +91,12 @@ const JUPITER_SWAP_API = "https://quote-api.jup.ag/v6/swap";
 const SOL_MINT =
   "So11111111111111111111111111111111111111112";
 
+const PORTFOLIO_KEY = "LIVE_BETA_PORTFOLIO";
+
 /* ============================================================
-UTILITY FUNCTIONS
+UTILITY
 ============================================================ */
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -167,13 +123,10 @@ function errorText(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-function cloneObject(value) {
-  return JSON.parse(JSON.stringify(value));
-}
-
 /* ============================================================
-FETCH HELPERS
+FETCH
 ============================================================ */
+
 async function fetchJson(url, options = {}) {
   const response = await fetch(url, {
     ...options,
@@ -190,7 +143,7 @@ async function fetchJson(url, options = {}) {
   return await response.json();
 }
 
-async function fetchJsonDiagnostic(url, options = {}) {
+async function fetchJsonSafe(url, options = {}) {
   try {
     const response = await fetch(url, {
       ...options,
@@ -200,65 +153,38 @@ async function fetchJsonDiagnostic(url, options = {}) {
       }
     });
 
-    const status = response.status;
-
     if (!response.ok) {
-      let bodyText = "";
-
-      try {
-        bodyText = await response.text();
-      } catch {
-        bodyText = "";
-      }
-
       return {
         ok: false,
-        status,
+        status: response.status,
         data: null,
-        error:
-          `HTTP ${status}` +
-          (bodyText ? `: ${bodyText.slice(0, 500)}` : "")
+        error: `HTTP ${response.status}`
       };
     }
 
-    try {
-      return {
-        ok: true,
-        status,
-        data: await response.json(),
-        error: null
-      };
-    } catch (error) {
-      return {
-        ok: false,
-        status,
-        data: null,
-        error: `INVALID_JSON_RESPONSE: ${errorText(error)}`
-      };
-    }
+    return {
+      ok: true,
+      status: response.status,
+      data: await response.json(),
+      error: null
+    };
   } catch (error) {
     return {
       ok: false,
       status: null,
       data: null,
-      error: `FETCH_EXCEPTION: ${errorText(error)}`
+      error: errorText(error)
     };
   }
-}
-
-function responseShape(value) {
-  if (Array.isArray(value)) return "array";
-  if (value === null) return "null";
-  if (typeof value === "object") return "object";
-  return typeof value;
 }
 
 /* ============================================================
 PORTFOLIO
 ============================================================ */
+
 function createEmptyPortfolio() {
   return {
-    schema_version: PAPER_SCHEMA_VERSION,
+    schema_version: SCHEMA_VERSION,
     mode: "LIVE",
     starting_cash_usd: STARTING_CASH_USD,
     cash_usd: STARTING_CASH_USD,
@@ -275,29 +201,15 @@ function createEmptyPortfolio() {
 }
 
 async function loadPortfolio(env) {
-  const raw =
-    await env.BOT_KV.get(
-      "LIVE_BETA_PORTFOLIO"
-    );
+  const raw = await env.BOT_KV.get(PORTFOLIO_KEY);
 
-  if (!raw) {
-    return createEmptyPortfolio();
-  }
+  if (!raw) return createEmptyPortfolio();
 
   try {
-    const portfolio =
-      JSON.parse(raw);
+    const portfolio = JSON.parse(raw);
 
-    /*
-    The previous schema was paper-oriented.
-
-    A live deployment must never interpret those simulated
-    positions as actual wallet holdings.
-    */
     if (
-      safeNumber(
-        portfolio.schema_version
-      ) !== PAPER_SCHEMA_VERSION ||
+      safeNumber(portfolio.schema_version) !== SCHEMA_VERSION ||
       portfolio.mode !== "LIVE"
     ) {
       return createEmptyPortfolio();
@@ -308,41 +220,23 @@ async function loadPortfolio(env) {
     portfolio.cooldowns ||= {};
     portfolio.market_memory ||= {};
 
-    portfolio.cash_usd =
+    portfolio.cash_usd = clamp(
       safeNumber(
         portfolio.cash_usd,
         STARTING_CASH_USD
-      );
-
-    /*
-    Never allow the internal live ledger to represent more
-    than the configured live bankroll.
-    */
-    portfolio.cash_usd =
-      clamp(
-        portfolio.cash_usd,
-        0,
-        MAX_LIVE_BANKROLL_USD
-      );
+      ),
+      0,
+      MAX_LIVE_BANKROLL_USD
+    );
 
     portfolio.realized_pnl_usd =
-      safeNumber(
-        portfolio.realized_pnl_usd
-      );
+      safeNumber(portfolio.realized_pnl_usd);
 
     portfolio.last_persist_at =
-      safeNumber(
-        portfolio.last_persist_at
-      );
+      safeNumber(portfolio.last_persist_at);
 
-    portfolio.last_persist_reason ||=
-      null;
-
-    delete portfolio.last_scan;
-
-    cleanupMarketMemory(
-      portfolio
-    );
+    cleanupCooldowns(portfolio);
+    cleanupMarketMemory(portfolio);
 
     return portfolio;
   } catch {
@@ -350,48 +244,28 @@ async function loadPortfolio(env) {
   }
 }
 
-/* ============================================================
-PERSISTENCE
-============================================================ */
 function persistenceAgeMs(portfolio) {
-  const last =
-    safeNumber(
-      portfolio.last_persist_at
-    );
-
-  if (!last) return Infinity;
-
-  return Date.now() - last;
-}
-
-function canPersistNow(portfolio) {
-  return (
-    persistenceAgeMs(portfolio) >=
-    MIN_PERSIST_INTERVAL_SECONDS *
-      1000
-  );
+  const last = safeNumber(portfolio.last_persist_at);
+  return last ? Date.now() - last : Infinity;
 }
 
 function checkpointDue(portfolio) {
   return (
     persistenceAgeMs(portfolio) >=
-    CHECKPOINT_INTERVAL_SECONDS *
-      1000
+    CHECKPOINT_INTERVAL_SECONDS * 1000
   );
 }
 
 async function savePortfolio(
   env,
   portfolio,
-  reason = "UNKNOWN",
-  options = {}
+  reason,
+  force = false
 ) {
-  const force =
-    options.force === true;
-
   if (
     !force &&
-    !canPersistNow(portfolio)
+    persistenceAgeMs(portfolio) <
+      MIN_PERSIST_INTERVAL_SECONDS * 1000
   ) {
     return {
       saved: false,
@@ -400,817 +274,216 @@ async function savePortfolio(
     };
   }
 
-  const persistedAt =
-    Date.now();
+  const persistedAt = Date.now();
 
-  const payload =
-    cloneObject(
-      portfolio
-    );
+  const payload = {
+    ...portfolio,
+    mode: "LIVE",
+    updated_at: new Date(persistedAt).toISOString(),
+    last_persist_at: persistedAt,
+    last_persist_reason: reason
+  };
 
   delete payload.last_scan;
 
-  payload.mode = "LIVE";
-
-  payload.updated_at =
-    new Date(
-      persistedAt
-    ).toISOString();
-
-  payload.last_persist_at =
-    persistedAt;
-
-  payload.last_persist_reason =
-    reason;
-
   await env.BOT_KV.put(
-    "LIVE_BETA_PORTFOLIO",
+    PORTFOLIO_KEY,
     JSON.stringify(payload)
   );
 
-  portfolio.updated_at =
-    payload.updated_at;
-
-  portfolio.last_persist_at =
-    persistedAt;
-
-  portfolio.last_persist_reason =
-    reason;
-
-  delete portfolio.last_scan;
+  portfolio.updated_at = payload.updated_at;
+  portfolio.last_persist_at = persistedAt;
+  portfolio.last_persist_reason = reason;
 
   return {
     saved: true,
     throttled: false,
-    reason,
-    time: payload.updated_at
+    reason
   };
 }
 
-/* ============================================================
-HISTORY
-============================================================ */
-function addHistory(
-  portfolio,
-  event
-) {
+function addHistory(portfolio, event) {
   portfolio.history.push({
     time: nowIso(),
     ...event
   });
 
-  if (
-    portfolio.history.length >
-    500
-  ) {
-    portfolio.history =
-      portfolio.history.slice(
-        -500
-      );
+  if (portfolio.history.length > 500) {
+    portfolio.history = portfolio.history.slice(-500);
   }
-}
-
-/* ============================================================
-POSITION SIZE
-============================================================ */
-function getPositionSize(equity) {
-  let amount =
-    POSITION_SIZE_TIERS[0].amount;
-
-  for (
-    const tier of
-    POSITION_SIZE_TIERS
-  ) {
-    if (
-      equity >=
-      tier.equity
-    ) {
-      amount =
-        tier.amount;
-    }
-  }
-
-  return Math.min(
-    amount,
-    MAX_PAPER_POSITION_USD
-  );
-}
-
-/* ============================================================
-DISCOVERY DIAGNOSTICS
-============================================================ */
-function createDiscoveryDiagnostics() {
-  return {
-    dexscreener_profiles: {
-      attempted: true,
-      http_status: null,
-      response_shape: null,
-      total_items: 0,
-      solana_items: 0,
-      extracted_mints: 0,
-      error: null,
-      sample: []
-    },
-
-    dexscreener_boosts: {
-      attempted: true,
-      http_status: null,
-      response_shape: null,
-      total_items: 0,
-      solana_items: 0,
-      extracted_mints: 0,
-      error: null,
-      sample: []
-    },
-
-    dexscreener_top_boosts: {
-      attempted: true,
-      http_status: null,
-      response_shape: null,
-      total_items: 0,
-      solana_items: 0,
-      extracted_mints: 0,
-      error: null,
-      sample: []
-    },
-
-    dexscreener_search: {
-      attempted: 0,
-      queries: {},
-      total_pairs: 0,
-      solana_pairs: 0,
-      extracted_mints: 0,
-      errors: []
-    },
-
-    gecko_trending: {
-      attempted: false,
-      http_status: null,
-      response_shape: null,
-      pool_count: 0,
-      tokens_extracted: 0,
-      error:
-        "SKIPPED_TO_PROTECT_SUBREQUEST_BUDGET",
-      sample: []
-    },
-
-    gecko_top_pools: {
-      attempted: false,
-      http_status: null,
-      response_shape: null,
-      pool_count: 0,
-      tokens_extracted: 0,
-      error:
-        "SKIPPED_TO_PROTECT_SUBREQUEST_BUDGET",
-      sample: []
-    },
-
-    gecko_new_pools: {
-      attempted: false,
-      http_status: null,
-      response_shape: null,
-      pool_count: 0,
-      tokens_extracted: 0,
-      error:
-        "SKIPPED_TO_PROTECT_SUBREQUEST_BUDGET",
-      sample: []
-    }
-  };
-}
-
-function discoveryItemSample(item) {
-  return {
-    chain_id:
-      item?.chainId ||
-      null,
-
-    token_address:
-      item?.tokenAddress ||
-      item?.address ||
-      null,
-
-    symbol:
-      item?.symbol ||
-      item?.baseToken?.symbol ||
-      null,
-
-    name:
-      item?.name ||
-      item?.baseToken?.name ||
-      null
-  };
 }
 
 /* ============================================================
 DEXSCREENER DISCOVERY
 ============================================================ */
+
 async function getDexDiscovery() {
-  const diagnostics =
-    createDiscoveryDiagnostics();
-
   const endpoints = [
-    {
-      key:
-        "dexscreener_profiles",
-
-      url:
-        `${DEX_BASE}/token-profiles/latest/v1`
-    },
-
-    {
-      key:
-        "dexscreener_boosts",
-
-      url:
-        `${DEX_BASE}/token-boosts/latest/v1`
-    },
-
-    {
-      key:
-        "dexscreener_top_boosts",
-
-      url:
-        `${DEX_BASE}/token-boosts/top/v1`
-    }
+    `${DEX_BASE}/token-profiles/latest/v1`,
+    `${DEX_BASE}/token-boosts/latest/v1`,
+    `${DEX_BASE}/token-boosts/top/v1`
   ];
 
   const results = [];
 
-  for (
-    const endpoint of
-    endpoints
-  ) {
-    const result =
-      await fetchJsonDiagnostic(
-        endpoint.url
-      );
+  for (const url of endpoints) {
+    const response = await fetchJsonSafe(url);
 
-    const diagnostic =
-      diagnostics[
-        endpoint.key
-      ];
-
-    diagnostic.http_status =
-      result.status;
-
-    if (!result.ok) {
-      diagnostic.error =
-        result.error;
+    if (!response.ok || !Array.isArray(response.data)) {
       continue;
     }
 
-    diagnostic.response_shape =
-      responseShape(
-        result.data
-      );
-
-    if (
-      !Array.isArray(
-        result.data
-      )
-    ) {
-      diagnostic.error =
-        "EXPECTED_ARRAY_RESPONSE";
-      continue;
-    }
-
-    diagnostic.total_items =
-      result.data.length;
-
-    diagnostic.sample =
-      result.data
-        .slice(0, 5)
-        .map(
-          discoveryItemSample
-        );
-
-    for (
-      const item of
-      result.data
-    ) {
-      const chainId =
-        String(
-          item?.chainId ||
-          ""
-        ).toLowerCase();
-
+    for (const item of response.data) {
       if (
-        chainId !==
+        String(item?.chainId || "").toLowerCase() !==
         "solana"
       ) {
         continue;
       }
 
-      diagnostic.solana_items++;
-
       const mint =
         item?.tokenAddress ||
         item?.address;
 
-      if (!mint) {
-        continue;
-      }
-
-      diagnostic.extracted_mints++;
+      if (!mint) continue;
 
       results.push({
         mint,
         source:
-          endpoint.key ===
-          "dexscreener_top_boosts"
+          url.includes("/top/")
             ? "DEXSCREENER_TOP_BOOSTS"
-            : endpoint.key ===
-              "dexscreener_boosts"
+            : url.includes("/boosts/")
               ? "DEXSCREENER_BOOSTS"
               : "DEXSCREENER"
       });
     }
   }
 
-  return {
-    results:
-      results.slice(
-        0,
-        MAX_CANDIDATES
-      ),
-
-    diagnostics
-  };
+  return results;
 }
 
-/* ============================================================
-DEXSCREENER SEARCH
-============================================================ */
 async function getDexSearch() {
-  const queries = [
-    "SOL",
-    "meme",
-    "pump"
-  ];
-
+  const queries = ["SOL", "meme", "pump"];
+  const pairMap = new Map();
   const results = [];
-  const pairMap =
-    new Map();
 
-  const diagnostics =
-    createDiscoveryDiagnostics()
-      .dexscreener_search;
+  for (const query of queries) {
+    const response = await fetchJsonSafe(
+      `${DEX_BASE}/latest/dex/search?q=${encodeURIComponent(query)}`
+    );
 
-  for (
-    const query of
-    queries
-  ) {
-    diagnostics.attempted++;
+    const pairs = Array.isArray(response.data?.pairs)
+      ? response.data.pairs
+      : [];
 
-    const queryDiagnostic = {
-      attempted: true,
-      http_status: null,
-      response_shape: null,
-      total_pairs: 0,
-      solana_pairs: 0,
-      extracted_mints: 0,
-      error: null,
-      sample: []
-    };
-
-    diagnostics.queries[
-      query
-    ] =
-      queryDiagnostic;
-
-    const result =
-      await fetchJsonDiagnostic(
-        `${DEX_BASE}/latest/dex/search?q=${encodeURIComponent(
-          query
-        )}`
-      );
-
-    queryDiagnostic.http_status =
-      result.status;
-
-    if (!result.ok) {
-      queryDiagnostic.error =
-        result.error;
-
-      diagnostics.errors.push({
-        query,
-        error:
-          result.error
-      });
-
-      continue;
-    }
-
-    queryDiagnostic.response_shape =
-      responseShape(
-        result.data
-      );
-
-    const pairs =
-      Array.isArray(
-        result.data?.pairs
-      )
-        ? result.data.pairs
-        : null;
-
-    if (!pairs) {
-      queryDiagnostic.error =
-        "EXPECTED_OBJECT_WITH_PAIRS_ARRAY";
-
-      diagnostics.errors.push({
-        query,
-        error:
-          queryDiagnostic.error
-      });
-
-      continue;
-    }
-
-    queryDiagnostic.total_pairs =
-      pairs.length;
-
-    diagnostics.total_pairs +=
-      pairs.length;
-
-    queryDiagnostic.sample =
-      pairs
-        .slice(0, 5)
-        .map(
-          pair => ({
-            chain_id:
-              pair?.chainId ||
-              null,
-
-            dex_id:
-              pair?.dexId ||
-              null,
-
-            pair_address:
-              pair?.pairAddress ||
-              null,
-
-            base_symbol:
-              pair?.baseToken
-                ?.symbol ||
-              null,
-
-            base_address:
-              pair?.baseToken
-                ?.address ||
-              null,
-
-            price_usd:
-              pair?.priceUsd ||
-              null,
-
-            liquidity_usd:
-              pair?.liquidity?.usd ??
-              null
-          })
-        );
-
-    for (
-      const pair of
-      pairs
-    ) {
+    for (const pair of pairs) {
       if (
-        String(
-          pair?.chainId ||
-          ""
-        ).toLowerCase() !==
+        String(pair?.chainId || "").toLowerCase() !==
         "solana"
       ) {
         continue;
       }
 
-      queryDiagnostic.solana_pairs++;
-      diagnostics.solana_pairs++;
+      const mint = pair?.baseToken?.address;
+      if (!mint) continue;
 
-      const mint =
-        pair?.baseToken
-          ?.address;
-
-      if (!mint) {
-        continue;
-      }
-
-      queryDiagnostic.extracted_mints++;
-      diagnostics.extracted_mints++;
-
-      const existing =
-        pairMap.get(
-          mint
-        );
+      const existing = pairMap.get(mint);
 
       if (!existing) {
-        pairMap.set(
-          mint,
-          pair
-        );
+        pairMap.set(mint, pair);
       } else {
-        const existingLiquidity =
-          safeNumber(
-            existing
-              ?.liquidity
-              ?.usd
-          );
+        const oldLiquidity =
+          safeNumber(existing?.liquidity?.usd);
 
-        const currentLiquidity =
-          safeNumber(
-            pair
-              ?.liquidity
-              ?.usd
-          );
+        const newLiquidity =
+          safeNumber(pair?.liquidity?.usd);
 
-        const existingVolume =
-          safeNumber(
-            existing
-              ?.volume
-              ?.h24
-          );
+        const oldVolume =
+          safeNumber(existing?.volume?.h24);
 
-        const currentVolume =
-          safeNumber(
-            pair
-              ?.volume
-              ?.h24
-          );
+        const newVolume =
+          safeNumber(pair?.volume?.h24);
 
         if (
-          currentLiquidity >
-            existingLiquidity ||
+          newLiquidity > oldLiquidity ||
           (
-            currentLiquidity ===
-              existingLiquidity &&
-            currentVolume >
-              existingVolume
+            newLiquidity === oldLiquidity &&
+            newVolume > oldVolume
           )
         ) {
-          pairMap.set(
-            mint,
-            pair
-          );
+          pairMap.set(mint, pair);
         }
       }
 
       results.push({
         mint,
-        source:
-          "DEXSCREENER_SEARCH"
+        source: "DEXSCREENER_SEARCH"
       });
     }
   }
 
   return {
-    results:
-      results.slice(
-        0,
-        MAX_CANDIDATES
-      ),
-
-    pairMap,
-    diagnostics
-  };
-}
-
-/* ============================================================
-DEX PAIR SUMMARY
-============================================================ */
-function summarizeDexPair(
-  pair,
-  index
-) {
-  const hasLiquidityField =
-    !!(
-      pair &&
-      pair.liquidity &&
-      Object.prototype.hasOwnProperty.call(
-        pair.liquidity,
-        "usd"
-      )
-    );
-
-  const rawLiquidity =
-    hasLiquidityField
-      ? pair.liquidity.usd
-      : null;
-
-  return {
-    rank:
-      index + 1,
-
-    pair_address:
-      pair?.pairAddress ||
-      null,
-
-    dex_id:
-      pair?.dexId ||
-      null,
-
-    url:
-      pair?.url ||
-      null,
-
-    base_symbol:
-      pair?.baseToken?.symbol ||
-      null,
-
-    quote_symbol:
-      pair?.quoteToken?.symbol ||
-      null,
-
-    liquidity_field_present:
-      hasLiquidityField,
-
-    liquidity_raw:
-      rawLiquidity,
-
-    liquidity_usd:
-      hasLiquidityField
-        ? safeNumber(
-            rawLiquidity
-          )
-        : null,
-
-    volume_24h_raw:
-      pair?.volume?.h24 ??
-      null,
-
-    volume_1h_raw:
-      pair?.volume?.h1 ??
-      null,
-
-    price_usd_raw:
-      pair?.priceUsd ??
-      null,
-
-    pair_created_at:
-      pair?.pairCreatedAt ??
-      null
+    results,
+    pairMap
   };
 }
 
 /* ============================================================
 DEX HYDRATION
 ============================================================ */
-async function hydrateDexPairs(
-  mints
-) {
-  const uniqueMints =
-    unique(mints)
-      .slice(
-        0,
-        MAX_DEX_TOKENS_ANALYZED
-      );
 
-  const diagnostics = {
-    attempted:
-      uniqueMints.length,
+async function hydrateDexPairs(mints) {
+  const targets = unique(mints).slice(
+    0,
+    MAX_DEX_TOKENS_ANALYZED
+  );
 
-    successful: 0,
-    failed: 0,
-    empty: 0,
+  const hydrated = new Map();
 
-    errors: [],
-    samples: []
-  };
+  for (const mint of targets) {
+    const response = await fetchJsonSafe(
+      `${DEX_BASE}/latest/dex/tokens/${encodeURIComponent(mint)}`
+    );
 
-  const hydrated =
-    new Map();
+    if (!response.ok) continue;
 
-  for (
-    const mint of
-    uniqueMints
-  ) {
-    try {
-      const result =
-        await fetchJsonDiagnostic(
-          `${DEX_BASE}/latest/dex/tokens/${encodeURIComponent(
-            mint
-          )}`
-        );
-
-      if (!result.ok) {
-        diagnostics.failed++;
-
-        diagnostics.errors.push({
-          mint,
-          error:
-            result.error
-        });
-
-        continue;
-      }
-
-      const pairs =
-        Array.isArray(
-          result.data?.pairs
-        )
-          ? result.data.pairs
-          : [];
-
-      if (!pairs.length) {
-        diagnostics.empty++;
-        continue;
-      }
-
-      const solanaPairs =
-        pairs.filter(
+    const pairs = Array.isArray(response.data?.pairs)
+      ? response.data.pairs.filter(
           pair =>
-            String(
-              pair?.chainId ||
-              ""
-            ).toLowerCase() ===
+            String(pair?.chainId || "").toLowerCase() ===
             "solana"
-        );
+        )
+      : [];
 
-      if (!solanaPairs.length) {
-        diagnostics.empty++;
-        continue;
+    if (!pairs.length) continue;
+
+    pairs.sort((a, b) => {
+      const liquidityDifference =
+        safeNumber(b?.liquidity?.usd) -
+        safeNumber(a?.liquidity?.usd);
+
+      if (liquidityDifference !== 0) {
+        return liquidityDifference;
       }
 
-      solanaPairs.sort(
-        (a, b) => {
-          const liquidityA =
-            safeNumber(
-              a?.liquidity?.usd
-            );
-
-          const liquidityB =
-            safeNumber(
-              b?.liquidity?.usd
-            );
-
-          if (
-            liquidityB !==
-            liquidityA
-          ) {
-            return (
-              liquidityB -
-              liquidityA
-            );
-          }
-
-          return (
-            safeNumber(
-              b?.volume?.h24
-            ) -
-            safeNumber(
-              a?.volume?.h24
-            )
-          );
-        }
+      return (
+        safeNumber(b?.volume?.h24) -
+        safeNumber(a?.volume?.h24)
       );
+    });
 
-      const best =
-        solanaPairs[0];
-
-      hydrated.set(
-        mint,
-        best
-      );
-
-      diagnostics.successful++;
-
-      if (
-        diagnostics.samples.length <
-        10
-      ) {
-        diagnostics.samples.push({
-          mint,
-          ...summarizeDexPair(
-            best,
-            0
-          )
-        });
-      }
-    } catch (error) {
-      diagnostics.failed++;
-
-      diagnostics.errors.push({
-        mint,
-        error:
-          errorText(error)
-      });
-    }
+    hydrated.set(mint, pairs[0]);
   }
 
-  return {
-    hydrated,
-    diagnostics
-  };
+  return hydrated;
 }
 
 /* ============================================================
-JUPITER PRICE HELPERS
+JUPITER PRICES
 ============================================================ */
-function extractJupiterPrice(
-  data,
-  mint
-) {
-  if (!data) {
-    return null;
-  }
+
+function extractJupiterPrice(data, mint) {
+  if (!data) return null;
 
   const direct =
     data?.data?.[mint] ||
@@ -1219,69 +492,42 @@ function extractJupiterPrice(
 
   if (
     direct &&
-    typeof direct ===
-      "object" &&
+    typeof direct === "object" &&
     !Array.isArray(direct)
   ) {
-    const candidates = [
+    for (const value of [
       direct.usdPrice,
       direct.usd_price,
       direct.price,
       direct.priceUsd,
       direct.price_usd
-    ];
+    ]) {
+      const price = Number(value);
 
-    for (
-      const value of
-      candidates
-    ) {
-      const number =
-        Number(value);
-
-      if (
-        Number.isFinite(
-          number
-        ) &&
-        number > 0
-      ) {
-        return number;
+      if (Number.isFinite(price) && price > 0) {
+        return price;
       }
     }
   }
 
-  if (
-    Array.isArray(
-      data?.data
-    )
-  ) {
-    for (
-      const item of
-      data.data
-    ) {
+  if (Array.isArray(data?.data)) {
+    for (const item of data.data) {
       const address =
         item?.id ||
         item?.mint ||
         item?.address;
 
-      if (
-        address === mint
-      ) {
-        const number =
-          Number(
-            item?.usdPrice ??
-            item?.usd_price ??
-            item?.price ??
-            item?.priceUsd
-          );
+      if (address !== mint) continue;
 
-        if (
-          Number.isFinite(
-            number
-          ) &&
-          number > 0
-        ) {
-          return number;
-        }
+      const price = Number(
+        item?.usdPrice ??
+        item?.usd_price ??
+        item?.price ??
+        item?.priceUsd
+      );
+
+      if (Number.isFinite(price) && price > 0) {
+        return price;
       }
     }
   }
@@ -1289,403 +535,158 @@ function extractJupiterPrice(
   return null;
 }
 
-async function getJupiterPrices(
-  mints
-) {
-  const uniqueMints =
-    unique(mints)
-      .slice(
-        0,
-        MAX_JUPITER_PRICE_CHECKS
-      );
+async function getJupiterPrices(mints) {
+  const targets = unique(mints).slice(
+    0,
+    MAX_JUPITER_PRICE_CHECKS
+  );
+
+  if (!targets.length) {
+    return {};
+  }
+
+  const response = await fetchJsonSafe(
+    `${JUPITER_PRICE_API}?ids=${encodeURIComponent(
+      targets.join(",")
+    )}`
+  );
+
+  if (!response.ok) {
+    return {};
+  }
 
   const prices = {};
 
-  const diagnostics = {
-    attempted:
-      uniqueMints.length,
-
-    http_status: null,
-    response_shape: null,
-    returned_keys: 0,
-    usable_prices: 0,
-    invalid_response: false,
-    batch_error: null,
-
-    fallback_attempted: 0,
-    fallback_successful: 0,
-    fallback_errors: []
-  };
-
-  if (
-    !uniqueMints.length
-  ) {
-    return {
-      prices,
-      diagnostics
-    };
-  }
-
-  const url =
-    `${JUPITER_PRICE_API}?ids=${encodeURIComponent(
-      uniqueMints.join(",")
-    )}`;
-
-  const batch =
-    await fetchJsonDiagnostic(
-      url
+  for (const mint of targets) {
+    const price = extractJupiterPrice(
+      response.data,
+      mint
     );
 
-  diagnostics.http_status =
-    batch.status;
-
-  if (batch.ok) {
-    diagnostics.response_shape =
-      responseShape(
-        batch.data
-      );
-
-    const dataObject =
-      batch.data?.data &&
-      typeof batch.data.data ===
-        "object"
-        ? batch.data.data
-        : batch.data &&
-          typeof batch.data ===
-            "object"
-          ? batch.data
-          : null;
-
-    if (
-      dataObject &&
-      typeof dataObject ===
-        "object" &&
-      !Array.isArray(
-        dataObject
-      )
-    ) {
-      diagnostics.returned_keys =
-        Object.keys(
-          dataObject
-        ).length;
-    }
-
-    for (
-      const mint of
-      uniqueMints
-    ) {
-      const price =
-        extractJupiterPrice(
-          batch.data,
-          mint
-        );
-
-      if (
-        Number.isFinite(
-          price
-        ) &&
-        price > 0
-      ) {
-        prices[mint] =
-          price;
-
-        diagnostics.usable_prices++;
-      }
-    }
-
-    if (
-      diagnostics.usable_prices ===
-      0
-    ) {
-      diagnostics.invalid_response =
-        true;
-
-      diagnostics.batch_error =
-        "HTTP_200_BUT_ZERO_USABLE_PRICES";
-    }
-  } else {
-    diagnostics.batch_error =
-      batch.error;
-  }
-
-  const fallbackMints =
-    uniqueMints
-      .filter(
-        mint =>
-          !prices[mint]
-      )
-      .slice(
-        0,
-        MAX_JUPITER_FALLBACK_CHECKS
-      );
-
-  for (
-    const mint of
-    fallbackMints
-  ) {
-    diagnostics.fallback_attempted++;
-
-    try {
-      const result =
-        await fetchJsonDiagnostic(
-          `${JUPITER_PRICE_API}?ids=${encodeURIComponent(
-            mint
-          )}`
-        );
-
-      if (!result.ok) {
-        diagnostics.fallback_errors.push({
-          mint,
-          error:
-            result.error
-        });
-
-        continue;
-      }
-
-      const price =
-        extractJupiterPrice(
-          result.data,
-          mint
-        );
-
-      if (
-        Number.isFinite(
-          price
-        ) &&
-        price > 0
-      ) {
-        prices[mint] =
-          price;
-
-        diagnostics.fallback_successful++;
-      } else {
-        diagnostics.fallback_errors.push({
-          mint,
-          error:
-            "ZERO_USABLE_PRICE"
-        });
-      }
-    } catch (error) {
-      diagnostics.fallback_errors.push({
-        mint,
-        error:
-          errorText(error)
-      });
+    if (Number.isFinite(price) && price > 0) {
+      prices[mint] = price;
     }
   }
 
-  return {
-    prices,
-    diagnostics
-  };
+  return prices;
 }
 
 /* ============================================================
-PAIR NORMALIZATION
+CANDIDATE NORMALIZATION
 ============================================================ */
+
 function normalizeCandidate(
   mint,
-  dexPair,
+  pair,
   jupiterPrice,
   source
 ) {
-  const hasDexLiquidity =
-    !!(
-      dexPair?.liquidity &&
-      Object.prototype.hasOwnProperty.call(
-        dexPair.liquidity,
-        "usd"
-      )
+  const liquidityAvailable =
+    pair?.liquidity &&
+    Object.prototype.hasOwnProperty.call(
+      pair.liquidity,
+      "usd"
     );
 
-  const dexLiquidity =
-    hasDexLiquidity
-      ? safeNumber(
-          dexPair.liquidity.usd
-        )
-      : 0;
+  const volume24Available =
+    Number.isFinite(Number(pair?.volume?.h24));
 
-  const hasVolume24h =
-    Number.isFinite(
-      Number(
-        dexPair?.volume?.h24
-      )
-    );
+  const volume1Available =
+    Number.isFinite(Number(pair?.volume?.h1));
 
-  const hasVolume1h =
-    Number.isFinite(
-      Number(
-        dexPair?.volume?.h1
-      )
-    );
+  const dexPrice =
+    safeNumber(pair?.priceUsd);
 
   const price =
-    safeNumber(
-      dexPair?.priceUsd,
-      0
-    ) ||
-    safeNumber(
-      jupiterPrice,
-      0
-    );
+    dexPrice ||
+    safeNumber(jupiterPrice);
 
-  const liquidity =
-    dexLiquidity;
-
-  const volume24h =
-    hasVolume24h
-      ? safeNumber(
-          dexPair.volume.h24
-        )
-      : 0;
-
-  const volume1h =
-    hasVolume1h
-      ? safeNumber(
-          dexPair.volume.h1
-        )
-      : 0;
-
-  const changes =
-    dexPair?.priceChange ||
-    {};
+  const changes = pair?.priceChange || {};
 
   const change5m =
-    Number.isFinite(
-      Number(changes.m5)
-    )
-      ? Number(changes.m5) /
-        100
+    Number.isFinite(Number(changes.m5))
+      ? Number(changes.m5) / 100
       : 0;
 
   const change1h =
-    Number.isFinite(
-      Number(changes.h1)
-    )
-      ? Number(changes.h1) /
-        100
+    Number.isFinite(Number(changes.h1))
+      ? Number(changes.h1) / 100
       : 0;
 
   const change6h =
-    Number.isFinite(
-      Number(changes.h6)
-    )
-      ? Number(changes.h6) /
-        100
+    Number.isFinite(Number(changes.h6))
+      ? Number(changes.h6) / 100
       : 0;
 
   const change24h =
-    Number.isFinite(
-      Number(changes.h24)
-    )
-      ? Number(changes.h24) /
-        100
+    Number.isFinite(Number(changes.h24))
+      ? Number(changes.h24) / 100
       : 0;
 
   const pairCreatedAt =
-    safeNumber(
-      dexPair?.pairCreatedAt,
-      0
-    );
+    safeNumber(pair?.pairCreatedAt);
 
   const ageDays =
     pairCreatedAt > 0
       ? Math.max(
           0,
-          (
-            Date.now() -
-            pairCreatedAt
-          ) /
-            86400000
+          (Date.now() - pairCreatedAt) / 86400000
         )
       : null;
 
   return {
     mint,
-
-    symbol:
-      dexPair?.baseToken?.symbol ||
-      null,
-
-    name:
-      dexPair?.baseToken?.name ||
-      null,
-
+    symbol: pair?.baseToken?.symbol || null,
+    name: pair?.baseToken?.name || null,
     source,
+    dex_id: pair?.dexId || null,
+    pair_address: pair?.pairAddress || null,
+    pair_url: pair?.url || null,
 
-    dex_id:
-      dexPair?.dexId ||
-      null,
-
-    pair_address:
-      dexPair?.pairAddress ||
-      null,
-
-    pair_url:
-      dexPair?.url ||
-      null,
-
-    price_usd:
-      price,
+    price_usd: price,
 
     liquidity_usd:
-      liquidity,
+      liquidityAvailable
+        ? safeNumber(pair.liquidity.usd)
+        : 0,
 
     liquidity_data_available:
-      hasDexLiquidity,
+      !!liquidityAvailable,
 
     volume_24h_usd:
-      volume24h,
+      volume24Available
+        ? safeNumber(pair.volume.h24)
+        : 0,
 
     volume_24h_data_available:
-      hasVolume24h,
+      !!volume24Available,
 
     volume_1h_usd:
-      volume1h,
+      volume1Available
+        ? safeNumber(pair.volume.h1)
+        : 0,
 
     volume_1h_data_available:
-      hasVolume1h,
+      !!volume1Available,
 
-    change_5m:
-      change5m,
-
-    change_1h:
-      change1h,
-
-    change_6h:
-      change6h,
-
-    change_24h:
-      change24h,
+    change_5m: change5m,
+    change_1h: change1h,
+    change_6h: change6h,
+    change_24h: change24h,
 
     pair_created_at:
-      pairCreatedAt ||
-      null,
+      pairCreatedAt || null,
 
-    age_days:
-      ageDays,
+    age_days: ageDays,
 
     quote_symbol:
-      dexPair?.quoteToken?.symbol ||
-      null,
+      pair?.quoteToken?.symbol || null,
 
     jupiter_price_usd:
-      safeNumber(
-        jupiterPrice,
-        0
-      ) || null,
-
-    liquidity_source:
-      hasDexLiquidity
-        ? "DEXSCREENER"
-        : "NONE",
+      safeNumber(jupiterPrice) || null,
 
     price_source:
-      safeNumber(
-        dexPair?.priceUsd,
-        0
-      ) > 0
+      dexPrice > 0
         ? "DEXSCREENER"
         : jupiterPrice > 0
           ? "JUPITER"
@@ -1696,73 +697,38 @@ function normalizeCandidate(
 /* ============================================================
 MARKET MEMORY
 ============================================================ */
-function cleanupMarketMemory(
-  portfolio
-) {
-  const memory =
-    portfolio.market_memory ||
-    {};
 
+function cleanupMarketMemory(portfolio) {
+  const memory = portfolio.market_memory || {};
   const cutoff =
-    Date.now() -
-    24 *
-      60 *
-      60 *
-      1000;
+    Date.now() - 24 * 60 * 60 * 1000;
 
-  for (
-    const [mint, entry] of
-    Object.entries(memory)
-  ) {
+  for (const [mint, entry] of Object.entries(memory)) {
     if (
       !entry ||
-      safeNumber(
-        entry.last_seen_at
-      ) < cutoff
+      safeNumber(entry.last_seen_at) < cutoff
     ) {
       delete memory[mint];
       continue;
     }
 
     entry.observations =
-      Array.isArray(
-        entry.observations
-      )
-        ? entry.observations
-        : [];
-
-    if (
-      entry.observations.length >
-      MAX_MEMORY_OBSERVATIONS
-    ) {
-      entry.observations =
-        entry.observations.slice(
-          -MAX_MEMORY_OBSERVATIONS
-        );
-    }
-  }
-
-  const entries =
-    Object.entries(
-      memory
-    )
-      .sort(
-        (a, b) =>
-          safeNumber(
-            b[1]?.last_seen_at
-          ) -
-          safeNumber(
-            a[1]?.last_seen_at
+      Array.isArray(entry.observations)
+        ? entry.observations.slice(
+            -MAX_MEMORY_OBSERVATIONS
           )
-      )
-      .slice(
-        0,
-        MAX_MEMORY_CANDIDATES
-      );
+        : [];
+  }
 
   portfolio.market_memory =
     Object.fromEntries(
-      entries
+      Object.entries(memory)
+        .sort(
+          (a, b) =>
+            safeNumber(b[1]?.last_seen_at) -
+            safeNumber(a[1]?.last_seen_at)
+        )
+        .slice(0, MAX_MEMORY_CANDIDATES)
     );
 }
 
@@ -1770,103 +736,45 @@ function recordMarketObservation(
   portfolio,
   candidate
 ) {
-  if (!candidate?.mint) {
-    return;
-  }
-
-  const mint =
-    candidate.mint;
+  if (!candidate?.mint) return;
 
   const existing =
-    portfolio.market_memory[
-      mint
-    ] || {
-      mint,
-      symbol:
-        candidate.symbol ||
-        null,
-      name:
-        candidate.name ||
-        null,
+    portfolio.market_memory[candidate.mint] || {
+      mint: candidate.mint,
+      symbol: candidate.symbol || null,
+      name: candidate.name || null,
       observations: []
     };
 
   existing.symbol =
-    candidate.symbol ||
-    existing.symbol ||
-    null;
+    candidate.symbol || existing.symbol || null;
 
   existing.name =
-    candidate.name ||
-    existing.name ||
-    null;
+    candidate.name || existing.name || null;
 
-  existing.last_seen_at =
-    Date.now();
+  existing.last_seen_at = Date.now();
 
   existing.observations.push({
-    time:
-      Date.now(),
-
-    price_usd:
-      safeNumber(
-        candidate.price_usd
-      ),
-
-    liquidity_usd:
-      safeNumber(
-        candidate.liquidity_usd
-      ),
-
-    volume_1h_usd:
-      safeNumber(
-        candidate.volume_1h_usd
-      ),
-
-    volume_24h_usd:
-      safeNumber(
-        candidate.volume_24h_usd
-      ),
-
-    change_5m:
-      safeNumber(
-        candidate.change_5m
-      ),
-
-    change_1h:
-      safeNumber(
-        candidate.change_1h
-      ),
-
-    change_6h:
-      safeNumber(
-        candidate.change_6h
-      ),
-
-    change_24h:
-      safeNumber(
-        candidate.change_24h
-      )
+    time: Date.now(),
+    price_usd: safeNumber(candidate.price_usd),
+    liquidity_usd: safeNumber(candidate.liquidity_usd),
+    volume_1h_usd: safeNumber(candidate.volume_1h_usd),
+    volume_24h_usd: safeNumber(candidate.volume_24h_usd),
+    change_5m: safeNumber(candidate.change_5m),
+    change_1h: safeNumber(candidate.change_1h),
+    change_6h: safeNumber(candidate.change_6h),
+    change_24h: safeNumber(candidate.change_24h)
   });
 
-  if (
-    existing.observations.length >
-    MAX_MEMORY_OBSERVATIONS
-  ) {
-    existing.observations =
-      existing.observations.slice(
-        -MAX_MEMORY_OBSERVATIONS
-      );
-  }
+  existing.observations =
+    existing.observations.slice(
+      -MAX_MEMORY_OBSERVATIONS
+    );
 
-  portfolio.market_memory[
-    mint
-  ] =
+  portfolio.market_memory[candidate.mint] =
     existing;
 
-  cleanupMarketMemory(
-    portfolio
-  );
+  cleanupMarketMemory(portfolio);
 }
 
 function getHistoricalSetupBonus(
@@ -1874,18 +782,10 @@ function getHistoricalSetupBonus(
   candidate
 ) {
   const memory =
-    portfolio.market_memory?.[
-      candidate.mint
-    ];
-
-  if (!memory) {
-    return 0;
-  }
+    portfolio.market_memory?.[candidate.mint];
 
   const observations =
-    Array.isArray(
-      memory.observations
-    )
+    Array.isArray(memory?.observations)
       ? memory.observations
       : [];
 
@@ -1896,55 +796,35 @@ function getHistoricalSetupBonus(
     return 0;
   }
 
+  const previous =
+    observations[observations.length - 1];
+
   let bonus = 0;
 
-  const previous =
-    observations[
-      observations.length - 1
-    ];
+  const oldPrice =
+    safeNumber(previous.price_usd);
 
-  if (
-    safeNumber(
-      previous.price_usd
-    ) > 0 &&
-    safeNumber(
-      candidate.price_usd
-    ) > 0
-  ) {
+  const currentPrice =
+    safeNumber(candidate.price_usd);
+
+  if (oldPrice > 0 && currentPrice > 0) {
     const delta =
-      (
-        candidate.price_usd -
-        previous.price_usd
-      ) /
-      previous.price_usd;
+      (currentPrice - oldPrice) / oldPrice;
 
-    if (delta > 0) {
-      bonus += 5;
-    }
-
-    if (delta >= 0.01) {
-      bonus += 3;
-    }
+    if (delta > 0) bonus += 5;
+    if (delta >= 0.01) bonus += 3;
   }
 
   if (
-    safeNumber(
-      candidate.volume_1h_usd
-    ) >
-    safeNumber(
-      previous.volume_1h_usd
-    )
+    safeNumber(candidate.volume_1h_usd) >
+    safeNumber(previous.volume_1h_usd)
   ) {
     bonus += 3;
   }
 
   if (
-    safeNumber(
-      candidate.liquidity_usd
-    ) >
-    safeNumber(
-      previous.liquidity_usd
-    )
+    safeNumber(candidate.liquidity_usd) >
+    safeNumber(previous.liquidity_usd)
   ) {
     bonus += 2;
   }
@@ -1959,155 +839,72 @@ function getHistoricalSetupBonus(
 /* ============================================================
 SCORING
 ============================================================ */
+
 function scoreCandidate(
   portfolio,
   candidate
 ) {
   const liquidity =
-    safeNumber(
-      candidate.liquidity_usd
-    );
+    safeNumber(candidate.liquidity_usd);
 
   const volume24h =
-    safeNumber(
-      candidate.volume_24h_usd
-    );
+    safeNumber(candidate.volume_24h_usd);
 
   const volume1h =
-    safeNumber(
-      candidate.volume_1h_usd
-    );
+    safeNumber(candidate.volume_1h_usd);
 
   const change5m =
-    safeNumber(
-      candidate.change_5m
-    );
+    safeNumber(candidate.change_5m);
 
   const change1h =
-    safeNumber(
-      candidate.change_1h
-    );
+    safeNumber(candidate.change_1h);
 
   const change6h =
-    safeNumber(
-      candidate.change_6h
-    );
+    safeNumber(candidate.change_6h);
 
   const change24h =
-    safeNumber(
-      candidate.change_24h
-    );
+    safeNumber(candidate.change_24h);
 
-  let momentumScore = 0;
-  let setupScore = 0;
-  let riskPenalty = 0;
+  let momentum = 0;
+  let setup = 0;
+  let risk = 0;
 
-  if (change5m > 0) {
-    momentumScore += 4;
-  }
+  if (change5m > 0) momentum += 4;
+  if (change5m >= 0.02) momentum += 3;
+  if (change1h > 0) momentum += 3;
+  if (change1h >= 0.05) momentum += 3;
+  if (change6h > 0) momentum += 2;
 
-  if (change5m >= 0.02) {
-    momentumScore += 3;
-  }
-
-  if (change1h > 0) {
-    momentumScore += 3;
-  }
-
-  if (change1h >= 0.05) {
-    momentumScore += 3;
-  }
-
-  if (change6h > 0) {
-    momentumScore += 2;
-  }
-
-  if (
-    volume1h >=
-    MIN_VOLUME_1H_USD
-  ) {
-    setupScore += 5;
-  }
-
-  if (
-    volume24h >=
-    MIN_VOLUME_24H_USD
-  ) {
-    setupScore += 5;
-  }
+  if (volume1h >= MIN_VOLUME_1H_USD) setup += 5;
+  if (volume24h >= MIN_VOLUME_24H_USD) setup += 5;
+  if (liquidity >= MIN_LIQUIDITY_USD) setup += 8;
 
   if (
     liquidity >=
-    MIN_LIQUIDITY_USD
+    2 * MIN_LIQUIDITY_USD
   ) {
-    setupScore += 8;
+    setup += 3;
   }
 
   if (
-    liquidity >=
-    2 *
-      MIN_LIQUIDITY_USD
+    change6h <= STRONG_NEGATIVE_6H &&
+    change5m >= BOUNCE_5M
   ) {
-    setupScore += 3;
+    setup += 6;
   }
 
-  if (
-    change6h <=
-      STRONG_NEGATIVE_6H &&
-    change5m >=
-      BOUNCE_5M
-  ) {
-    setupScore += 6;
-  }
-
-  if (
-    change5m <=
-    STRONG_NEGATIVE_5M
-  ) {
-    riskPenalty += 8;
-  }
-
-  if (
-    change1h >=
-    EXTREME_1H_MOVE
-  ) {
-    riskPenalty += 10;
-  }
-
-  if (
-    change5m >
-    MAX_5M_GAIN
-  ) {
-    riskPenalty += 10;
-  }
-
-  if (
-    change1h >
-    MAX_1H_GAIN
-  ) {
-    riskPenalty += 10;
-  }
-
-  if (
-    change6h >
-    MAX_6H_GAIN
-  ) {
-    riskPenalty += 8;
-  }
-
-  if (
-    change24h >
-    MAX_24H_GAIN
-  ) {
-    riskPenalty += 8;
-  }
+  if (change5m <= STRONG_NEGATIVE_5M) risk += 8;
+  if (change1h >= EXTREME_1H_MOVE) risk += 10;
+  if (change5m > MAX_5M_GAIN) risk += 10;
+  if (change1h > MAX_1H_GAIN) risk += 10;
+  if (change6h > MAX_6H_GAIN) risk += 8;
+  if (change24h > MAX_24H_GAIN) risk += 8;
 
   let newTokenPenalty = 0;
 
   if (
     candidate.age_days !== null &&
-    candidate.age_days <=
-      NEW_TOKEN_MAX_AGE_DAYS
+    candidate.age_days <= NEW_TOKEN_MAX_AGE_DAYS
   ) {
     if (
       liquidity <
@@ -2115,65 +912,41 @@ function scoreCandidate(
     ) {
       newTokenPenalty += 20;
     } else {
-      setupScore += 5;
+      setup += 5;
     }
   }
 
-  const historicalBonus =
+  const historical =
     getHistoricalSetupBonus(
       portfolio,
       candidate
     );
 
-  const score =
-    momentumScore +
-    setupScore +
-    historicalBonus -
-    riskPenalty -
-    newTokenPenalty;
-
   return {
-    score:
-      round(
-        score,
-        2
-      ),
-
-    momentum_score:
-      round(
-        momentumScore,
-        2
-      ),
-
-    setup_score:
-      round(
-        setupScore,
-        2
-      ),
-
-    historical_bonus:
-      round(
-        historicalBonus,
-        2
-      ),
-
-    risk_penalty:
-      round(
-        riskPenalty,
-        2
-      ),
-
-    new_token_penalty:
-      round(
+    score: round(
+      momentum +
+        setup +
+        historical -
+        risk -
         newTokenPenalty,
-        2
-      )
+      2
+    ),
+
+    momentum_score: round(momentum, 2),
+    setup_score: round(setup, 2),
+    historical_bonus: round(historical, 2),
+    risk_penalty: round(risk, 2),
+    new_token_penalty: round(
+      newTokenPenalty,
+      2
+    )
   };
 }
 
 /* ============================================================
 FILTERS
 ============================================================ */
+
 function evaluateCandidate(
   portfolio,
   candidate
@@ -2181,158 +954,95 @@ function evaluateCandidate(
   const reasons = [];
 
   if (!candidate?.mint) {
-    reasons.push(
-      "MISSING_MINT"
-    );
+    reasons.push("MISSING_MINT");
   }
 
   if (
-    safeNumber(
-      candidate.price_usd
-    ) <
+    safeNumber(candidate.price_usd) <
     MIN_TOKEN_PRICE
   ) {
-    reasons.push(
-      "PRICE_TOO_LOW"
-    );
+    reasons.push("PRICE_TOO_LOW");
   }
 
-  if (
-    !candidate.liquidity_data_available
-  ) {
-    reasons.push(
-      "LIQUIDITY_DATA_UNAVAILABLE"
-    );
+  if (!candidate.liquidity_data_available) {
+    reasons.push("LIQUIDITY_DATA_UNAVAILABLE");
   } else if (
-    safeNumber(
-      candidate.liquidity_usd
-    ) <
+    safeNumber(candidate.liquidity_usd) <
     MIN_LIQUIDITY_USD
   ) {
-    reasons.push(
-      "LIQUIDITY_TOO_LOW"
-    );
+    reasons.push("LIQUIDITY_TOO_LOW");
   }
 
-  if (
-    !candidate.volume_24h_data_available
-  ) {
-    reasons.push(
-      "VOLUME_24H_DATA_UNAVAILABLE"
-    );
+  if (!candidate.volume_24h_data_available) {
+    reasons.push("VOLUME_24H_DATA_UNAVAILABLE");
   } else if (
-    safeNumber(
-      candidate.volume_24h_usd
-    ) <
+    safeNumber(candidate.volume_24h_usd) <
     MIN_VOLUME_24H_USD
   ) {
-    reasons.push(
-      "VOLUME_24H_TOO_LOW"
-    );
+    reasons.push("VOLUME_24H_TOO_LOW");
   }
 
-  if (
-    !candidate.volume_1h_data_available
-  ) {
-    reasons.push(
-      "VOLUME_1H_DATA_UNAVAILABLE"
-    );
+  if (!candidate.volume_1h_data_available) {
+    reasons.push("VOLUME_1H_DATA_UNAVAILABLE");
   } else if (
-    safeNumber(
-      candidate.volume_1h_usd
-    ) <
+    safeNumber(candidate.volume_1h_usd) <
     MIN_VOLUME_1H_USD
   ) {
-    reasons.push(
-      "VOLUME_1H_TOO_LOW"
-    );
+    reasons.push("VOLUME_1H_TOO_LOW");
   }
 
   if (
     candidate.age_days !== null &&
-    candidate.age_days <=
-      NEW_TOKEN_MAX_AGE_DAYS &&
-    safeNumber(
-      candidate.liquidity_usd
-    ) <
+    candidate.age_days <= NEW_TOKEN_MAX_AGE_DAYS &&
+    safeNumber(candidate.liquidity_usd) <
       NEW_TOKEN_MIN_LIQUIDITY_USD
   ) {
-    reasons.push(
-      "NEW_TOKEN_LIQUIDITY_TOO_LOW"
-    );
+    reasons.push("NEW_TOKEN_LIQUIDITY_TOO_LOW");
   }
 
   if (
-    safeNumber(
-      candidate.change_5m
-    ) >
+    safeNumber(candidate.change_5m) >
     MAX_5M_GAIN
   ) {
-    reasons.push(
-      "CHASE_5M"
-    );
+    reasons.push("CHASE_5M");
   }
 
   if (
-    safeNumber(
-      candidate.change_1h
-    ) >
+    safeNumber(candidate.change_1h) >
     MAX_1H_GAIN
   ) {
-    reasons.push(
-      "CHASE_1H"
-    );
+    reasons.push("CHASE_1H");
   }
 
   if (
-    safeNumber(
-      candidate.change_6h
-    ) >
+    safeNumber(candidate.change_6h) >
     MAX_6H_GAIN
   ) {
-    reasons.push(
-      "CHASE_6H"
-    );
+    reasons.push("CHASE_6H");
   }
 
   if (
-    safeNumber(
-      candidate.change_24h
-    ) >
+    safeNumber(candidate.change_24h) >
     MAX_24H_GAIN
   ) {
-    reasons.push(
-      "CHASE_24H"
-    );
+    reasons.push("CHASE_24H");
   }
-
-  const cooldownUntil =
-    safeNumber(
-      portfolio.cooldowns?.[
-        candidate.mint
-      ]
-    );
 
   if (
-    cooldownUntil >
-    Date.now()
+    safeNumber(
+      portfolio.cooldowns?.[candidate.mint]
+    ) > Date.now()
   ) {
-    reasons.push(
-      "COOLDOWN"
-    );
+    reasons.push("COOLDOWN");
   }
 
-  const duplicate =
+  if (
     portfolio.positions.some(
       position =>
-        position.mint ===
-        candidate.mint
-    );
-
-  if (duplicate) {
-    reasons.push(
-      "ALREADY_HELD"
-    );
+        position.mint === candidate.mint
+    )
+  ) {
+    reasons.push("ALREADY_HELD");
   }
 
   return reasons;
@@ -2341,57 +1051,22 @@ function evaluateCandidate(
 /* ============================================================
 PORTFOLIO VALUE
 ============================================================ */
-function getPositionValue(
-  position,
-  candidate
-) {
-  if (
-    !position ||
-    !candidate
-  ) {
-    return 0;
-  }
-
-  return (
-    safeNumber(
-      position.quantity
-    ) *
-    safeNumber(
-      candidate.price_usd
-    )
-  );
-}
 
 function calculateEquity(
   portfolio,
   candidateMap
 ) {
   let equity =
-    safeNumber(
-      portfolio.cash_usd
-    );
+    safeNumber(portfolio.cash_usd);
 
-  for (
-    const position of
-    portfolio.positions
-  ) {
+  for (const position of portfolio.positions) {
     const candidate =
-      candidateMap.get(
-        position.mint
-      );
+      candidateMap.get(position.mint);
 
-    if (candidate) {
-      equity +=
-        getPositionValue(
-          position,
-          candidate
-        );
-    } else {
-      equity +=
-        safeNumber(
-          position.cost_usd
-        );
-    }
+    equity += candidate
+      ? safeNumber(position.quantity) *
+        safeNumber(candidate.price_usd)
+      : safeNumber(position.cost_usd);
   }
 
   return equity;
@@ -2400,137 +1075,94 @@ function calculateEquity(
 /* ============================================================
 COOLDOWNS
 ============================================================ */
+
 function setCooldown(
   portfolio,
   mint
 ) {
-  portfolio.cooldowns[
-    mint
-  ] =
+  portfolio.cooldowns[mint] =
     Date.now() +
-    COOLDOWN_SECONDS *
-      1000;
+    COOLDOWN_SECONDS * 1000;
 }
 
-function cleanupCooldowns(
-  portfolio
-) {
-  const now =
-    Date.now();
+function cleanupCooldowns(portfolio) {
+  const now = Date.now();
 
-  for (
-    const [mint, until] of
-    Object.entries(
-      portfolio.cooldowns
-    )
-  ) {
-    if (
-      safeNumber(
-        until
-      ) <= now
-    ) {
-      delete portfolio.cooldowns[
-        mint
-      ];
+  for (const [mint, until] of Object.entries(
+    portfolio.cooldowns || {}
+  )) {
+    if (safeNumber(until) <= now) {
+      delete portfolio.cooldowns[mint];
     }
   }
 }
 
 /* ============================================================
-SELL REASON
+EXIT LOGIC
 ============================================================ */
+
 function getSellReason(
   position,
   candidate
 ) {
-  const entryPrice =
-    safeNumber(
-      position.entry_price_usd
-    );
+  const entry =
+    safeNumber(position.entry_price_usd);
 
-  const currentPrice =
-    safeNumber(
-      candidate.price_usd
-    );
+  const current =
+    safeNumber(candidate.price_usd);
 
-  if (
-    entryPrice <= 0 ||
-    currentPrice <= 0
-  ) {
+  if (entry <= 0 || current <= 0) {
     return null;
   }
 
   const pnlRatio =
-    (
-      currentPrice -
-      entryPrice
-    ) /
-    entryPrice;
+    (current - entry) / entry;
 
-  if (
-    pnlRatio <=
-    STOP_LOSS
-  ) {
+  if (pnlRatio <= STOP_LOSS) {
     return "STOP_LOSS";
   }
 
   if (
-    currentPrice >
+    current >
     safeNumber(
       position.peak_price_usd,
-      entryPrice
+      entry
     )
   ) {
-    position.peak_price_usd =
-      currentPrice;
+    position.peak_price_usd = current;
   }
 
   if (
     !position.trailing_active &&
-    currentPrice >=
-      entryPrice *
-        (
-          1 +
-          TRAILING_ACTIVATION
-        )
+    current >=
+      entry *
+        (1 + TRAILING_ACTIVATION)
   ) {
-    position.trailing_active =
-      true;
+    position.trailing_active = true;
   }
 
   if (
     position.trailing_active &&
-    currentPrice <=
+    current <=
       safeNumber(
         position.peak_price_usd,
-        currentPrice
+        current
       ) *
-        (
-          1 -
-          TRAILING_STOP
-        )
+        (1 - TRAILING_STOP)
   ) {
     return "TRAILING_STOP";
   }
 
-  const shortTermRatio =
-    safeNumber(
-      candidate.change_5m
-    );
+  const shortTerm =
+    safeNumber(candidate.change_5m);
 
-  const hourlyRatio =
-    safeNumber(
-      candidate.change_1h
-    );
+  const hourly =
+    safeNumber(candidate.change_1h);
 
   if (
     pnlRatio > 0 &&
-    shortTermRatio <=
-      -(
-        1 -
-        1 /
-          SHORT_TERM_SELL_RATIO
-      )
+    shortTerm <=
+      -(1 - 1 / SHORT_TERM_SELL_RATIO)
   ) {
     position.reversal_confirmations =
       safeNumber(
@@ -2538,12 +1170,8 @@ function getSellReason(
       ) + 1;
   } else if (
     pnlRatio > 0 &&
-    hourlyRatio <=
-      -(
-        1 -
-        1 /
-          HOURLY_SELL_RATIO
-      )
+    hourly <=
+      -(1 - 1 / HOURLY_SELL_RATIO)
   ) {
     position.reversal_confirmations =
       safeNumber(
@@ -2561,20 +1189,13 @@ function getSellReason(
     return "REVERSAL";
   }
 
-  if (
-    pnlRatio >=
-    0.025
-  ) {
+  if (pnlRatio >= 0.025) {
     return "PROFIT_TARGET";
   }
 
   if (
-    pnlRatio >=
-      0.01 &&
-    safeNumber(
-      candidate.change_1h
-    ) <=
-      -0.10
+    pnlRatio >= 0.01 &&
+    hourly <= -0.10
   ) {
     return "PROFIT_REVERSAL";
   }
@@ -2585,40 +1206,28 @@ function getSellReason(
 /* ============================================================
 BASE58
 ============================================================ */
+
 const BASE58_ALPHABET =
   "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 function base58Decode(value) {
-  const input =
-    String(value || "")
-      .trim();
+  const input = String(value || "").trim();
 
   if (!input) {
-    throw new Error(
-      "EMPTY_BASE58_VALUE"
-    );
+    throw new Error("EMPTY_BASE58_VALUE");
   }
 
   const digits =
-    new Uint8Array(
-      input.length
-    );
+    new Uint8Array(input.length);
 
   let digitLength = 1;
 
-  for (
-    const char of
-    input
-  ) {
+  for (const char of input) {
     const index =
-      BASE58_ALPHABET.indexOf(
-        char
-      );
+      BASE58_ALPHABET.indexOf(char);
 
     if (index < 0) {
-      throw new Error(
-        "INVALID_BASE58_CHARACTER"
-      );
+      throw new Error("INVALID_BASE58_CHARACTER");
     }
 
     let carry = index;
@@ -2629,50 +1238,32 @@ function base58Decode(value) {
       i++
     ) {
       const value =
-        digits[i] *
-          58 +
-        carry;
+        digits[i] * 58 + carry;
 
-      digits[i] =
-        value &
-        0xff;
-
-      carry =
-        value >>
-        8;
+      digits[i] = value & 0xff;
+      carry = value >> 8;
     }
 
-    while (
-      carry > 0
-    ) {
-      digits[
-        digitLength++
-      ] =
-        carry &
-        0xff;
+    while (carry > 0) {
+      digits[digitLength++] =
+        carry & 0xff;
 
-      carry =
-        carry >>
-        8;
+      carry >>= 8;
     }
   }
 
   let leadingZeros = 0;
 
   while (
-    leadingZeros <
-      input.length &&
-    input[
-      leadingZeros
-    ] === "1"
+    leadingZeros < input.length &&
+    input[leadingZeros] === "1"
   ) {
     leadingZeros++;
   }
 
   const result =
     new Uint8Array(
-      leadingZeros +
-        digitLength
+      leadingZeros + digitLength
     );
 
   for (
@@ -2681,36 +1272,22 @@ function base58Decode(value) {
     i++
   ) {
     result[
-      result.length -
-        1 -
-        i
-    ] =
-      digits[i];
+      result.length - 1 - i
+    ] = digits[i];
   }
 
   return result;
 }
 
-function base58Encode(
-  bytes
-) {
-  if (
-    !bytes?.length
-  ) {
-    return "";
-  }
+function base58Encode(bytes) {
+  if (!bytes?.length) return "";
 
   const digits =
-    new Uint8Array(
-      bytes.length * 2
-    );
+    new Uint8Array(bytes.length * 2);
 
   let digitLength = 1;
 
-  for (
-    const byte of
-    bytes
-  ) {
+  for (const byte of bytes) {
     let carry = byte;
 
     for (
@@ -2719,31 +1296,17 @@ function base58Encode(
       i++
     ) {
       const value =
-        digits[i] *
-          256 +
-        carry;
+        digits[i] * 256 + carry;
 
-      digits[i] =
-        value % 58;
-
-      carry =
-        Math.floor(
-          value / 58
-        );
+      digits[i] = value % 58;
+      carry = Math.floor(value / 58);
     }
 
-    while (
-      carry > 0
-    ) {
-      digits[
-        digitLength++
-      ] =
+    while (carry > 0) {
+      digits[digitLength++] =
         carry % 58;
 
-      carry =
-        Math.floor(
-          carry / 58
-        );
+      carry = Math.floor(carry / 58);
     }
   }
 
@@ -2759,15 +1322,12 @@ function base58Encode(
   }
 
   for (
-    let i =
-      digitLength - 1;
+    let i = digitLength - 1;
     i >= 0;
     i--
   ) {
     result +=
-      BASE58_ALPHABET[
-        digits[i]
-      ];
+      BASE58_ALPHABET[digits[i]];
   }
 
   return result;
@@ -2776,97 +1336,60 @@ function base58Encode(
 /* ============================================================
 BASE64
 ============================================================ */
-function bytesToBase64(
-  bytes
-) {
-  let binary = "";
-  const chunkSize =
-    0x8000;
 
-  for (
-    let i = 0;
-    i < bytes.length;
-    i += chunkSize
-  ) {
-    binary +=
-      String.fromCharCode(
-        ...bytes.subarray(
-          i,
-          Math.min(
-            i + chunkSize,
-            bytes.length
-          )
-        )
-      );
+function bytesToBase64(bytes) {
+  let binary = "";
+
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(
+      ...bytes.subarray(
+        i,
+        Math.min(i + 0x8000, bytes.length)
+      )
+    );
   }
 
-  return btoa(
-    binary
-  );
+  return btoa(binary);
 }
 
-function base64ToBytes(
-  value
-) {
-  const binary =
-    atob(value);
-
+function base64ToBytes(value) {
+  const binary = atob(value);
   const bytes =
-    new Uint8Array(
-      binary.length
-    );
+    new Uint8Array(binary.length);
 
-  for (
-    let i = 0;
-    i < binary.length;
-    i++
-  ) {
-    bytes[i] =
-      binary.charCodeAt(i);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
   }
 
   return bytes;
 }
 
 /* ============================================================
-LIVE CONFIGURATION
+WALLET
 ============================================================ */
-function requireLiveConfig(
-  env
-) {
-  if (
-    PAPER_MODE ||
-    !TRANSACTION_EXECUTION
-  ) {
+
+function requireLiveConfig(env) {
+  if (!TRANSACTION_EXECUTION) {
     throw new Error(
       "LIVE_TRANSACTION_EXECUTION_DISABLED"
     );
   }
 
-  if (
-    !env.SOLANA_RPC_URL
-  ) {
-    throw new Error(
-      "MISSING_SOLANA_RPC_URL"
-    );
+  if (!env.SOLANA_RPC_URL) {
+    throw new Error("MISSING_SOLANA_RPC_URL");
   }
 
-  if (
-    !env.WALLET_PRIVATE_KEY
-  ) {
+  if (!env.WALLET_PRIVATE_KEY) {
     throw new Error(
       "MISSING_WALLET_PRIVATE_KEY"
     );
   }
 }
 
-function parseWalletSecret(
-  env
-) {
+function parseWalletSecret(env) {
   const raw =
     String(
-      env.WALLET_PRIVATE_KEY ||
-      ""
+      env.WALLET_PRIVATE_KEY || ""
     ).trim();
 
   if (!raw) {
@@ -2875,51 +1398,33 @@ function parseWalletSecret(
     );
   }
 
-  let bytes = null;
+  let bytes;
 
-  if (
-    raw.startsWith("[")
-  ) {
+  if (raw.startsWith("[")) {
     let parsed;
 
     try {
-      parsed =
-        JSON.parse(raw);
+      parsed = JSON.parse(raw);
     } catch {
-      throw new Error(
-        "INVALID_WALLET_JSON"
-      );
+      throw new Error("INVALID_WALLET_JSON");
     }
 
     if (
-      !Array.isArray(
-        parsed
-      )
-    ) {
-      throw new Error(
-        "WALLET_JSON_NOT_ARRAY"
-      );
-    }
-
-    if (
+      !Array.isArray(parsed) ||
       parsed.length !== 64
     ) {
       throw new Error(
-        `WALLET_JSON_MUST_HAVE_64_BYTES_GOT_${parsed.length}`
+        "WALLET_JSON_MUST_HAVE_64_BYTES"
       );
     }
 
     const normalized =
-      parsed.map(
-        Number
-      );
+      parsed.map(Number);
 
     if (
       normalized.some(
         value =>
-          !Number.isInteger(
-            value
-          ) ||
+          !Number.isInteger(value) ||
           value < 0 ||
           value > 255
       )
@@ -2930,20 +1435,13 @@ function parseWalletSecret(
     }
 
     bytes =
-      new Uint8Array(
-        normalized
-      );
+      new Uint8Array(normalized);
   } else if (
-    /^[0-9a-fA-F]+$/.test(
-      raw
-    ) &&
-    raw.length % 2 ===
-      0
+    /^[0-9a-fA-F]+$/.test(raw) &&
+    raw.length % 2 === 0
   ) {
     bytes =
-      new Uint8Array(
-        raw.length / 2
-      );
+      new Uint8Array(raw.length / 2);
 
     for (
       let i = 0;
@@ -2952,23 +1450,15 @@ function parseWalletSecret(
     ) {
       bytes[i] =
         parseInt(
-          raw.slice(
-            i * 2,
-            i * 2 + 2
-          ),
+          raw.slice(i * 2, i * 2 + 2),
           16
         );
     }
   } else {
-    bytes =
-      base58Decode(
-        raw
-      );
+    bytes = base58Decode(raw);
   }
 
-  if (
-    bytes.length !== 64
-  ) {
+  if (bytes.length !== 64) {
     throw new Error(
       `WALLET_SECRET_MUST_BE_64_BYTES_GOT_${bytes.length}`
     );
@@ -2978,93 +1468,41 @@ function parseWalletSecret(
 }
 
 /* ============================================================
-SOLANA TRANSACTION PARSING
+SOLANA TRANSACTION SIGNING
 ============================================================ */
-function readCompactU16(
-  bytes,
-  offset
-) {
+
+function readCompactU16(bytes, offset) {
   let value = 0;
   let shift = 0;
   let index = offset;
 
   while (true) {
-    if (
-      index >=
-      bytes.length
-    ) {
-      throw new Error(
-        "SHORTVEC_OUT_OF_RANGE"
-      );
+    if (index >= bytes.length) {
+      throw new Error("SHORTVEC_OUT_OF_RANGE");
     }
 
-    const byte =
-      bytes[index++];
+    const byte = bytes[index++];
 
     value |=
-      (byte & 0x7f) <<
-      shift;
+      (byte & 0x7f) << shift;
 
-    if (
-      (byte & 0x80) ===
-      0
-    ) {
+    if ((byte & 0x80) === 0) {
       break;
     }
 
     shift += 7;
 
-    if (
-      shift > 28
-    ) {
-      throw new Error(
-        "SHORTVEC_TOO_LARGE"
-      );
+    if (shift > 28) {
+      throw new Error("SHORTVEC_TOO_LARGE");
     }
   }
 
   return {
     value,
-    nextOffset:
-      index
+    nextOffset: index
   };
 }
 
-/*
-============================================================
-SOLANA TRANSACTION SIGNING
-
-Supports:
-- Legacy Solana transactions
-- Versioned transaction format v0
-
-Important:
-The signatures section is identical in structure for both
-formats. The difference is that a versioned message begins
-with a version prefix byte:
-
-  0xxxxxxx = legacy message header
-  1xxxxxxx = versioned message
-
-For v0:
-  message[0] = 0x80 | version
-  message[1] = numRequiredSignatures
-  message[2] = numReadonlySignedAccounts
-  message[3] = numReadonlyUnsignedAccounts
-  message[4...] = account-key shortvec
-
-For legacy:
-  message[0] = numRequiredSignatures
-  message[1] = numReadonlySignedAccounts
-  message[2] = numReadonlyUnsignedAccounts
-  message[3...] = account-key shortvec
-
-We only need the message header/account section to verify
-that the fee payer matches the configured wallet. The
-signature itself is generated over the complete serialized
-message exactly as supplied by Jupiter.
-============================================================
-*/
 async function signSolanaTransaction(
   serializedTransaction,
   walletSecret
@@ -3074,168 +1512,77 @@ async function signSolanaTransaction(
       serializedTransaction
     );
 
-  const {
-    value:
-      signatureCount,
-    nextOffset
-  } =
+  const signatureHeader =
     readCompactU16(
       transaction,
       0
     );
 
-  if (
-    signatureCount !== 1
-  ) {
+  if (signatureHeader.value !== 1) {
     throw new Error(
-      `EXPECTED_ONE_REQUIRED_SIGNER_GOT_${signatureCount}`
+      `EXPECTED_ONE_REQUIRED_SIGNER_GOT_${signatureHeader.value}`
     );
   }
 
   const signaturesStart =
-    nextOffset;
+    signatureHeader.nextOffset;
 
   const messageStart =
-    signaturesStart +
-    signatureCount *
-      64;
+    signaturesStart + 64;
 
-  if (
-    messageStart >=
-    transaction.length
-  ) {
+  if (messageStart >= transaction.length) {
     throw new Error(
       "SOLANA_MESSAGE_OFFSET_OUT_OF_RANGE"
     );
   }
 
   const message =
-    transaction.slice(
-      messageStart
-    );
+    transaction.slice(messageStart);
+
+  const versioned =
+    (message[0] & 0x80) !== 0;
 
   if (
-    !message.length
+    versioned &&
+    (message[0] & 0x7f) !== 0
   ) {
     throw new Error(
-      "EMPTY_SOLANA_MESSAGE"
+      "UNSUPPORTED_SOLANA_TRANSACTION_VERSION"
     );
   }
 
-  /*
-  Detect legacy vs versioned transaction.
+  const headerOffset =
+    versioned ? 1 : 0;
 
-  A versioned message has its high bit set. Jupiter commonly
-  returns version 0 transactions, represented by 0x80 here.
-  */
-  const firstMessageByte =
-    message[0];
-
-  const isVersioned =
-    (
-      firstMessageByte &
-      0x80
-    ) !== 0;
-
-  let messageHeaderOffset;
-  let accountCountOffset;
+  const accountCountOffset =
+    versioned ? 4 : 3;
 
   if (
-    isVersioned
-  ) {
-    const version =
-      firstMessageByte &
-      0x7f;
-
-    if (
-      version !== 0
-    ) {
-      throw new Error(
-        `UNSUPPORTED_SOLANA_TRANSACTION_VERSION_${version}`
-      );
-    }
-
-    /*
-    Versioned message layout:
-
-      byte 0:
-        version prefix
-
-      byte 1:
-        numRequiredSignatures
-
-      byte 2:
-        numReadonlySignedAccounts
-
-      byte 3:
-        numReadonlyUnsignedAccounts
-
-      byte 4:
-        account-key shortvec begins
-    */
-    messageHeaderOffset = 1;
-    accountCountOffset = 4;
-  } else {
-    /*
-    Legacy message layout:
-
-      byte 0:
-        numRequiredSignatures
-
-      byte 1:
-        numReadonlySignedAccounts
-
-      byte 2:
-        numReadonlyUnsignedAccounts
-
-      byte 3:
-        account-key shortvec begins
-    */
-    messageHeaderOffset = 0;
-    accountCountOffset = 3;
-  }
-
-  const numRequiredSignatures =
-    message[
-      messageHeaderOffset
-    ];
-
-  if (
-    numRequiredSignatures !==
-    1
+    message[headerOffset] !== 1
   ) {
     throw new Error(
-      `EXPECTED_ONE_MESSAGE_SIGNER_GOT_${numRequiredSignatures}`
+      "EXPECTED_ONE_MESSAGE_SIGNER"
     );
   }
 
-  const accountCountResult =
+  const accountCount =
     readCompactU16(
       message,
       accountCountOffset
     );
 
-  const accountCount =
-    accountCountResult.value;
-
-  if (
-    accountCount < 1
-  ) {
+  if (accountCount.value < 1) {
     throw new Error(
-      "SOLANA_TRANSACTION_HAS_NO_ACCOUNT_KEYS"
+      "NO_SOLANA_ACCOUNT_KEYS"
     );
   }
 
   const accountStart =
-    accountCountResult.nextOffset;
-
-  const accountBytesLength =
-    accountCount *
-    32;
+    accountCount.nextOffset;
 
   if (
     accountStart +
-      accountBytesLength >
+      accountCount.value * 32 >
     message.length
   ) {
     throw new Error(
@@ -3243,9 +1590,6 @@ async function signSolanaTransaction(
     );
   }
 
-  /*
-  Solana's first account key is the fee payer.
-  */
   const feePayer =
     message.slice(
       accountStart,
@@ -3253,103 +1597,48 @@ async function signSolanaTransaction(
     );
 
   const walletPublicKey =
-    walletSecret.slice(
-      32,
-      64
-    );
-
-  const feePayerBase58 =
-    base58Encode(
-      feePayer
-    );
-
-  const configuredWalletBase58 =
-    base58Encode(
-      walletPublicKey
-    );
+    walletSecret.slice(32, 64);
 
   if (
-    feePayerBase58 !==
-    configuredWalletBase58
+    base58Encode(feePayer) !==
+    base58Encode(walletPublicKey)
   ) {
     throw new Error(
       "TRANSACTION_FEE_PAYER_DOES_NOT_MATCH_CONFIGURED_WALLET"
     );
   }
 
-  /*
-  The WALLET_PRIVATE_KEY is expected to be a standard Solana
-  64-byte secret-key representation:
+  const seed =
+    walletSecret.slice(0, 32);
 
-    bytes 0-31  = Ed25519 private seed
-    bytes 32-63 = public key
-  */
-  const privateSeed =
-    walletSecret.slice(
-      0,
-      32
-    );
-
-  /*
-  PKCS#8 wrapper for an Ed25519 private key.
-
-  This is compatible with Web Crypto's Ed25519 implementation
-  available in the Cloudflare Worker runtime.
-  */
   const pkcs8Prefix =
     new Uint8Array([
-      0x30,
-      0x2e,
-      0x02,
-      0x01,
-      0x00,
-      0x30,
-      0x05,
-      0x06,
-      0x03,
-      0x2b,
-      0x65,
-      0x70,
-      0x04,
-      0x22,
-      0x04,
-      0x20
+      0x30, 0x2e,
+      0x02, 0x01, 0x00,
+      0x30, 0x05,
+      0x06, 0x03,
+      0x2b, 0x65, 0x70,
+      0x04, 0x22,
+      0x04, 0x20
     ]);
 
   const pkcs8 =
     new Uint8Array(
-      pkcs8Prefix.length +
-        privateSeed.length
+      pkcs8Prefix.length + seed.length
     );
 
-  pkcs8.set(
-    pkcs8Prefix,
-    0
-  );
-
-  pkcs8.set(
-    privateSeed,
-    pkcs8Prefix.length
-  );
+  pkcs8.set(pkcs8Prefix);
+  pkcs8.set(seed, pkcs8Prefix.length);
 
   const privateKey =
     await crypto.subtle.importKey(
       "pkcs8",
       pkcs8,
-      {
-        name:
-          "Ed25519"
-      },
+      { name: "Ed25519" },
       false,
       ["sign"]
     );
 
-  /*
-  CRITICAL:
-  Ed25519 signs the complete serialized Solana message,
-  starting at messageStart. The version prefix, if present,
-  is part of that message and MUST be included.
-  */
   const signature =
     new Uint8Array(
       await crypto.subtle.sign(
@@ -3359,42 +1648,29 @@ async function signSolanaTransaction(
       )
     );
 
-  if (
-    signature.length !== 64
-  ) {
+  if (signature.length !== 64) {
     throw new Error(
       "INVALID_ED25519_SIGNATURE_LENGTH"
     );
   }
 
-  /*
-  Preserve the original transaction byte-for-byte and replace
-  only the first signature slot.
-
-  This works for both legacy and v0 transactions.
-  */
   const signed =
     new Uint8Array(
-      transaction.length
+      transaction
     );
-
-  signed.set(
-    transaction
-  );
 
   signed.set(
     signature,
     signaturesStart
   );
 
-  return bytesToBase64(
-    signed
-  );
+  return bytesToBase64(signed);
 }
 
 /* ============================================================
 SOLANA RPC
 ============================================================ */
+
 async function solanaRpc(
   env,
   method,
@@ -3404,29 +1680,17 @@ async function solanaRpc(
     await fetch(
       env.SOLANA_RPC_URL,
       {
-        method:
-          "POST",
-
+        method: "POST",
         headers: {
-          "content-type":
-            "application/json",
-
-          accept:
-            "application/json"
+          "content-type": "application/json",
+          accept: "application/json"
         },
-
-        body:
-          JSON.stringify({
-            jsonrpc:
-              "2.0",
-
-            id:
-              1,
-
-            method,
-
-            params
-          })
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method,
+          params
+        })
       }
     );
 
@@ -3441,65 +1705,47 @@ async function solanaRpc(
 
   if (data.error) {
     throw new Error(
-      `SOLANA_RPC_${method}: ${JSON.stringify(
-        data.error
-      )}`
+      `SOLANA_RPC_${method}:${JSON.stringify(data.error)}`
     );
   }
 
   return data.result;
 }
 
-async function getLiveWalletPublicKey(
-  env
-) {
-  requireLiveConfig(
-    env
-  );
+async function getLiveWalletPublicKey(env) {
+  requireLiveConfig(env);
 
   const secret =
-    parseWalletSecret(
-      env
-    );
+    parseWalletSecret(env);
 
   return base58Encode(
-    secret.slice(
-      32,
-      64
-    )
+    secret.slice(32, 64)
   );
 }
 
 /* ============================================================
-SOL USD PRICE
+SOL PRICE
 ============================================================ */
+
 async function getSolUsdPrice() {
-  const result =
-    await fetchJsonDiagnostic(
-      `${JUPITER_PRICE_API}?ids=${encodeURIComponent(
-        SOL_MINT
-      )}`
+  const response =
+    await fetchJsonSafe(
+      `${JUPITER_PRICE_API}?ids=${SOL_MINT}`
     );
 
-  if (!result.ok) {
+  if (!response.ok) {
     throw new Error(
-      result.error ||
       "SOL_PRICE_LOOKUP_FAILED"
     );
   }
 
   const price =
     extractJupiterPrice(
-      result.data,
+      response.data,
       SOL_MINT
     );
 
-  if (
-    !Number.isFinite(
-      price
-    ) ||
-    price <= 0
-  ) {
+  if (!Number.isFinite(price) || price <= 0) {
     throw new Error(
       "INVALID_SOL_USD_PRICE"
     );
@@ -3509,8 +1755,27 @@ async function getSolUsdPrice() {
 }
 
 /* ============================================================
-JUPITER LIVE QUOTE
+JUPITER
 ============================================================ */
+
+async function jupiterHeaders(env, json = false) {
+  const headers = {
+    accept: "application/json"
+  };
+
+  if (json) {
+    headers["content-type"] =
+      "application/json";
+  }
+
+  if (env.JUPITER_API_KEY) {
+    headers["x-api-key"] =
+      env.JUPITER_API_KEY;
+  }
+
+  return headers;
+}
+
 async function jupiterQuote(
   env,
   inputMint,
@@ -3518,9 +1783,7 @@ async function jupiterQuote(
   amount
 ) {
   const url =
-    new URL(
-      JUPITER_QUOTE_API
-    );
+    new URL(JUPITER_QUOTE_API);
 
   url.searchParams.set(
     "inputMint",
@@ -3542,32 +1805,16 @@ async function jupiterQuote(
     "100"
   );
 
-  const headers = {
-    accept:
-      "application/json"
-  };
-
-  if (
-    env.JUPITER_API_KEY
-  ) {
-    headers[
-      "x-api-key"
-    ] =
-      env.JUPITER_API_KEY;
-  }
-
   const quote =
     await fetchJson(
       url.toString(),
       {
-        headers
+        headers:
+          await jupiterHeaders(env)
       }
     );
 
-  if (
-    !quote ||
-    !quote.outAmount
-  ) {
+  if (!quote?.outAmount) {
     throw new Error(
       "JUPITER_QUOTE_MISSING_OUT_AMOUNT"
     );
@@ -3576,54 +1823,28 @@ async function jupiterQuote(
   return quote;
 }
 
-/* ============================================================
-JUPITER SWAP TRANSACTION
-============================================================ */
 async function jupiterSwapTransaction(
   env,
   quoteResponse,
   userPublicKey
 ) {
-  const headers = {
-    "content-type":
-      "application/json",
-
-    accept:
-      "application/json"
-  };
-
-  if (
-    env.JUPITER_API_KEY
-  ) {
-    headers[
-      "x-api-key"
-    ] =
-      env.JUPITER_API_KEY;
-  }
-
   const response =
     await fetch(
       JUPITER_SWAP_API,
       {
-        method:
-          "POST",
-
-        headers,
-
-        body:
-          JSON.stringify({
-            quoteResponse,
-            userPublicKey,
-
-            wrapAndUnwrapSol:
-              true,
-
-            dynamicComputeUnitLimit:
-              true,
-
-            prioritizationFeeLamports:
-              "auto"
-          })
+        method: "POST",
+        headers:
+          await jupiterHeaders(
+            env,
+            true
+          ),
+        body: JSON.stringify({
+          quoteResponse,
+          userPublicKey,
+          wrapAndUnwrapSol: true,
+          dynamicComputeUnitLimit: true,
+          prioritizationFeeLamports: "auto"
+        })
       }
     );
 
@@ -3631,20 +1852,14 @@ async function jupiterSwapTransaction(
     let body = "";
 
     try {
-      body =
-        await response.text();
-    } catch {
-      body = "";
-    }
+      body = await response.text();
+    } catch {}
 
     throw new Error(
       `JUPITER_SWAP_HTTP_${response.status}` +
       (
         body
-          ? `: ${body.slice(
-              0,
-              500
-            )}`
+          ? `:${body.slice(0, 500)}`
           : ""
       )
     );
@@ -3653,9 +1868,7 @@ async function jupiterSwapTransaction(
   const data =
     await response.json();
 
-  if (
-    !data?.swapTransaction
-  ) {
+  if (!data?.swapTransaction) {
     throw new Error(
       "JUPITER_SWAP_TRANSACTION_MISSING"
     );
@@ -3667,16 +1880,15 @@ async function jupiterSwapTransaction(
 /* ============================================================
 BROADCAST / CONFIRM
 ============================================================ */
-async function broadcastAndConfirmLiveTransaction(
+
+async function broadcastAndConfirm(
   env,
   serializedTransaction
 ) {
   const walletSecret =
-    parseWalletSecret(
-      env
-    );
+    parseWalletSecret(env);
 
-  const signedTransaction =
+  const signed =
     await signSolanaTransaction(
       serializedTransaction,
       walletSecret
@@ -3687,19 +1899,12 @@ async function broadcastAndConfirmLiveTransaction(
       env,
       "sendTransaction",
       [
-        signedTransaction,
+        signed,
         {
-          encoding:
-            "base64",
-
-          skipPreflight:
-            false,
-
-          preflightCommitment:
-            "confirmed",
-
-          maxRetries:
-            2
+          encoding: "base64",
+          skipPreflight: false,
+          preflightCommitment: "confirmed",
+          maxRetries: 2
         }
       ]
     );
@@ -3711,15 +1916,9 @@ async function broadcastAndConfirmLiveTransaction(
   }
 
   const deadline =
-    Date.now() +
-    45000;
+    Date.now() + 45000;
 
-  let status = null;
-
-  while (
-    Date.now() <
-    deadline
-  ) {
+  while (Date.now() < deadline) {
     const result =
       await solanaRpc(
         env,
@@ -3727,19 +1926,15 @@ async function broadcastAndConfirmLiveTransaction(
         [
           [signature],
           {
-            searchTransactionHistory:
-              true
+            searchTransactionHistory: true
           }
         ]
       );
 
-    status =
-      result?.value?.[0] ||
-      null;
+    const status =
+      result?.value?.[0] || null;
 
-    if (
-      status?.err
-    ) {
+    if (status?.err) {
       throw new Error(
         `LIVE_TRANSACTION_FAILED:${JSON.stringify(
           status.err
@@ -3748,10 +1943,8 @@ async function broadcastAndConfirmLiveTransaction(
     }
 
     if (
-      status?.confirmationStatus ===
-        "confirmed" ||
-      status?.confirmationStatus ===
-        "finalized"
+      status?.confirmationStatus === "confirmed" ||
+      status?.confirmationStatus === "finalized"
     ) {
       return {
         signature,
@@ -3760,11 +1953,7 @@ async function broadcastAndConfirmLiveTransaction(
     }
 
     await new Promise(
-      resolve =>
-        setTimeout(
-          resolve,
-          1000
-        )
+      resolve => setTimeout(resolve, 1000)
     );
   }
 
@@ -3773,25 +1962,16 @@ async function broadcastAndConfirmLiveTransaction(
   );
 }
 
-/* ============================================================
-LIVE SWAP
-============================================================ */
 async function executeLiveSwap(
   env,
   inputMint,
   outputMint,
   amount,
-  userPublicKey
+  walletPublicKey
 ) {
-  requireLiveConfig(
-    env
-  );
+  requireLiveConfig(env);
 
-  if (
-    !amount ||
-    String(amount) ===
-      "0"
-  ) {
+  if (!amount || String(amount) === "0") {
     throw new Error(
       "INVALID_LIVE_SWAP_AMOUNT"
     );
@@ -3809,11 +1989,11 @@ async function executeLiveSwap(
     await jupiterSwapTransaction(
       env,
       quote,
-      userPublicKey
+      walletPublicKey
     );
 
   const confirmation =
-    await broadcastAndConfirmLiveTransaction(
+    await broadcastAndConfirm(
       env,
       swap.swapTransaction
     );
@@ -3828,39 +2008,20 @@ async function executeLiveSwap(
 /* ============================================================
 LIVE BUY
 ============================================================ */
+
 async function liveBuy(
   env,
   portfolio,
-  candidate,
-  amountUsd
+  candidate
 ) {
-  requireLiveConfig(
-    env
-  );
+  requireLiveConfig(env);
 
-  if (
-    amountUsd >
-    MAX_LIVE_TRADE_USD
-  ) {
+  const amountUsd =
+    MAX_LIVE_TRADE_USD;
+
+  if (amountUsd > MAX_LIVE_TRADE_USD) {
     throw new Error(
       "LIVE_TRADE_LIMIT_EXCEEDED"
-    );
-  }
-
-  if (
-    amountUsd <= 0
-  ) {
-    throw new Error(
-      "INVALID_LIVE_BUY_AMOUNT"
-    );
-  }
-
-  if (
-    amountUsd >
-    MAX_LIVE_BANKROLL_USD
-  ) {
-    throw new Error(
-      "LIVE_BANKROLL_LIMIT_EXCEEDED"
     );
   }
 
@@ -3876,8 +2037,7 @@ async function liveBuy(
   if (
     portfolio.positions.some(
       position =>
-        position.mint ===
-        candidate.mint
+        position.mint === candidate.mint
     )
   ) {
     throw new Error(
@@ -3886,29 +2046,31 @@ async function liveBuy(
   }
 
   if (
-    portfolio.cash_usd <
-    amountUsd
+    portfolio.cash_usd < amountUsd
   ) {
     throw new Error(
       "INSUFFICIENT_LIVE_LEDGER_CASH"
     );
   }
 
-  /*
-  Enforce the configured live bankroll at the ledger level.
-  */
-  const ledgerEquity =
+  if (
     calculateEquity(
       portfolio,
       new Map()
-    );
-
-  if (
-    ledgerEquity >
-    MAX_LIVE_BANKROLL_USD
+    ) > MAX_LIVE_BANKROLL_USD
   ) {
     throw new Error(
       "LIVE_BANKROLL_LIMIT_EXCEEDED"
+    );
+  }
+
+  if (
+    portfolio.cash_usd -
+      amountUsd <
+    MIN_CASH_RESERVE_USD
+  ) {
+    throw new Error(
+      "MINIMUM_CASH_RESERVE_REQUIRED"
     );
   }
 
@@ -3924,18 +2086,14 @@ async function liveBuy(
       1_000_000_000
     );
 
-  if (
-    lamports <= 0
-  ) {
+  if (lamports <= 0) {
     throw new Error(
       "LIVE_BUY_LAMPORT_AMOUNT_TOO_SMALL"
     );
   }
 
   const walletPublicKey =
-    await getLiveWalletPublicKey(
-      env
-    );
+    await getLiveWalletPublicKey(env);
 
   const balance =
     await solanaRpc(
@@ -3944,8 +2102,7 @@ async function liveBuy(
       [
         walletPublicKey,
         {
-          commitment:
-            "confirmed"
+          commitment: "confirmed"
         }
       ]
     );
@@ -3953,15 +2110,12 @@ async function liveBuy(
   const reserveLamports =
     Math.floor(
       MIN_SOL_RESERVE *
-        1_000_000_000
+      1_000_000_000
     );
 
   if (
-    safeNumber(
-      balance?.value
-    ) <
-    lamports +
-      reserveLamports
+    safeNumber(balance?.value) <
+    lamports + reserveLamports
   ) {
     throw new Error(
       "INSUFFICIENT_ONCHAIN_SOL_RESERVE"
@@ -3978,121 +2132,67 @@ async function liveBuy(
     );
 
   const quantityRaw =
-    String(
-      result.quote.outAmount
+    String(result.quote.outAmount);
+
+  const price =
+    safeNumber(candidate.price_usd);
+
+  if (price <= 0) {
+    throw new Error(
+      "INVALID_CANDIDATE_PRICE"
     );
+  }
 
-  /*
-  Keep a USD-normalized quantity for the strategy while
-  retaining Jupiter's exact raw token amount for selling.
-  */
   const quantity =
-    safeNumber(
-      candidate.price_usd
-    ) > 0
-      ? amountUsd /
-        candidate.price_usd
-      : 0;
-
-  portfolio.cash_usd -=
-    amountUsd;
+    amountUsd / price;
 
   portfolio.cash_usd =
     clamp(
-      portfolio.cash_usd,
+      portfolio.cash_usd - amountUsd,
       0,
       MAX_LIVE_BANKROLL_USD
     );
 
   const position = {
-    mint:
-      candidate.mint,
+    mint: candidate.mint,
+    symbol: candidate.symbol || null,
+    name: candidate.name || null,
 
-    symbol:
-      candidate.symbol ||
-      null,
-
-    name:
-      candidate.name ||
-      null,
-
-    entry_price_usd:
-      safeNumber(
-        candidate.price_usd
-      ),
-
+    entry_price_usd: price,
     quantity,
+    quantity_raw: quantityRaw,
+    cost_usd: amountUsd,
 
-    quantity_raw:
-      quantityRaw,
+    peak_price_usd: price,
+    trailing_active: false,
+    reversal_confirmations: 0,
 
-    cost_usd:
-      amountUsd,
+    opened_at: nowIso(),
 
-    peak_price_usd:
-      safeNumber(
-        candidate.price_usd
-      ),
-
-    trailing_active:
-      false,
-
-    reversal_confirmations:
-      0,
-
-    opened_at:
-      nowIso(),
-
-    source:
-      candidate.source ||
-      null,
+    source: candidate.source || null,
 
     transaction_signature:
       result.signature,
 
-    input_lamports:
-      lamports
+    input_lamports: lamports
   };
 
-  portfolio.positions.push(
-    position
-  );
+  portfolio.positions.push(position);
 
   addHistory(
     portfolio,
     {
-      type:
-        "BUY",
-
-      mode:
-        "LIVE",
-
-      mint:
-        candidate.mint,
-
-      symbol:
-        candidate.symbol ||
-        null,
-
-      amount_usd:
-        round(
-          amountUsd,
-          6
-        ),
-
-      price_usd:
-        candidate.price_usd,
-
+      type: "BUY",
+      mode: "LIVE",
+      mint: candidate.mint,
+      symbol: candidate.symbol || null,
+      amount_usd: round(amountUsd, 6),
+      price_usd: price,
       quantity,
-
-      quantity_raw:
-        quantityRaw,
-
+      quantity_raw: quantityRaw,
       transaction_signature:
         result.signature,
-
-      score:
-        candidate.score
+      score: candidate.score
     }
   );
 
@@ -4107,6 +2207,7 @@ async function liveBuy(
 /* ============================================================
 LIVE SELL
 ============================================================ */
+
 async function liveSell(
   env,
   portfolio,
@@ -4114,125 +2215,74 @@ async function liveSell(
   candidate,
   reason
 ) {
-  requireLiveConfig(
-    env
-  );
+  requireLiveConfig(env);
 
   const quantityRaw =
-    String(
-      position.quantity_raw ||
-      ""
-    );
+    String(position.quantity_raw || "");
 
-  if (
-    !quantityRaw ||
-    quantityRaw === "0"
-  ) {
+  if (!quantityRaw || quantityRaw === "0") {
     throw new Error(
       "LIVE_POSITION_MISSING_RAW_TOKEN_AMOUNT"
     );
   }
 
   const walletPublicKey =
-    await getLiveWalletPublicKey(
-      env
-    );
+    await getLiveWalletPublicKey(env);
 
-  /*
-  Verify the wallet still has the token before attempting
-  the swap. This prevents a stale KV position from causing
-  an invalid sell transaction.
-  */
-  const tokenAccounts =
+  const accounts =
     await solanaRpc(
       env,
       "getTokenAccountsByOwner",
       [
         walletPublicKey,
         {
-          mint:
-            candidate.mint
+          mint: candidate.mint
         },
         {
-          encoding:
-            "jsonParsed",
-          commitment:
-            "confirmed"
+          encoding: "jsonParsed",
+          commitment: "confirmed"
         }
       ]
     );
 
-  const accounts =
-    Array.isArray(
-      tokenAccounts?.value
-    )
-      ? tokenAccounts.value
-      : [];
-
-  let onChainRawAmount =
-    0n;
+  let onChainRaw = 0n;
 
   for (
     const account of
-    accounts
+    accounts?.value || []
   ) {
     const amount =
-      account?.account
-        ?.data
-        ?.parsed
-        ?.info
-        ?.tokenAmount
-        ?.amount;
+      account?.account?.data?.parsed
+        ?.info?.tokenAmount?.amount;
 
-    if (
-      amount !== undefined
-    ) {
-      try {
-        onChainRawAmount +=
-          BigInt(
-            String(amount)
-          );
-      } catch {
-        throw new Error(
-          "INVALID_ONCHAIN_TOKEN_AMOUNT"
-        );
-      }
+    if (amount !== undefined) {
+      onChainRaw += BigInt(String(amount));
     }
   }
 
-  let requestedRawAmount;
+  if (onChainRaw <= 0n) {
+    throw new Error(
+      "LIVE_TOKEN_BALANCE_NOT_FOUND"
+    );
+  }
+
+  let requestedRaw;
 
   try {
-    requestedRawAmount =
-      BigInt(
-        quantityRaw
-      );
+    requestedRaw =
+      BigInt(quantityRaw);
   } catch {
     throw new Error(
       "INVALID_STORED_TOKEN_AMOUNT"
     );
   }
 
-  if (
-    onChainRawAmount <= 0n
-  ) {
-    throw new Error(
-      "LIVE_TOKEN_BALANCE_NOT_FOUND"
-    );
-  }
+  const sellRaw =
+    requestedRaw <= onChainRaw
+      ? requestedRaw
+      : onChainRaw;
 
-  /*
-  Never request more tokens than are actually in the wallet.
-  */
-  const sellRawAmount =
-    requestedRawAmount <=
-    onChainRawAmount
-      ? requestedRawAmount
-      : onChainRawAmount;
-
-  if (
-    sellRawAmount <= 0n
-  ) {
+  if (sellRaw <= 0n) {
     throw new Error(
       "LIVE_SELL_AMOUNT_TOO_SMALL"
     );
@@ -4243,7 +2293,7 @@ async function liveSell(
       env,
       candidate.mint,
       SOL_MINT,
-      sellRawAmount.toString(),
+      sellRaw.toString(),
       walletPublicKey
     );
 
@@ -4252,9 +2302,7 @@ async function liveSell(
       result.quote.outAmount
     );
 
-  if (
-    solOutLamports <= 0
-  ) {
+  if (solOutLamports <= 0) {
     throw new Error(
       "LIVE_SELL_RETURNED_ZERO_SOL"
     );
@@ -4271,95 +2319,49 @@ async function liveSell(
     solPrice;
 
   const soldFraction =
-    requestedRawAmount > 0n
-      ? Number(
-          sellRawAmount
-        ) /
-        Number(
-          requestedRawAmount
-        )
+    requestedRaw > 0n
+      ? Number(sellRaw) /
+        Number(requestedRaw)
       : 1;
 
   const adjustedCost =
-    safeNumber(
-      position.cost_usd
-    ) *
-    clamp(
-      soldFraction,
-      0,
-      1
-    );
+    safeNumber(position.cost_usd) *
+    clamp(soldFraction, 0, 1);
 
   const pnl =
-    proceeds -
-    adjustedCost;
-
-  /*
-  A full-position sell removes the position.
-
-  A partial on-chain amount caused by stale/different wallet
-  state is treated conservatively as a full exit from the
-  worker's tracked position so the worker does not keep
-  pretending it owns tokens it may no longer control.
-  */
-  portfolio.cash_usd +=
-    proceeds;
+    proceeds - adjustedCost;
 
   portfolio.cash_usd =
     clamp(
-      portfolio.cash_usd,
+      portfolio.cash_usd + proceeds,
       0,
       MAX_LIVE_BANKROLL_USD
     );
 
-  portfolio.realized_pnl_usd +=
-    pnl;
+  portfolio.realized_pnl_usd += pnl;
 
   portfolio.positions =
     portfolio.positions.filter(
       item =>
-        item.mint !==
-        position.mint
+        item.mint !== position.mint
     );
 
   addHistory(
     portfolio,
     {
-      type:
-        "SELL",
-
-      mode:
-        "LIVE",
-
-      mint:
-        position.mint,
-
+      type: "SELL",
+      mode: "LIVE",
+      mint: position.mint,
       symbol:
         position.symbol ||
         candidate.symbol ||
         null,
-
-      proceeds_usd:
-        round(
-          proceeds,
-          6
-        ),
-
-      pnl_usd:
-        round(
-          pnl,
-          6
-        ),
-
-      output_lamports:
-        solOutLamports,
-
-      sold_raw_amount:
-        sellRawAmount.toString(),
-
+      proceeds_usd: round(proceeds, 6),
+      pnl_usd: round(pnl, 6),
+      output_lamports: solOutLamports,
+      sold_raw_amount: sellRaw.toString(),
       transaction_signature:
         result.signature,
-
       reason
     }
   );
@@ -4372,38 +2374,424 @@ async function liveSell(
   return {
     proceeds,
     pnl,
-    signature:
-      result.signature
+    signature: result.signature
   };
 }
 
 /* ============================================================
-LIVE STATUS
+SCAN
 ============================================================ */
-function liveBetaExecutionStatus(
+
+async function runScan(env) {
+  const [
+    dexDiscovery,
+    dexSearch
+  ] = await Promise.all([
+    getDexDiscovery(),
+    getDexSearch()
+  ]);
+
+  const sourceMap = new Map();
+
+  for (
+    const item of
+    [
+      ...dexSearch.results,
+      ...dexDiscovery
+    ]
+  ) {
+    if (
+      item?.mint &&
+      !sourceMap.has(item.mint)
+    ) {
+      sourceMap.set(
+        item.mint,
+        item.source
+      );
+    }
+  }
+
+  const orderedMints = [];
+
+  for (
+    const mint of
+    dexSearch.pairMap.keys()
+  ) {
+    if (!orderedMints.includes(mint)) {
+      orderedMints.push(mint);
+    }
+
+    if (
+      orderedMints.length >=
+      MAX_CANDIDATES
+    ) {
+      break;
+    }
+  }
+
+  for (
+    const mint of
+    sourceMap.keys()
+  ) {
+    if (
+      orderedMints.length >=
+      MAX_CANDIDATES
+    ) {
+      break;
+    }
+
+    if (!orderedMints.includes(mint)) {
+      orderedMints.push(mint);
+    }
+  }
+
+  const mints =
+    orderedMints.slice(
+      0,
+      MAX_CANDIDATES
+    );
+
+  const hydrationMints =
+    mints.filter(
+      mint =>
+        !dexSearch.pairMap.has(mint)
+    );
+
+  const [
+    hydrated,
+    jupiterPrices,
+    portfolio
+  ] = await Promise.all([
+    hydrateDexPairs(hydrationMints),
+    getJupiterPrices(mints),
+    loadPortfolio(env)
+  ]);
+
+  const candidates = [];
+
+  for (const mint of mints) {
+    const pair =
+      dexSearch.pairMap.get(mint) ||
+      hydrated.get(mint) ||
+      null;
+
+    const candidate =
+      normalizeCandidate(
+        mint,
+        pair,
+        jupiterPrices[mint],
+        sourceMap.get(mint) ||
+          "DEXSCREENER"
+      );
+
+    Object.assign(
+      candidate,
+      scoreCandidate(
+        portfolio,
+        candidate
+      )
+    );
+
+    candidate.filter_reasons =
+      evaluateCandidate(
+        portfolio,
+        candidate
+      );
+
+    candidates.push(candidate);
+  }
+
+  candidates.sort(
+    (a, b) =>
+      safeNumber(b.score) -
+      safeNumber(a.score)
+  );
+
+  return {
+    candidates: candidates.slice(
+      0,
+      MAX_CANDIDATES
+    ),
+
+    diagnostics: {
+      dexscreener_discovery:
+        dexDiscovery.length,
+
+      dexscreener_search_pairs:
+        dexSearch.results.length,
+
+      dex_hydration:
+        hydrated.size,
+
+      jupiter_prices:
+        Object.keys(jupiterPrices).length,
+
+      estimated_external_requests:
+        3 +
+        3 +
+        hydrationMints.length +
+        1,
+
+      target_limit: 50
+    }
+  };
+}
+
+/* ============================================================
+LIVE ENGINE
+============================================================ */
+
+async function runLiveEngine(
+  env,
+  portfolio,
+  scan
+) {
+  cleanupCooldowns(portfolio);
+
+  const candidateMap =
+    new Map(
+      scan.candidates.map(
+        candidate => [
+          candidate.mint,
+          candidate
+        ]
+      )
+    );
+
+  let sells = 0;
+
+  for (
+    const position of
+    [...portfolio.positions]
+  ) {
+    const candidate =
+      candidateMap.get(position.mint);
+
+    if (!candidate) continue;
+
+    const reason =
+      getSellReason(
+        position,
+        candidate
+      );
+
+    if (!reason) continue;
+
+    await liveSell(
+      env,
+      portfolio,
+      position,
+      candidate,
+      reason
+    );
+
+    await savePortfolio(
+      env,
+      portfolio,
+      "LIVE_SELL",
+      true
+    );
+
+    sells++;
+  }
+
+  let buys = 0;
+
+  if (
+    portfolio.positions.length <
+    MAX_POSITIONS
+  ) {
+    for (
+      const candidate of
+      scan.candidates
+    ) {
+      if (
+        buys >=
+        MAX_NEW_BUYS_PER_RUN
+      ) {
+        break;
+      }
+
+      if (
+        safeNumber(candidate.score) <
+        MIN_ENTRY_SCORE
+      ) {
+        continue;
+      }
+
+      if (
+        safeNumber(candidate.momentum_score) <
+        MIN_MOMENTUM_SCORE
+      ) {
+        continue;
+      }
+
+      if (
+        safeNumber(candidate.setup_score) <
+        MIN_SETUP_SCORE
+      ) {
+        continue;
+      }
+
+      if (
+        evaluateCandidate(
+          portfolio,
+          candidate
+        ).length
+      ) {
+        continue;
+      }
+
+      if (
+        portfolio.cash_usd -
+          MAX_LIVE_TRADE_USD <
+        MIN_CASH_RESERVE_USD
+      ) {
+        continue;
+      }
+
+      await liveBuy(
+        env,
+        portfolio,
+        candidate
+      );
+
+      await savePortfolio(
+        env,
+        portfolio,
+        "LIVE_BUY",
+        true
+      );
+
+      buys++;
+    }
+  }
+
+  for (
+    const candidate of
+    scan.candidates
+  ) {
+    recordMarketObservation(
+      portfolio,
+      candidate
+    );
+  }
+
+  return {
+    buys,
+    sells,
+    positions:
+      portfolio.positions.length
+  };
+}
+
+/* ============================================================
+AUTHORIZATION
+============================================================ */
+
+async function requireExecutionAuthorization(
+  request,
   env
 ) {
+  const expected =
+    String(
+      env.LIVE_EXECUTION_TOKEN || ""
+    );
+
+  if (!expected) {
+    throw new Error(
+      "MISSING_LIVE_EXECUTION_TOKEN"
+    );
+  }
+
+  const header =
+    request.headers.get(
+      "authorization"
+    ) || "";
+
+  if (
+    !header.startsWith("Bearer ")
+  ) {
+    throw new Error(
+      "LIVE_EXECUTION_AUTH_REQUIRED"
+    );
+  }
+
+  const supplied =
+    header.slice(7);
+
+  const a =
+    new TextEncoder().encode(
+      supplied
+    );
+
+  const b =
+    new TextEncoder().encode(
+      expected
+    );
+
+  if (a.length !== b.length) {
+    throw new Error(
+      "LIVE_EXECUTION_UNAUTHORIZED"
+    );
+  }
+
+  let equal = true;
+
+  for (let i = 0; i < a.length; i++) {
+    equal =
+      equal &&
+      a[i] === b[i];
+  }
+
+  if (!equal) {
+    throw new Error(
+      "LIVE_EXECUTION_UNAUTHORIZED"
+    );
+  }
+}
+
+/* ============================================================
+RESPONSES
+============================================================ */
+
+function jsonResponse(
+  body,
+  status = 200
+) {
+  return new Response(
+    JSON.stringify(body, null, 2),
+    {
+      status,
+      headers: {
+        "content-type":
+          "application/json; charset=utf-8",
+        "cache-control":
+          "no-store"
+      }
+    }
+  );
+}
+
+/* ============================================================
+EXECUTION STATUS
+============================================================ */
+
+function executionStatus(env) {
   return {
-    paper_mode:
-      PAPER_MODE,
-
-    live_beta_mode:
-      LIVE_BETA_MODE,
-
+    paper_mode: false,
+    live_beta_mode: LIVE_BETA_MODE,
     transaction_execution:
       TRANSACTION_EXECUTION,
 
     live_trading_enabled:
-      !PAPER_MODE &&
       TRANSACTION_EXECUTION,
 
     automatic_signing:
-      !PAPER_MODE &&
       TRANSACTION_EXECUTION &&
       !!env.WALLET_PRIVATE_KEY,
 
     automatic_broadcast:
-      !PAPER_MODE &&
       TRANSACTION_EXECUTION &&
       !!env.SOLANA_RPC_URL &&
       !!env.WALLET_PRIVATE_KEY,
@@ -4431,889 +2819,76 @@ function liveBetaExecutionStatus(
 }
 
 /* ============================================================
-SCAN
-============================================================ */
-async function runScan(
-  env
-) {
-  const discovery =
-    createDiscoveryDiagnostics();
-
-  const [
-    dexDiscovery,
-    dexSearch
-  ] =
-    await Promise.all([
-      getDexDiscovery(),
-      getDexSearch()
-    ]);
-
-  Object.assign(
-    discovery,
-    dexDiscovery.diagnostics
-  );
-
-  discovery.dexscreener_search =
-    dexSearch.diagnostics;
-
-  const sources = [
-    ...dexDiscovery.results,
-    ...dexSearch.results
-  ];
-
-  const mintSource =
-    new Map();
-
-  for (
-    const item of
-    sources
-  ) {
-    if (!item?.mint) {
-      continue;
-    }
-
-    if (
-      !mintSource.has(
-        item.mint
-      )
-    ) {
-      mintSource.set(
-        item.mint,
-        item.source
-      );
-    }
-  }
-
-  const orderedMints = [];
-
-  for (
-    const mint of
-    dexSearch.pairMap.keys()
-  ) {
-    if (
-      !orderedMints.includes(
-        mint
-      )
-    ) {
-      orderedMints.push(
-        mint
-      );
-    }
-
-    if (
-      orderedMints.length >=
-      MAX_CANDIDATES
-    ) {
-      break;
-    }
-  }
-
-  if (
-    orderedMints.length <
-    MAX_CANDIDATES
-  ) {
-    for (
-      const mint of
-      mintSource.keys()
-    ) {
-      if (
-        !orderedMints.includes(
-          mint
-        )
-      ) {
-        orderedMints.push(
-          mint
-        );
-      }
-
-      if (
-        orderedMints.length >=
-        MAX_CANDIDATES
-      ) {
-        break;
-      }
-    }
-  }
-
-  const mints =
-    orderedMints.slice(
-      0,
-      MAX_CANDIDATES
-    );
-
-  const hydrationMints =
-    mints
-      .filter(
-        mint =>
-          !dexSearch.pairMap.has(
-            mint
-          )
-      )
-      .slice(
-        0,
-        MAX_DEX_TOKENS_ANALYZED
-      );
-
-  const [
-    dexHydration,
-    jupiter,
-    portfolio
-  ] =
-    await Promise.all([
-      hydrateDexPairs(
-        hydrationMints
-      ),
-
-      getJupiterPrices(
-        mints
-      ),
-
-      loadPortfolio(
-        env
-      )
-    ]);
-
-  const candidates = [];
-
-  for (
-    const mint of
-    mints
-  ) {
-    const dexPair =
-      dexSearch.pairMap.get(
-        mint
-      ) ||
-      dexHydration.hydrated.get(
-        mint
-      ) ||
-      null;
-
-    const candidate =
-      normalizeCandidate(
-        mint,
-        dexPair,
-        jupiter.prices[
-          mint
-        ],
-        mintSource.get(
-          mint
-        ) ||
-          "DEXSCREENER_SEARCH"
-      );
-
-    const scoring =
-      scoreCandidate(
-        portfolio,
-        candidate
-      );
-
-    Object.assign(
-      candidate,
-      scoring
-    );
-
-    candidate.filter_reasons =
-      evaluateCandidate(
-        portfolio,
-        candidate
-      );
-
-    candidates.push(
-      candidate
-    );
-  }
-
-  candidates.sort(
-    (a, b) =>
-      safeNumber(
-        b.score
-      ) -
-      safeNumber(
-        a.score
-      )
-  );
-
-  const discoveryRequests =
-    3 +
-    dexSearch
-      .diagnostics
-      .attempted;
-
-  const hydrationRequests =
-    dexHydration
-      .diagnostics
-      .attempted;
-
-  const jupiterRequests =
-    1 +
-    jupiter
-      .diagnostics
-      .fallback_attempted;
-
-  return {
-    candidates:
-      candidates.slice(
-        0,
-        MAX_CANDIDATES
-      ),
-
-    diagnostics: {
-      discovery,
-
-      dex_hydration:
-        dexHydration.diagnostics,
-
-      gecko_hydration: {
-        attempted: 0,
-        successful: 0,
-        failed: 0,
-        empty: 0,
-        errors: [],
-        samples: [],
-        skipped:
-          "COINGECKO_HYDRATION_DISABLED_TO_PROTECT_SUBREQUEST_BUDGET"
-      },
-
-      jupiter:
-        jupiter.diagnostics,
-
-      subrequest_budget: {
-        estimated_discovery_requests:
-          discoveryRequests,
-
-        estimated_dex_hydration_requests:
-          hydrationRequests,
-
-        estimated_jupiter_requests:
-          jupiterRequests,
-
-        estimated_kv_reads:
-          1,
-
-        estimated_total:
-          discoveryRequests +
-          hydrationRequests +
-          jupiterRequests +
-          1,
-
-        target_limit:
-          50
-      }
-    }
-  };
-}
-
-/* ============================================================
-ENGINE
-============================================================ */
-async function runPaperEngine(
-  env,
-  portfolio,
-  scan
-) {
-  /*
-  This function retains its historical name so the rest of
-  the worker structure remains stable.
-
-  It is now the execution engine for both paper and live mode.
-  This deployment is configured for LIVE mode.
-  */
-  if (
-    PAPER_MODE &&
-    TRANSACTION_EXECUTION
-  ) {
-    throw new Error(
-      "INVALID_EXECUTION_CONFIGURATION"
-    );
-  }
-
-  if (
-    !PAPER_MODE &&
-    !TRANSACTION_EXECUTION
-  ) {
-    throw new Error(
-      "NO_LIVE_EXECUTION_ENABLED"
-    );
-  }
-
-  cleanupCooldowns(
-    portfolio
-  );
-
-  const candidateMap =
-    new Map(
-      scan.candidates.map(
-        candidate => [
-          candidate.mint,
-          candidate
-        ]
-      )
-    );
-
-  let sells = 0;
-
-  for (
-    const position of
-    [...portfolio.positions]
-  ) {
-    const candidate =
-      candidateMap.get(
-        position.mint
-      );
-
-    if (!candidate) {
-      continue;
-    }
-
-    const reason =
-      getSellReason(
-        position,
-        candidate
-      );
-
-    if (!reason) {
-      continue;
-    }
-
-    if (PAPER_MODE) {
-      /*
-      Kept for compatibility if paper mode is ever explicitly
-      re-enabled.
-      */
-      const price =
-        safeNumber(
-          candidate.price_usd
-        );
-
-      if (
-        price <= 0
-      ) {
-        continue;
-      }
-
-      const proceeds =
-        safeNumber(
-          position.quantity
-        ) *
-        price;
-
-      const pnl =
-        proceeds -
-        safeNumber(
-          position.cost_usd
-        );
-
-      portfolio.cash_usd +=
-        proceeds;
-
-      portfolio.realized_pnl_usd +=
-        pnl;
-
-      portfolio.positions =
-        portfolio.positions.filter(
-          item =>
-            item.mint !==
-            position.mint
-        );
-
-      addHistory(
-        portfolio,
-        {
-          type:
-            "SELL",
-
-          mode:
-            "PAPER",
-
-          mint:
-            position.mint,
-
-          proceeds_usd:
-            round(
-              proceeds,
-              6
-            ),
-
-          pnl_usd:
-            round(
-              pnl,
-              6
-            ),
-
-          reason
-        }
-      );
-
-      setCooldown(
-        portfolio,
-        position.mint
-      );
-    } else {
-      await liveSell(
-        env,
-        portfolio,
-        position,
-        candidate,
-        reason
-      );
-
-      /*
-      A successful live transaction must be persisted
-      immediately. Do not allow the normal KV throttle to
-      discard the new position state.
-      */
-      await savePortfolio(
-        env,
-        portfolio,
-        "LIVE_SELL",
-        {
-          force:
-            true
-        }
-      );
-    }
-
-    sells++;
-  }
-
-  let buys = 0;
-
-  if (
-    portfolio.positions.length <
-    MAX_POSITIONS
-  ) {
-    const equity =
-      calculateEquity(
-        portfolio,
-        candidateMap
-      );
-
-    const positionSize =
-      PAPER_MODE
-        ? getPositionSize(
-            equity
-          )
-        : MAX_LIVE_TRADE_USD;
-
-    for (
-      const candidate of
-      scan.candidates
-    ) {
-      if (
-        buys >=
-        MAX_NEW_BUYS_PER_RUN
-      ) {
-        break;
-      }
-
-      if (
-        candidate.score <
-        MIN_ENTRY_SCORE
-      ) {
-        continue;
-      }
-
-      if (
-        candidate.momentum_score <
-        MIN_MOMENTUM_SCORE
-      ) {
-        continue;
-      }
-
-      if (
-        candidate.setup_score <
-        MIN_SETUP_SCORE
-      ) {
-        continue;
-      }
-
-      const reasons =
-        evaluateCandidate(
-          portfolio,
-          candidate
-        );
-
-      if (
-        reasons.length
-      ) {
-        continue;
-      }
-
-      if (
-        portfolio.cash_usd <
-        positionSize
-      ) {
-        continue;
-      }
-
-      if (
-        portfolio.cash_usd -
-          positionSize <
-        MIN_CASH_RESERVE_USD
-      ) {
-        continue;
-      }
-
-      if (
-        PAPER_MODE
-      ) {
-        const price =
-          safeNumber(
-            candidate.price_usd
-          );
-
-        if (
-          price <= 0
-        ) {
-          continue;
-        }
-
-        const quantity =
-          positionSize /
-          price;
-
-        portfolio.cash_usd -=
-          positionSize;
-
-        portfolio.positions.push({
-          mint:
-            candidate.mint,
-
-          symbol:
-            candidate.symbol ||
-            null,
-
-          name:
-            candidate.name ||
-            null,
-
-          entry_price_usd:
-            price,
-
-          quantity,
-
-          cost_usd:
-            positionSize,
-
-          peak_price_usd:
-            price,
-
-          trailing_active:
-            false,
-
-          reversal_confirmations:
-            0,
-
-          opened_at:
-            nowIso(),
-
-          source:
-            candidate.source ||
-            null
-        });
-
-        addHistory(
-          portfolio,
-          {
-            type:
-              "BUY",
-
-            mode:
-              "PAPER",
-
-            mint:
-              candidate.mint,
-
-            amount_usd:
-              round(
-                positionSize,
-                6
-              ),
-
-            price_usd:
-              price,
-
-            quantity,
-
-            score:
-              candidate.score
-          }
-        );
-
-        setCooldown(
-          portfolio,
-          candidate.mint
-        );
-      } else {
-        await liveBuy(
-          env,
-          portfolio,
-          candidate,
-          positionSize
-        );
-
-        /*
-        Immediately checkpoint the live position.
-        */
-        await savePortfolio(
-          env,
-          portfolio,
-          "LIVE_BUY",
-          {
-            force:
-              true
-          }
-        );
-      }
-
-      buys++;
-    }
-  }
-
-  for (
-    const candidate of
-    scan.candidates
-  ) {
-    recordMarketObservation(
-      portfolio,
-      candidate
-    );
-  }
-
-  return {
-    buys,
-    sells,
-    positions:
-      portfolio.positions.length
-  };
-}
-
-/* ============================================================
-AUTHORIZATION
-============================================================ */
-async function requireExecutionAuthorization(
-  request,
-  env
-) {
-  /*
-  Scheduled execution intentionally does not come through
-  this function.
-
-  HTTP live execution remains protected by a bearer token.
-  */
-  if (
-    PAPER_MODE ||
-    !TRANSACTION_EXECUTION
-  ) {
-    return;
-  }
-
-  const expected =
-    String(
-      env.LIVE_EXECUTION_TOKEN ||
-      ""
-    );
-
-  if (!expected) {
-    throw new Error(
-      "MISSING_LIVE_EXECUTION_TOKEN"
-    );
-  }
-
-  const header =
-    request.headers.get(
-      "authorization"
-    ) || "";
-
-  const prefix =
-    "Bearer ";
-
-  if (
-    !header.startsWith(
-      prefix
-    )
-  ) {
-    throw new Error(
-      "LIVE_EXECUTION_AUTH_REQUIRED"
-    );
-  }
-
-  const supplied =
-    header.slice(
-      prefix.length
-    );
-
-  const encoder =
-    new TextEncoder();
-
-  const a =
-    encoder.encode(
-      supplied
-    );
-
-  const b =
-    encoder.encode(
-      expected
-    );
-
-  if (
-    a.length !==
-    b.length
-  ) {
-    throw new Error(
-      "LIVE_EXECUTION_UNAUTHORIZED"
-    );
-  }
-
-  let equal = true;
-
-  for (
-    let i = 0;
-    i < a.length;
-    i++
-  ) {
-    equal =
-      equal &&
-      a[i] === b[i];
-  }
-
-  if (!equal) {
-    throw new Error(
-      "LIVE_EXECUTION_UNAUTHORIZED"
-    );
-  }
-}
-
-/* ============================================================
-RESPONSE
-============================================================ */
-function jsonResponse(
-  body,
-  status = 200
-) {
-  return new Response(
-    JSON.stringify(
-      body,
-      null,
-      2
-    ),
-    {
-      status,
-
-      headers: {
-        "content-type":
-          "application/json; charset=utf-8",
-
-        "cache-control":
-          "no-store"
-      }
-    }
-  );
-}
-
-/* ============================================================
 HEALTH
 ============================================================ */
-async function health(
-  env
-) {
+
+async function health(env) {
   return {
     ok: true,
-
-    bot:
-      BOT_NAME,
+    bot: BOT_NAME,
 
     mode: {
-      type:
-        PAPER_MODE
-          ? "PAPER"
-          : "LIVE",
-
-      live_beta:
-        LIVE_BETA_MODE,
-
+      type: "LIVE",
+      live_beta: LIVE_BETA_MODE,
       transaction_execution:
         TRANSACTION_EXECUTION
     },
 
     execution:
-      liveBetaExecutionStatus(
-        env
-      ),
+      executionStatus(env),
 
     scanner_status:
       "OK",
 
     scanner_subrequest_protection: {
-      enabled:
-        true,
-
+      enabled: true,
       max_candidates:
         MAX_CANDIDATES,
-
       max_dex_hydration:
         MAX_DEX_TOKENS_ANALYZED,
-
-      gecko_hydration:
-        false
+      gecko_hydration: false
     },
 
     live_limits: {
       max_bankroll_usd:
         MAX_LIVE_BANKROLL_USD,
-
       max_trade_usd:
         MAX_LIVE_TRADE_USD,
-
       min_sol_reserve:
         MIN_SOL_RESERVE,
-
+      min_cash_reserve_usd:
+        MIN_CASH_RESERVE_USD,
       max_positions:
         MAX_POSITIONS,
-
       max_new_buys_per_run:
         MAX_NEW_BUYS_PER_RUN
     },
 
-    time:
-      nowIso()
+    time: nowIso()
   };
 }
 
 /* ============================================================
 STATUS
 ============================================================ */
-async function status(
-  env
-) {
+
+async function status(env) {
   const portfolio =
-    await loadPortfolio(
-      env
-    );
+    await loadPortfolio(env);
 
   return {
     ok: true,
-
-    bot:
-      BOT_NAME,
+    bot: BOT_NAME,
 
     mode: {
-      type:
-        PAPER_MODE
-          ? "PAPER"
-          : "LIVE",
-
-      live_beta:
-        LIVE_BETA_MODE,
-
+      type: "LIVE",
+      live_beta: LIVE_BETA_MODE,
       transaction_execution:
         TRANSACTION_EXECUTION
     },
 
     execution:
-      liveBetaExecutionStatus(
-        env
-      ),
+      executionStatus(env),
 
     portfolio: {
       schema_version:
@@ -5345,22 +2920,19 @@ async function status(
 
       market_memory_count:
         Object.keys(
-          portfolio.market_memory ||
-            {}
+          portfolio.market_memory || {}
         ).length
     },
 
-    time:
-      nowIso()
+    time: nowIso()
   };
 }
 
 /* ============================================================
 RESET
 ============================================================ */
-async function resetPortfolio(
-  env
-) {
+
+async function resetPortfolio(env) {
   const portfolio =
     createEmptyPortfolio();
 
@@ -5368,10 +2940,7 @@ async function resetPortfolio(
     env,
     portfolio,
     "LIVE_RESET",
-    {
-      force:
-        true
-    }
+    true
   );
 
   return {
@@ -5385,77 +2954,57 @@ async function resetPortfolio(
 /* ============================================================
 REQUEST HANDLER
 ============================================================ */
+
 async function handleRequest(
   request,
   env
 ) {
   const url =
-    new URL(
-      request.url
-    );
+    new URL(request.url);
 
   const pathname =
     url.pathname;
 
   if (
-    request.method ===
-      "GET" &&
-    pathname ===
-      "/health"
+    request.method === "GET" &&
+    pathname === "/health"
   ) {
     return jsonResponse(
-      await health(
-        env
-      )
+      await health(env)
     );
   }
 
   if (
-    request.method ===
-      "GET" &&
-    pathname ===
-      "/status"
+    request.method === "GET" &&
+    pathname === "/status"
   ) {
     return jsonResponse(
-      await status(
-        env
-      )
+      await status(env)
     );
   }
 
   if (
-    request.method ===
-      "GET" &&
-    pathname ===
-      "/scan"
+    request.method === "GET" &&
+    pathname === "/scan"
   ) {
     try {
       const scan =
-        await runScan(
-          env
-        );
+        await runScan(env);
 
       return jsonResponse({
         ok: true,
-
-        bot:
-          BOT_NAME,
-
-        scanner_status:
-          "OK",
-
-        mode:
-          "LIVE",
-
+        bot: BOT_NAME,
+        scanner_status: "OK",
+        mode: "LIVE",
         scan
       });
     } catch (error) {
       return jsonResponse(
         {
           ok: false,
-
-          error:
-            errorText(error)
+          bot: BOT_NAME,
+          mode: "LIVE",
+          error: errorText(error)
         },
         500
       );
@@ -5463,10 +3012,8 @@ async function handleRequest(
   }
 
   if (
-    request.method ===
-      "POST" &&
-    pathname ===
-      "/run"
+    request.method === "POST" &&
+    pathname === "/run"
   ) {
     try {
       await requireExecutionAuthorization(
@@ -5474,49 +3021,34 @@ async function handleRequest(
         env
       );
 
+      requireLiveConfig(env);
+
       const portfolio =
-        await loadPortfolio(
-          env
-        );
+        await loadPortfolio(env);
 
       const scan =
-        await runScan(
-          env
-        );
+        await runScan(env);
 
       const engine =
-        await runPaperEngine(
+        await runLiveEngine(
           env,
           portfolio,
           scan
         );
 
-      /*
-      Live trades are already force-persisted individually.
-      This final save captures market-memory updates and any
-      other portfolio changes.
-      */
       const persist =
         await savePortfolio(
           env,
           portfolio,
           "LIVE_RUN",
-          {
-            force:
-              engine.buys > 0 ||
-              engine.sells > 0
-          }
+          engine.buys > 0 ||
+            engine.sells > 0
         );
 
       return jsonResponse({
         ok: true,
-
-        bot:
-          BOT_NAME,
-
-        mode:
-          "LIVE",
-
+        bot: BOT_NAME,
+        mode: "LIVE",
         transaction_execution:
           TRANSACTION_EXECUTION,
 
@@ -5556,12 +3088,9 @@ async function handleRequest(
       return jsonResponse(
         {
           ok: false,
-
-          mode:
-            "LIVE",
-
-          error:
-            errorText(error)
+          bot: BOT_NAME,
+          mode: "LIVE",
+          error: errorText(error)
         },
         500
       );
@@ -5569,10 +3098,8 @@ async function handleRequest(
   }
 
   if (
-    request.method ===
-      "POST" &&
-    pathname ===
-      "/reset"
+    request.method === "POST" &&
+    pathname === "/reset"
   ) {
     try {
       await requireExecutionAuthorization(
@@ -5580,18 +3107,18 @@ async function handleRequest(
         env
       );
 
+      requireLiveConfig(env);
+
       return jsonResponse(
-        await resetPortfolio(
-          env
-        )
+        await resetPortfolio(env)
       );
     } catch (error) {
       return jsonResponse(
         {
           ok: false,
-
-          error:
-            errorText(error)
+          bot: BOT_NAME,
+          mode: "LIVE",
+          error: errorText(error)
         },
         500
       );
@@ -5601,65 +3128,34 @@ async function handleRequest(
   return jsonResponse(
     {
       ok: false,
-
-      error:
-        "NOT_FOUND"
+      error: "NOT_FOUND"
     },
     404
   );
 }
 
 /* ============================================================
-SCHEDULED RUN
+SCHEDULED LIVE RUN
 ============================================================ */
-async function scheduledRun(
-  env
-) {
-  /*
-  Hard live-mode guard.
 
-  If this worker is deployed with the constants in this file,
-  the scheduled cron is an automatic live execution path.
-  */
-  if (
-    PAPER_MODE ||
-    !TRANSACTION_EXECUTION
-  ) {
-    throw new Error(
-      "SCHEDULED_LIVE_EXECUTION_NOT_ENABLED"
-    );
-  }
-
-  requireLiveConfig(
-    env
-  );
+async function scheduledRun(env) {
+  requireLiveConfig(env);
 
   const portfolio =
-    await loadPortfolio(
-      env
-    );
+    await loadPortfolio(env);
 
   const scan =
-    await runScan(
-      env
-    );
+    await runScan(env);
 
   const engine =
-    await runPaperEngine(
+    await runLiveEngine(
       env,
       portfolio,
       scan
     );
 
-  /*
-  If a live trade happened, runPaperEngine has already forced
-  a checkpoint. This additional checkpoint captures scanner
-  memory and routine state.
-  */
   if (
-    checkpointDue(
-      portfolio
-    ) ||
+    checkpointDue(portfolio) ||
     engine.buys > 0 ||
     engine.sells > 0
   ) {
@@ -5667,18 +3163,16 @@ async function scheduledRun(
       env,
       portfolio,
       "LIVE_CHECKPOINT",
-      {
-        force:
-          engine.buys > 0 ||
-          engine.sells > 0
-      }
+      engine.buys > 0 ||
+        engine.sells > 0
     );
   }
 }
 
 /* ============================================================
-WORKER EXPORT
+WORKER
 ============================================================ */
+
 export default {
   async fetch(
     request,
@@ -5694,15 +3188,9 @@ export default {
       return jsonResponse(
         {
           ok: false,
-
-          bot:
-            BOT_NAME,
-
-          mode:
-            "LIVE",
-
-          error:
-            errorText(error)
+          bot: BOT_NAME,
+          mode: "LIVE",
+          error: errorText(error)
         },
         500
       );
@@ -5715,9 +3203,7 @@ export default {
     ctx
   ) {
     ctx.waitUntil(
-      scheduledRun(
-        env
-      )
+      scheduledRun(env)
     );
   }
 };
