@@ -2,22 +2,26 @@ const BOT_NAME = "memebott";
 
 /*
 ============================================================
-MEMEBOTT — LIVE BETA / CONFIRMATION GATED
+MEMEBOTT — PAPER / CONFIRMATION GATED
 ============================================================
-Strategy revision:
+Scanner revision:
 - Scanner still runs every minute.
 - KV persistence remains throttled.
 - Compact short-term candidate memory is maintained.
 - Historical observations help identify early momentum.
 - Existing safety filters remain intact.
 - Duplicate extreme 1h penalty removed.
-- Live beta path is confirmation-gated; no automatic transaction execution.
-- Discovery diagnostics enabled.
-- DexScreener batch hydration enabled.
-- Jupiter Price API v3 robust response parsing enabled.
-- Jupiter fallback price diagnostics enabled.
-- Liquidity-source diagnostics enabled.
+- Live beta path remains confirmation-gated.
+- Automatic transaction execution remains disabled.
+- DexScreener discovery/search data is reused directly.
+- Additional DEX hydration is strictly capped.
+- CoinGecko per-token hydration is disabled because it was
+  returning rate-limit errors and consuming subrequests.
+- Jupiter batch price confirmation remains enabled.
+- Missing liquidity is distinguished from confirmed zero.
+============================================================
 */
+
 const PAPER_MODE = true;
 const LIVE_BETA_MODE = true;
 const TRANSACTION_EXECUTION = false;
@@ -107,19 +111,29 @@ const HOURLY_SELL_RATIO = 1.43;
 /* ============================================================
 SCANNER LIMITS
 ============================================================ */
-const MAX_CANDIDATES = 30;
-const MAX_DEX_TOKENS_ANALYZED = 40;
-const MAX_GECKO_POOLS_ANALYZED = 20;
-const MAX_JUPITER_PRICE_CHECKS = 20;
 
 /*
-Jupiter fallback is deliberately limited.
-If the batch endpoint returns HTTP 200 but no usable prices,
-we perform a small number of individual requests. This gives
-us a real diagnostic signal without turning every scan into
-a large number of API calls.
+The critical protection.
+
+Cloudflare Workers Free allows 50 external subrequests per
+invocation. The scanner therefore intentionally stays well
+below that number.
+
+Approximate normal scan:
+3 DEX discovery
++ 3 DEX searches
++ up to 20 DEX hydrations
++ 1 Jupiter batch
++ up to 2 Jupiter fallbacks
++ 1 KV portfolio read
+= 30 external/service operations or fewer.
+
+CoinGecko hydration is intentionally not performed.
 */
-const MAX_JUPITER_FALLBACK_CHECKS = 5;
+const MAX_CANDIDATES = 30;
+const MAX_DEX_TOKENS_ANALYZED = 20;
+const MAX_JUPITER_PRICE_CHECKS = 20;
+const MAX_JUPITER_FALLBACK_CHECKS = 2;
 
 /* ============================================================
 API SETTINGS
@@ -144,10 +158,6 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-function pct(value) {
-  return safeNumber(value) * 100;
-}
-
 function round(value, decimals = 4) {
   const p = 10 ** decimals;
   return Math.round(safeNumber(value) * p) / p;
@@ -163,13 +173,6 @@ function errorText(error) {
 
 function cloneObject(value) {
   return JSON.parse(JSON.stringify(value));
-}
-
-function restoreObject(target, snapshot) {
-  for (const key of Object.keys(target)) {
-    delete target[key];
-  }
-  Object.assign(target, snapshot);
 }
 
 /* ============================================================
@@ -223,12 +226,10 @@ async function fetchJsonDiagnostic(url, options = {}) {
     }
 
     try {
-      const data = await response.json();
-
       return {
         ok: true,
         status,
-        data,
+        data: await response.json(),
         error: null
       };
     } catch (error) {
@@ -250,18 +251,9 @@ async function fetchJsonDiagnostic(url, options = {}) {
 }
 
 function responseShape(value) {
-  if (Array.isArray(value)) {
-    return "array";
-  }
-
-  if (value === null) {
-    return "null";
-  }
-
-  if (typeof value === "object") {
-    return "object";
-  }
-
+  if (Array.isArray(value)) return "array";
+  if (value === null) return "null";
+  if (typeof value === "object") return "object";
   return typeof value;
 }
 
@@ -333,14 +325,12 @@ async function loadPortfolio(env) {
 }
 
 /* ============================================================
-PERSISTENCE CONTROL
+PERSISTENCE
 ============================================================ */
 function persistenceAgeMs(portfolio) {
   const last = safeNumber(portfolio.last_persist_at);
 
-  if (!last) {
-    return Infinity;
-  }
+  if (!last) return Infinity;
 
   return Date.now() - last;
 }
@@ -453,6 +443,7 @@ function createDiscoveryDiagnostics() {
       error: null,
       sample: []
     },
+
     dexscreener_boosts: {
       attempted: true,
       http_status: null,
@@ -463,6 +454,7 @@ function createDiscoveryDiagnostics() {
       error: null,
       sample: []
     },
+
     dexscreener_top_boosts: {
       attempted: true,
       http_status: null,
@@ -473,6 +465,7 @@ function createDiscoveryDiagnostics() {
       error: null,
       sample: []
     },
+
     dexscreener_search: {
       attempted: 0,
       queries: {},
@@ -481,31 +474,34 @@ function createDiscoveryDiagnostics() {
       extracted_mints: 0,
       errors: []
     },
+
     gecko_trending: {
-      attempted: true,
+      attempted: false,
       http_status: null,
       response_shape: null,
       pool_count: 0,
       tokens_extracted: 0,
-      error: null,
+      error: "SKIPPED_TO_PROTECT_SUBREQUEST_BUDGET",
       sample: []
     },
+
     gecko_top_pools: {
-      attempted: true,
+      attempted: false,
       http_status: null,
       response_shape: null,
       pool_count: 0,
       tokens_extracted: 0,
-      error: null,
+      error: "SKIPPED_TO_PROTECT_SUBREQUEST_BUDGET",
       sample: []
     },
+
     gecko_new_pools: {
-      attempted: true,
+      attempted: false,
       http_status: null,
       response_shape: null,
       pool_count: 0,
       tokens_extracted: 0,
-      error: null,
+      error: "SKIPPED_TO_PROTECT_SUBREQUEST_BUDGET",
       sample: []
     }
   };
@@ -516,14 +512,17 @@ function discoveryItemSample(item) {
     chain_id:
       item?.chainId ||
       null,
+
     token_address:
       item?.tokenAddress ||
       item?.address ||
       null,
+
     symbol:
       item?.symbol ||
       item?.baseToken?.symbol ||
       null,
+
     name:
       item?.name ||
       item?.baseToken?.name ||
@@ -544,11 +543,13 @@ async function getDexDiscovery() {
       url:
         `${DEX_BASE}/token-profiles/latest/v1`
     },
+
     {
       key: "dexscreener_boosts",
       url:
         `${DEX_BASE}/token-boosts/latest/v1`
     },
+
     {
       key: "dexscreener_top_boosts",
       url:
@@ -565,10 +566,12 @@ async function getDexDiscovery() {
     const diagnostic =
       diagnostics[endpoint.key];
 
-    diagnostic.http_status = result.status;
+    diagnostic.http_status =
+      result.status;
 
     if (!result.ok) {
-      diagnostic.error = result.error;
+      diagnostic.error =
+        result.error;
       continue;
     }
 
@@ -605,9 +608,7 @@ async function getDexDiscovery() {
         item?.tokenAddress ||
         item?.address;
 
-      if (!mint) {
-        continue;
-      }
+      if (!mint) continue;
 
       diagnostic.extracted_mints++;
 
@@ -629,14 +630,24 @@ async function getDexDiscovery() {
     results:
       results.slice(
         0,
-        MAX_DEX_TOKENS_ANALYZED
+        MAX_CANDIDATES
       ),
+
     diagnostics
   };
 }
 
 /* ============================================================
 DEXSCREENER SEARCH
+
+IMPORTANT:
+The actual pair objects are retained here.
+
+Previously the scanner threw away this information and then
+made another request for every token. That was the main source
+of the subrequest explosion.
+
+Now search data is reused directly.
 ============================================================ */
 async function getDexSearch() {
   const queries = [
@@ -646,6 +657,7 @@ async function getDexSearch() {
   ];
 
   const results = [];
+  const pairMap = new Map();
 
   const diagnostics =
     createDiscoveryDiagnostics()
@@ -722,21 +734,27 @@ async function getDexSearch() {
           chain_id:
             pair?.chainId ||
             null,
+
           dex_id:
             pair?.dexId ||
             null,
+
           pair_address:
             pair?.pairAddress ||
             null,
+
           base_symbol:
             pair?.baseToken?.symbol ||
             null,
+
           base_address:
             pair?.baseToken?.address ||
             null,
+
           price_usd:
             pair?.priceUsd ||
             null,
+
           liquidity_usd:
             pair?.liquidity?.usd ??
             null
@@ -758,12 +776,61 @@ async function getDexSearch() {
       const mint =
         pair?.baseToken?.address;
 
-      if (!mint) {
-        continue;
-      }
+      if (!mint) continue;
 
       queryDiagnostic.extracted_mints++;
       diagnostics.extracted_mints++;
+
+      /*
+      Keep the best observed pair for this mint.
+
+      Prefer liquidity, then volume, then price availability.
+      */
+      const existing =
+        pairMap.get(mint);
+
+      if (!existing) {
+        pairMap.set(
+          mint,
+          pair
+        );
+      } else {
+        const existingLiquidity =
+          safeNumber(
+            existing?.liquidity?.usd
+          );
+
+        const currentLiquidity =
+          safeNumber(
+            pair?.liquidity?.usd
+          );
+
+        const existingVolume =
+          safeNumber(
+            existing?.volume?.h24
+          );
+
+        const currentVolume =
+          safeNumber(
+            pair?.volume?.h24
+          );
+
+        if (
+          currentLiquidity >
+            existingLiquidity ||
+          (
+            currentLiquidity ===
+              existingLiquidity &&
+            currentVolume >
+              existingVolume
+          )
+        ) {
+          pairMap.set(
+            mint,
+            pair
+          );
+        }
+      }
 
       results.push({
         mint,
@@ -777,166 +844,16 @@ async function getDexSearch() {
     results:
       results.slice(
         0,
-        MAX_DEX_TOKENS_ANALYZED
+        MAX_CANDIDATES
       ),
+
+    pairMap,
     diagnostics
   };
 }
 
 /* ============================================================
-GECKO HELPERS
-============================================================ */
-function extractGeckoMint(item) {
-  const id =
-    item?.relationships
-      ?.base_token
-      ?.data
-      ?.id;
-
-  if (id) {
-    return String(id)
-      .replace(/^solana_/, "");
-  }
-
-  const directAddress =
-    item?.attributes?.address ||
-    item?.address;
-
-  if (directAddress) {
-    return String(directAddress);
-  }
-
-  return null;
-}
-
-function geckoPoolSample(item) {
-  return {
-    id:
-      item?.id ||
-      null,
-    type:
-      item?.type ||
-      null,
-    address:
-      item?.attributes?.address ||
-      null,
-    name:
-      item?.attributes?.name ||
-      null,
-    base_token_price_usd:
-      item?.attributes
-        ?.base_token_price_usd ||
-      null,
-    reserve_usd:
-      item?.attributes
-        ?.reserve_in_usd ||
-      null
-  };
-}
-
-/* ============================================================
-GECKOTERMINAL DISCOVERY
-============================================================ */
-async function getGeckoCandidates() {
-  const mints = new Set();
-
-  const diagnostics =
-    createDiscoveryDiagnostics();
-
-  async function readGeckoEndpoint(
-    key,
-    url
-  ) {
-    const diagnostic =
-      diagnostics[key];
-
-    const result =
-      await fetchJsonDiagnostic(
-        url,
-        {
-          headers: {
-            accept:
-              "application/json;version=20230203"
-          }
-        }
-      );
-
-    diagnostic.http_status =
-      result.status;
-
-    if (!result.ok) {
-      diagnostic.error =
-        result.error;
-      return;
-    }
-
-    diagnostic.response_shape =
-      responseShape(result.data);
-
-    const items =
-      Array.isArray(result.data?.data)
-        ? result.data.data
-        : null;
-
-    if (!items) {
-      diagnostic.error =
-        "EXPECTED_OBJECT_WITH_DATA_ARRAY";
-      return;
-    }
-
-    diagnostic.pool_count =
-      items.length;
-
-    diagnostic.sample =
-      items
-        .slice(0, 5)
-        .map(geckoPoolSample);
-
-    for (const item of items) {
-      const mint =
-        extractGeckoMint(item);
-
-      if (!mint) {
-        continue;
-      }
-
-      diagnostic.tokens_extracted++;
-      mints.add(mint);
-    }
-  }
-
-  await readGeckoEndpoint(
-    "gecko_trending",
-    `${GECKO_BASE}/networks/solana/trending_pools?page=1`
-  );
-
-  if (mints.size === 0) {
-    await readGeckoEndpoint(
-      "gecko_top_pools",
-      `${GECKO_BASE}/networks/solana/pools?page=1&include=base_token`
-    );
-  }
-
-  if (mints.size === 0) {
-    await readGeckoEndpoint(
-      "gecko_new_pools",
-      `${GECKO_BASE}/networks/solana/new_pools?page=1&include=base_token`
-    );
-  }
-
-  return {
-    mints: [
-      ...mints
-    ].slice(
-      0,
-      MAX_GECKO_POOLS_ANALYZED
-    ),
-    diagnostics
-  };
-}
-
-/* ============================================================
-BEST DEX PAIR — LIQUIDITY DIAGNOSTIC VERSION
+DEX PAIR SUMMARY
 ============================================================ */
 function summarizeDexPair(pair, index) {
   const hasLiquidityField =
@@ -954,44 +871,54 @@ function summarizeDexPair(pair, index) {
       ? pair.liquidity.usd
       : null;
 
-  const normalizedLiquidity =
-    safeNumber(
-      rawLiquidity,
-      0
-    );
-
   return {
     rank: index + 1,
+
     pair_address:
       pair?.pairAddress ||
       null,
+
     dex_id:
       pair?.dexId ||
       null,
+
     url:
       pair?.url ||
       null,
+
     base_symbol:
       pair?.baseToken?.symbol ||
       null,
+
     quote_symbol:
       pair?.quoteToken?.symbol ||
       null,
+
     liquidity_field_present:
       hasLiquidityField,
+
     liquidity_raw:
       rawLiquidity,
+
     liquidity_usd:
-      normalizedLiquidity,
+      hasLiquidityField
+        ? safeNumber(
+            rawLiquidity
+          )
+        : null,
+
     volume_24h_raw:
       pair?.volume?.h24 ??
       null,
+
     volume_1h_raw:
       pair?.volume?.h1 ??
       null,
+
     price_usd_raw:
       pair?.priceUsd ??
       null,
+
     pair_created_at:
       pair?.pairCreatedAt ??
       null
@@ -999,17 +926,29 @@ function summarizeDexPair(pair, index) {
 }
 
 /* ============================================================
-BATCH DEXSCREENER HYDRATION
+DEX HYDRATION
+
+Only tokens that do NOT already have usable DEX search data
+are hydrated.
+
+The maximum is deliberately small.
 ============================================================ */
 async function hydrateDexPairs(mints) {
   const uniqueMints =
-    unique(mints);
+    unique(mints)
+      .slice(
+        0,
+        MAX_DEX_TOKENS_ANALYZED
+      );
 
   const diagnostics = {
-    attempted: uniqueMints.length,
+    attempted:
+      uniqueMints.length,
+
     successful: 0,
     failed: 0,
     empty: 0,
+
     errors: [],
     samples: []
   };
@@ -1028,14 +967,17 @@ async function hydrateDexPairs(mints) {
 
         diagnostics.errors.push({
           mint,
-          error: result.error
+          error:
+            result.error
         });
 
         continue;
       }
 
       const pairs =
-        Array.isArray(result.data?.pairs)
+        Array.isArray(
+          result.data?.pairs
+        )
           ? result.data.pairs
           : [];
 
@@ -1060,13 +1002,36 @@ async function hydrateDexPairs(mints) {
       }
 
       solanaPairs.sort(
-        (a, b) =>
-          safeNumber(
-            b?.liquidity?.usd
-          ) -
-          safeNumber(
-            a?.liquidity?.usd
-          )
+        (a, b) => {
+          const liquidityA =
+            safeNumber(
+              a?.liquidity?.usd
+            );
+
+          const liquidityB =
+            safeNumber(
+              b?.liquidity?.usd
+            );
+
+          if (
+            liquidityB !==
+            liquidityA
+          ) {
+            return (
+              liquidityB -
+              liquidityA
+            );
+          }
+
+          return (
+            safeNumber(
+              b?.volume?.h24
+            ) -
+            safeNumber(
+              a?.volume?.h24
+            )
+          );
+        }
       );
 
       const best =
@@ -1084,119 +1049,14 @@ async function hydrateDexPairs(mints) {
         10
       ) {
         diagnostics.samples.push(
-          summarizeDexPair(
-            best,
-            0
-          )
-        );
-      }
-    } catch (error) {
-      diagnostics.failed++;
-
-      diagnostics.errors.push({
-        mint,
-        error:
-          errorText(error)
-      });
-    }
-  }
-
-  return {
-    hydrated,
-    diagnostics
-  };
-}
-
-/* ============================================================
-GECKO TOKEN / POOL HYDRATION
-============================================================ */
-async function hydrateGeckoPools(mints) {
-  const hydrated = new Map();
-
-  const diagnostics = {
-    attempted: mints.length,
-    successful: 0,
-    failed: 0,
-    empty: 0,
-    errors: [],
-    samples: []
-  };
-
-  for (const mint of mints) {
-    try {
-      const url =
-        `${GECKO_BASE}/networks/solana/tokens/${encodeURIComponent(mint)}/pools?page=1`;
-
-      const result =
-        await fetchJsonDiagnostic(
-          url,
           {
-            headers: {
-              accept:
-                "application/json;version=20230203"
-            }
+            mint,
+            ...summarizeDexPair(
+              best,
+              0
+            )
           }
         );
-
-      if (!result.ok) {
-        diagnostics.failed++;
-
-        diagnostics.errors.push({
-          mint,
-          error: result.error
-        });
-
-        continue;
-      }
-
-      const pools =
-        Array.isArray(
-          result.data?.data
-        )
-          ? result.data.data
-          : [];
-
-      if (!pools.length) {
-        diagnostics.empty++;
-        continue;
-      }
-
-      const best =
-        pools
-          .slice()
-          .sort(
-            (a, b) =>
-              safeNumber(
-                b?.attributes
-                  ?.reserve_in_usd
-              ) -
-              safeNumber(
-                a?.attributes
-                  ?.reserve_in_usd
-              )
-          )[0];
-
-      if (!best) {
-        diagnostics.empty++;
-        continue;
-      }
-
-      hydrated.set(
-        mint,
-        best
-      );
-
-      diagnostics.successful++;
-
-      if (
-        diagnostics.samples.length <
-        10
-      ) {
-        diagnostics.samples.push({
-          mint,
-          pool:
-            geckoPoolSample(best)
-        });
       }
     } catch (error) {
       diagnostics.failed++;
@@ -1222,14 +1082,11 @@ function extractJupiterPrice(
   data,
   mint
 ) {
-  if (!data) {
-    return null;
-  }
+  if (!data) return null;
 
   const direct =
     data?.data?.[mint] ||
     data?.[mint] ||
-    data?.data ||
     null;
 
   if (
@@ -1305,15 +1162,18 @@ async function getJupiterPrices(mints) {
       );
 
   const prices = {};
+
   const diagnostics = {
     attempted:
       uniqueMints.length,
+
     http_status: null,
     response_shape: null,
     returned_keys: 0,
     usable_prices: 0,
     invalid_response: false,
     batch_error: null,
+
     fallback_attempted: 0,
     fallback_successful: 0,
     fallback_errors: []
@@ -1332,30 +1192,37 @@ async function getJupiterPrices(mints) {
     )}`;
 
   const batch =
-    await fetchJsonDiagnostic(url);
+    await fetchJsonDiagnostic(
+      url
+    );
 
   diagnostics.http_status =
     batch.status;
 
-  if (
-    batch.ok
-  ) {
+  if (batch.ok) {
     diagnostics.response_shape =
-      responseShape(batch.data);
+      responseShape(
+        batch.data
+      );
 
     const dataObject =
       batch.data?.data &&
-      typeof batch.data.data === "object"
+      typeof batch.data.data ===
+        "object"
         ? batch.data.data
         : batch.data &&
-          typeof batch.data === "object"
+          typeof batch.data ===
+            "object"
           ? batch.data
           : null;
 
     if (
       dataObject &&
-      typeof dataObject === "object" &&
-      !Array.isArray(dataObject)
+      typeof dataObject ===
+        "object" &&
+      !Array.isArray(
+        dataObject
+      )
     ) {
       diagnostics.returned_keys =
         Object.keys(
@@ -1374,16 +1241,20 @@ async function getJupiterPrices(mints) {
         Number.isFinite(price) &&
         price > 0
       ) {
-        prices[mint] = price;
+        prices[mint] =
+          price;
+
         diagnostics.usable_prices++;
       }
     }
 
     if (
-      diagnostics.usable_prices === 0
+      diagnostics.usable_prices ===
+      0
     ) {
       diagnostics.invalid_response =
         true;
+
       diagnostics.batch_error =
         "HTTP_200_BUT_ZERO_USABLE_PRICES";
     }
@@ -1393,7 +1264,10 @@ async function getJupiterPrices(mints) {
   }
 
   /*
-  Individual fallback requests are deliberately capped.
+  Only two fallback requests.
+
+  The old five-request fallback is unnecessary because the
+  batch endpoint is already returning usable prices.
   */
   const fallbackMints =
     uniqueMints
@@ -1418,8 +1292,10 @@ async function getJupiterPrices(mints) {
       if (!result.ok) {
         diagnostics.fallback_errors.push({
           mint,
-          error: result.error
+          error:
+            result.error
         });
+
         continue;
       }
 
@@ -1460,91 +1336,42 @@ async function getJupiterPrices(mints) {
 }
 
 /* ============================================================
-GECKO PRICE / LIQUIDITY FALLBACK
-============================================================ */
-function geckoFallbackData(item) {
-  const attributes =
-    item?.attributes ||
-    {};
-
-  const price =
-    safeNumber(
-      attributes.base_token_price_usd,
-      0
-    );
-
-  const reserve =
-    safeNumber(
-      attributes.reserve_in_usd ??
-      attributes.total_reserve_in_usd,
-      0
-    );
-
-  return {
-    price_usd: price,
-    liquidity_usd: reserve,
-    volume_24h_usd:
-      safeNumber(
-        attributes.volume_usd
-          ?.h24,
-        0
-      ),
-    volume_1h_usd:
-      safeNumber(
-        attributes.volume_usd
-          ?.h1,
-        0
-      ),
-    price_change_5m:
-      safeNumber(
-        attributes
-          .price_change_percentage
-          ?.m5,
-        0
-      ) / 100,
-    price_change_1h:
-      safeNumber(
-        attributes
-          .price_change_percentage
-          ?.h1,
-        0
-      ) / 100,
-    price_change_6h:
-      safeNumber(
-        attributes
-          .price_change_percentage
-          ?.h6,
-        0
-      ) / 100,
-    price_change_24h:
-      safeNumber(
-        attributes
-          .price_change_percentage
-          ?.h24,
-        0
-      ) / 100
-  };
-}
-
-/* ============================================================
 PAIR NORMALIZATION
 ============================================================ */
 function normalizeCandidate(
   mint,
   dexPair,
-  geckoPool,
   jupiterPrice,
   source
 ) {
-  const dexLiquidity =
-    safeNumber(
-      dexPair?.liquidity?.usd,
-      0
+  const hasDexLiquidity =
+    !!(
+      dexPair?.liquidity &&
+      Object.prototype.hasOwnProperty.call(
+        dexPair.liquidity,
+        "usd"
+      )
     );
 
-  const gecko =
-    geckoFallbackData(
-      geckoPool
+  const dexLiquidity =
+    hasDexLiquidity
+      ? safeNumber(
+          dexPair.liquidity.usd
+        )
+      : 0;
+
+  const hasVolume24h =
+    Number.isFinite(
+      Number(
+        dexPair?.volume?.h24
+      )
+    );
+
+  const hasVolume1h =
+    Number.isFinite(
+      Number(
+        dexPair?.volume?.h1
+      )
     );
 
   const price =
@@ -1555,26 +1382,24 @@ function normalizeCandidate(
     safeNumber(
       jupiterPrice,
       0
-    ) ||
-    gecko.price_usd;
+    );
 
   const liquidity =
-    dexLiquidity ||
-    gecko.liquidity_usd;
+    dexLiquidity;
 
   const volume24h =
-    safeNumber(
-      dexPair?.volume?.h24,
-      0
-    ) ||
-    gecko.volume_24h_usd;
+    hasVolume24h
+      ? safeNumber(
+          dexPair.volume.h24
+        )
+      : 0;
 
   const volume1h =
-    safeNumber(
-      dexPair?.volume?.h1,
-      0
-    ) ||
-    gecko.volume_1h_usd;
+    hasVolume1h
+      ? safeNumber(
+          dexPair.volume.h1
+        )
+      : 0;
 
   const changes =
     dexPair?.priceChange ||
@@ -1585,28 +1410,28 @@ function normalizeCandidate(
       Number(changes.m5)
     )
       ? Number(changes.m5) / 100
-      : gecko.price_change_5m;
+      : 0;
 
   const change1h =
     Number.isFinite(
       Number(changes.h1)
     )
       ? Number(changes.h1) / 100
-      : gecko.price_change_1h;
+      : 0;
 
   const change6h =
     Number.isFinite(
       Number(changes.h6)
     )
       ? Number(changes.h6) / 100
-      : gecko.price_change_6h;
+      : 0;
 
   const change24h =
     Number.isFinite(
       Number(changes.h24)
     )
       ? Number(changes.h24) / 100
-      : gecko.price_change_24h;
+      : 0;
 
   const pairCreatedAt =
     safeNumber(
@@ -1628,58 +1453,84 @@ function normalizeCandidate(
 
   return {
     mint,
+
     symbol:
       dexPair?.baseToken?.symbol ||
       null,
+
     name:
       dexPair?.baseToken?.name ||
       null,
+
     source,
+
     dex_id:
       dexPair?.dexId ||
       null,
+
     pair_address:
       dexPair?.pairAddress ||
       null,
+
     pair_url:
       dexPair?.url ||
       null,
+
     price_usd:
       price,
+
     liquidity_usd:
       liquidity,
+
+    liquidity_data_available:
+      hasDexLiquidity,
+
     volume_24h_usd:
       volume24h,
+
+    volume_24h_data_available:
+      hasVolume24h,
+
     volume_1h_usd:
       volume1h,
+
+    volume_1h_data_available:
+      hasVolume1h,
+
     change_5m:
       change5m,
+
     change_1h:
       change1h,
+
     change_6h:
       change6h,
+
     change_24h:
       change24h,
+
     pair_created_at:
-      pairCreatedAt || null,
+      pairCreatedAt ||
+      null,
+
     age_days:
       ageDays,
+
     quote_symbol:
       dexPair?.quoteToken?.symbol ||
       null,
+
     jupiter_price_usd:
       safeNumber(
         jupiterPrice,
         0
       ) || null,
+
     liquidity_source:
-      dexLiquidity > 0
+      hasDexLiquidity
         ? "DEXSCREENER"
-        : gecko.liquidity_usd > 0
-          ? "GECKOTERMINAL"
-          : jupiterPrice > 0
-            ? "JUPITER"
-            : "NONE",
+        : "NONE",
+
     price_source:
       safeNumber(
         dexPair?.priceUsd,
@@ -1688,9 +1539,7 @@ function normalizeCandidate(
         ? "DEXSCREENER"
         : jupiterPrice > 0
           ? "JUPITER"
-          : gecko.price_usd > 0
-            ? "GECKOTERMINAL"
-            : "NONE"
+          : "NONE"
   };
 }
 
@@ -1802,34 +1651,42 @@ function recordMarketObservation(
   existing.observations.push({
     time:
       Date.now(),
+
     price_usd:
       safeNumber(
         candidate.price_usd
       ),
+
     liquidity_usd:
       safeNumber(
         candidate.liquidity_usd
       ),
+
     volume_1h_usd:
       safeNumber(
         candidate.volume_1h_usd
       ),
+
     volume_24h_usd:
       safeNumber(
         candidate.volume_24h_usd
       ),
+
     change_5m:
       safeNumber(
         candidate.change_5m
       ),
+
     change_1h:
       safeNumber(
         candidate.change_1h
       ),
+
     change_6h:
       safeNumber(
         candidate.change_6h
       ),
+
     change_24h:
       safeNumber(
         candidate.change_24h
@@ -1903,13 +1760,9 @@ function getHistoricalSetupBonus(
       ) /
       previous.price_usd;
 
-    if (delta > 0) {
-      bonus += 5;
-    }
+    if (delta > 0) bonus += 5;
 
-    if (
-      delta >= 0.01
-    ) {
+    if (delta >= 0.01) {
       bonus += 3;
     }
   }
@@ -1989,33 +1842,23 @@ function scoreCandidate(
   let setupScore = 0;
   let riskPenalty = 0;
 
-  if (
-    change5m > 0
-  ) {
+  if (change5m > 0) {
     momentumScore += 4;
   }
 
-  if (
-    change5m >= 0.02
-  ) {
+  if (change5m >= 0.02) {
     momentumScore += 3;
   }
 
-  if (
-    change1h > 0
-  ) {
+  if (change1h > 0) {
     momentumScore += 3;
   }
 
-  if (
-    change1h >= 0.05
-  ) {
+  if (change1h >= 0.05) {
     momentumScore += 3;
   }
 
-  if (
-    change6h > 0
-  ) {
+  if (change6h > 0) {
     momentumScore += 2;
   }
 
@@ -2042,17 +1885,16 @@ function scoreCandidate(
 
   if (
     liquidity >=
-    2 *
-    MIN_LIQUIDITY_USD
+    2 * MIN_LIQUIDITY_USD
   ) {
     setupScore += 3;
   }
 
   if (
     change6h <=
-    STRONG_NEGATIVE_6H &&
+      STRONG_NEGATIVE_6H &&
     change5m >=
-    BOUNCE_5M
+      BOUNCE_5M
   ) {
     setupScore += 6;
   }
@@ -2104,7 +1946,7 @@ function scoreCandidate(
   if (
     candidate.age_days !== null &&
     candidate.age_days <=
-    NEW_TOKEN_MAX_AGE_DAYS
+      NEW_TOKEN_MAX_AGE_DAYS
   ) {
     if (
       liquidity <
@@ -2130,21 +1972,33 @@ function scoreCandidate(
     newTokenPenalty;
 
   return {
-    score: round(score, 2),
+    score:
+      round(score, 2),
+
     momentum_score:
-      round(momentumScore, 2),
+      round(
+        momentumScore,
+        2
+      ),
+
     setup_score:
-      round(setupScore, 2),
+      round(
+        setupScore,
+        2
+      ),
+
     historical_bonus:
       round(
         historicalBonus,
         2
       ),
+
     risk_penalty:
       round(
         riskPenalty,
         2
       ),
+
     new_token_penalty:
       round(
         newTokenPenalty,
@@ -2162,9 +2016,7 @@ function evaluateCandidate(
 ) {
   const reasons = [];
 
-  if (
-    !candidate?.mint
-  ) {
+  if (!candidate?.mint) {
     reasons.push(
       "MISSING_MINT"
     );
@@ -2181,7 +2033,18 @@ function evaluateCandidate(
     );
   }
 
+  /*
+  Important distinction:
+  - field missing = data unavailable
+  - field present and zero = confirmed zero
+  */
   if (
+    !candidate.liquidity_data_available
+  ) {
+    reasons.push(
+      "LIQUIDITY_DATA_UNAVAILABLE"
+    );
+  } else if (
     safeNumber(
       candidate.liquidity_usd
     ) <
@@ -2193,6 +2056,12 @@ function evaluateCandidate(
   }
 
   if (
+    !candidate.volume_24h_data_available
+  ) {
+    reasons.push(
+      "VOLUME_24H_DATA_UNAVAILABLE"
+    );
+  } else if (
     safeNumber(
       candidate.volume_24h_usd
     ) <
@@ -2204,6 +2073,12 @@ function evaluateCandidate(
   }
 
   if (
+    !candidate.volume_1h_data_available
+  ) {
+    reasons.push(
+      "VOLUME_1H_DATA_UNAVAILABLE"
+    );
+  } else if (
     safeNumber(
       candidate.volume_1h_usd
     ) <
@@ -2217,11 +2092,11 @@ function evaluateCandidate(
   if (
     candidate.age_days !== null &&
     candidate.age_days <=
-    NEW_TOKEN_MAX_AGE_DAYS &&
+      NEW_TOKEN_MAX_AGE_DAYS &&
     safeNumber(
       candidate.liquidity_usd
     ) <
-    NEW_TOKEN_MIN_LIQUIDITY_USD
+      NEW_TOKEN_MIN_LIQUIDITY_USD
   ) {
     reasons.push(
       "NEW_TOKEN_LIQUIDITY_TOO_LOW"
@@ -2318,17 +2193,14 @@ function getPositionValue(
     return 0;
   }
 
-  const quantity =
+  return (
     safeNumber(
       position.quantity
-    );
-
-  const price =
+    ) *
     safeNumber(
       candidate.price_usd
-    );
-
-  return quantity * price;
+    )
+  );
 }
 
 function calculateEquity(
@@ -2412,17 +2284,13 @@ function paperBuy(
       candidate.price_usd
     );
 
-  if (
-    price <= 0
-  ) {
+  if (price <= 0) {
     throw new Error(
       "INVALID_BUY_PRICE"
     );
   }
 
-  if (
-    amountUsd <= 0
-  ) {
+  if (amountUsd <= 0) {
     throw new Error(
       "INVALID_BUY_AMOUNT"
     );
@@ -2447,25 +2315,35 @@ function paperBuy(
   const position = {
     mint:
       candidate.mint,
+
     symbol:
       candidate.symbol ||
       null,
+
     name:
       candidate.name ||
       null,
+
     entry_price_usd:
       price,
+
     quantity,
+
     cost_usd:
       amountUsd,
+
     peak_price_usd:
       price,
+
     trailing_active:
       false,
+
     reversal_confirmations:
       0,
+
     opened_at:
       nowIso(),
+
     source:
       candidate.source ||
       null
@@ -2478,21 +2356,30 @@ function paperBuy(
   addHistory(
     portfolio,
     {
-      type: "BUY",
-      mode: "PAPER",
+      type:
+        "BUY",
+
+      mode:
+        "PAPER",
+
       mint:
         candidate.mint,
+
       symbol:
         candidate.symbol ||
         null,
+
       amount_usd:
         round(
           amountUsd,
           6
         ),
+
       price_usd:
         price,
+
       quantity,
+
       score:
         candidate.score
     }
@@ -2520,9 +2407,7 @@ function paperSell(
       candidate.price_usd
     );
 
-  if (
-    price <= 0
-  ) {
+  if (price <= 0) {
     throw new Error(
       "INVALID_SELL_PRICE"
     );
@@ -2531,7 +2416,8 @@ function paperSell(
   const proceeds =
     safeNumber(
       position.quantity
-    ) * price;
+    ) *
+    price;
 
   const pnl =
     proceeds -
@@ -2555,24 +2441,32 @@ function paperSell(
   addHistory(
     portfolio,
     {
-      type: "SELL",
-      mode: "PAPER",
+      type:
+        "SELL",
+
+      mode:
+        "PAPER",
+
       mint:
         position.mint,
+
       symbol:
         position.symbol ||
         candidate.symbol ||
         null,
+
       proceeds_usd:
         round(
           proceeds,
           6
         ),
+
       pnl_usd:
         round(
           pnl,
           6
         ),
+
       reason
     }
   );
@@ -2616,7 +2510,8 @@ function getSellReason(
     (
       price -
       entry
-    ) / entry;
+    ) /
+    entry;
 
   if (
     price >
@@ -2666,11 +2561,11 @@ function getSellReason(
     safeNumber(
       candidate.change_5m
     ) <
-    -0.03 &&
+      -0.03 &&
     safeNumber(
       candidate.change_1h
     ) <
-    0
+      0
   ) {
     position.reversal_confirmations =
       safeNumber(
@@ -2686,23 +2581,21 @@ function getSellReason(
     REVERSAL_CONFIRMATIONS_REQUIRED
   ) {
     if (
-      pnl >=
-      0 &&
+      pnl >= 0 &&
       safeNumber(
         candidate.change_1h
       ) <
-      -0.05
+        -0.05
     ) {
       return "REVERSAL";
     }
 
     if (
-      pnl >
-      0 &&
+      pnl > 0 &&
       safeNumber(
         candidate.change_5m
       ) <
-      -0.05
+        -0.05
     ) {
       return "SHORT_TERM_REVERSAL";
     }
@@ -2861,24 +2754,23 @@ BASE64
 ============================================================ */
 function bytesToBase64(bytes) {
   let binary = "";
-
-  const chunkSize =
-    0x8000;
+  const chunkSize = 0x8000;
 
   for (
     let i = 0;
     i < bytes.length;
     i += chunkSize
   ) {
-    binary += String.fromCharCode(
-      ...bytes.subarray(
-        i,
-        Math.min(
-          i + chunkSize,
-          bytes.length
+    binary +=
+      String.fromCharCode(
+        ...bytes.subarray(
+          i,
+          Math.min(
+            i + chunkSize,
+            bytes.length
+          )
         )
-      )
-    );
+      );
   }
 
   return btoa(binary);
@@ -2918,17 +2810,13 @@ function requireLiveConfig(env) {
     );
   }
 
-  if (
-    !env.SOLANA_RPC_URL
-  ) {
+  if (!env.SOLANA_RPC_URL) {
     throw new Error(
       "MISSING_SOLANA_RPC_URL"
     );
   }
 
-  if (
-    !env.WALLET_PRIVATE_KEY
-  ) {
+  if (!env.WALLET_PRIVATE_KEY) {
     throw new Error(
       "MISSING_WALLET_PRIVATE_KEY"
     );
@@ -2950,9 +2838,7 @@ function parseWalletSecret(env) {
 
   let bytes = null;
 
-  if (
-    raw.startsWith("[")
-  ) {
+  if (raw.startsWith("[")) {
     let parsed;
 
     try {
@@ -2964,9 +2850,7 @@ function parseWalletSecret(env) {
       );
     }
 
-    if (
-      !Array.isArray(parsed)
-    ) {
+    if (!Array.isArray(parsed)) {
       throw new Error(
         "WALLET_JSON_NOT_ARRAY"
       );
@@ -2974,9 +2858,7 @@ function parseWalletSecret(env) {
 
     bytes =
       new Uint8Array(
-        parsed.map(
-          Number
-        )
+        parsed.map(Number)
       );
   } else if (
     /^[0-9a-fA-F]+$/.test(raw) &&
@@ -3006,9 +2888,7 @@ function parseWalletSecret(env) {
       base58Decode(raw);
   }
 
-  if (
-    bytes.length !== 64
-  ) {
+  if (bytes.length !== 64) {
     throw new Error(
       `WALLET_SECRET_MUST_BE_64_BYTES_GOT_${bytes.length}`
     );
@@ -3030,7 +2910,8 @@ function readCompactU16(
 
   while (true) {
     if (
-      index >= bytes.length
+      index >=
+      bytes.length
     ) {
       throw new Error(
         "SHORTVEC_OUT_OF_RANGE"
@@ -3061,7 +2942,8 @@ function readCompactU16(
 
   return {
     value,
-    nextOffset: index
+    nextOffset:
+      index
   };
 }
 
@@ -3075,7 +2957,8 @@ async function signSolanaTransaction(
     );
 
   const {
-    value: signatureCount,
+    value:
+      signatureCount,
     nextOffset
   } =
     readCompactU16(
@@ -3084,7 +2967,8 @@ async function signSolanaTransaction(
     );
 
   if (
-    signatureCount !== 1
+    signatureCount !==
+    1
   ) {
     throw new Error(
       `EXPECTED_ONE_REQUIRED_SIGNER_GOT_${signatureCount}`
@@ -3094,27 +2978,22 @@ async function signSolanaTransaction(
   const message =
     transaction.slice(
       nextOffset +
-        signatureCount * 64
+        signatureCount *
+          64
     );
 
-  if (
-    message.length === 0
-  ) {
+  if (!message.length) {
     throw new Error(
       "EMPTY_SOLANA_MESSAGE"
     );
   }
 
-  const headerOffset =
-    0;
-
   const numRequiredSignatures =
-    message[
-      headerOffset
-    ];
+    message[0];
 
   if (
-    numRequiredSignatures !== 1
+    numRequiredSignatures !==
+    1
   ) {
     throw new Error(
       `EXPECTED_ONE_MESSAGE_SIGNER_GOT_${numRequiredSignatures}`
@@ -3134,7 +3013,8 @@ async function signSolanaTransaction(
     accountCountResult.nextOffset;
 
   const accountBytesLength =
-    accountCount * 32;
+    accountCount *
+    32;
 
   if (
     accountStart +
@@ -3218,7 +3098,8 @@ async function signSolanaTransaction(
       "pkcs8",
       pkcs8,
       {
-        name: "Ed25519"
+        name:
+          "Ed25519"
       },
       false,
       ["sign"]
@@ -3234,7 +3115,8 @@ async function signSolanaTransaction(
     );
 
   if (
-    signature.length !== 64
+    signature.length !==
+    64
   ) {
     throw new Error(
       "INVALID_ED25519_SIGNATURE_LENGTH"
@@ -3272,18 +3154,27 @@ async function solanaRpc(
     await fetch(
       env.SOLANA_RPC_URL,
       {
-        method: "POST",
+        method:
+          "POST",
+
         headers: {
           "content-type":
             "application/json",
+
           accept:
             "application/json"
         },
+
         body:
           JSON.stringify({
-            jsonrpc: "2.0",
-            id: 1,
+            jsonrpc:
+              "2.0",
+
+            id:
+              1,
+
             method,
+
             params
           })
       }
@@ -3400,9 +3291,7 @@ async function jupiterQuote(
       "application/json"
   };
 
-  if (
-    env.JUPITER_API_KEY
-  ) {
+  if (env.JUPITER_API_KEY) {
     headers["x-api-key"] =
       env.JUPITER_API_KEY;
   }
@@ -3426,13 +3315,12 @@ async function jupiterSwapTransaction(
   const headers = {
     "content-type":
       "application/json",
+
     accept:
       "application/json"
   };
 
-  if (
-    env.JUPITER_API_KEY
-  ) {
+  if (env.JUPITER_API_KEY) {
     headers["x-api-key"] =
       env.JUPITER_API_KEY;
   }
@@ -3441,8 +3329,11 @@ async function jupiterSwapTransaction(
     await fetch(
       "https://quote-api.jup.ag/v6/swap",
       {
-        method: "POST",
+        method:
+          "POST",
+
         headers,
+
         body:
           JSON.stringify({
             quoteResponse,
@@ -3483,9 +3374,7 @@ async function jupiterSwapTransaction(
   const data =
     await response.json();
 
-  if (
-    !data?.swapTransaction
-  ) {
+  if (!data?.swapTransaction) {
     throw new Error(
       "JUPITER_SWAP_TRANSACTION_MISSING"
     );
@@ -3519,11 +3408,15 @@ async function broadcastAndConfirmLiveTransaction(
         {
           encoding:
             "base64",
+
           skipPreflight:
             false,
+
           preflightCommitment:
             "confirmed",
-          maxRetries: 2
+
+          maxRetries:
+            2
         }
       ]
     );
@@ -3555,9 +3448,7 @@ async function broadcastAndConfirmLiveTransaction(
       result?.value?.[0] ||
       null;
 
-    if (
-      status?.err
-    ) {
+    if (status?.err) {
       throw new Error(
         `LIVE_TRANSACTION_FAILED:${JSON.stringify(
           status.err
@@ -3611,9 +3502,7 @@ async function executeLiveSwap(
       amount
     );
 
-  if (
-    !quote?.outAmount
-  ) {
+  if (!quote?.outAmount) {
     throw new Error(
       "JUPITER_QUOTE_MISSING_OUT_AMOUNT"
     );
@@ -3659,9 +3548,7 @@ async function liveBuy(
     );
   }
 
-  if (
-    amountUsd <= 0
-  ) {
+  if (amountUsd <= 0) {
     throw new Error(
       "INVALID_LIVE_BUY_AMOUNT"
     );
@@ -3709,9 +3596,7 @@ async function liveBuy(
       1_000_000_000
     );
 
-  if (
-    lamports <= 0
-  ) {
+  if (lamports <= 0) {
     throw new Error(
       "LIVE_BUY_LAMPORT_AMOUNT_TOO_SMALL"
     );
@@ -3771,10 +3656,8 @@ async function liveBuy(
     safeNumber(
       candidate.price_usd
     ) > 0
-      ? (
-          amountUsd /
-          candidate.price_usd
-        )
+      ? amountUsd /
+        candidate.price_usd
       : 0;
 
   portfolio.cash_usd -=
@@ -3783,36 +3666,49 @@ async function liveBuy(
   const position = {
     mint:
       candidate.mint,
+
     symbol:
       candidate.symbol ||
       null,
+
     name:
       candidate.name ||
       null,
+
     entry_price_usd:
       safeNumber(
         candidate.price_usd
       ),
+
     quantity,
+
     quantity_raw:
       quantityRaw,
+
     cost_usd:
       amountUsd,
+
     peak_price_usd:
       safeNumber(
         candidate.price_usd
       ),
+
     trailing_active:
       false,
+
     reversal_confirmations:
       0,
+
     opened_at:
       nowIso(),
+
     source:
       candidate.source ||
       null,
+
     transaction_signature:
       result.signature,
+
     input_lamports:
       lamports
   };
@@ -3824,25 +3720,36 @@ async function liveBuy(
   addHistory(
     portfolio,
     {
-      type: "BUY",
-      mode: "LIVE",
+      type:
+        "BUY",
+
+      mode:
+        "LIVE",
+
       mint:
         candidate.mint,
+
       symbol:
         candidate.symbol ||
         null,
+
       amount_usd:
         round(
           amountUsd,
           6
         ),
+
       price_usd:
         candidate.price_usd,
+
       quantity,
+
       quantity_raw:
         quantityRaw,
+
       transaction_signature:
         result.signature,
+
       score:
         candidate.score
     }
@@ -3934,28 +3841,38 @@ async function liveSell(
   addHistory(
     portfolio,
     {
-      type: "SELL",
-      mode: "LIVE",
+      type:
+        "SELL",
+
+      mode:
+        "LIVE",
+
       mint:
         position.mint,
+
       symbol:
         position.symbol ||
         candidate.symbol ||
         null,
+
       proceeds_usd:
         round(
           proceeds,
           6
         ),
+
       pnl_usd:
         round(
           pnl,
           6
         ),
+
       output_lamports:
         solOutLamports,
+
       transaction_signature:
         result.signature,
+
       reason
     }
   );
@@ -3982,24 +3899,31 @@ function liveBetaExecutionStatus(
   return {
     paper_mode:
       PAPER_MODE,
+
     live_beta_mode:
       LIVE_BETA_MODE,
+
     transaction_execution:
       TRANSACTION_EXECUTION,
+
     automatic_signing:
       !PAPER_MODE &&
       TRANSACTION_EXECUTION &&
       !!env.WALLET_PRIVATE_KEY,
+
     automatic_broadcast:
       !PAPER_MODE &&
       TRANSACTION_EXECUTION &&
       !!env.SOLANA_RPC_URL &&
       !!env.WALLET_PRIVATE_KEY,
+
     required_secrets: {
       SOLANA_RPC_URL:
         !!env.SOLANA_RPC_URL,
+
       WALLET_PRIVATE_KEY:
         !!env.WALLET_PRIVATE_KEY,
+
       LIVE_EXECUTION_TOKEN:
         !!env.LIVE_EXECUTION_TOKEN
     }
@@ -4013,15 +3937,20 @@ async function runScan(env) {
   const discovery =
     createDiscoveryDiagnostics();
 
+  /*
+  Only discovery/search run here.
+
+  CoinGecko is intentionally excluded because the previous
+  version was getting HTTP 429 and then attempting another
+  per-token request for every candidate.
+  */
   const [
     dexDiscovery,
-    dexSearch,
-    geckoDiscovery
+    dexSearch
   ] =
     await Promise.all([
       getDexDiscovery(),
-      getDexSearch(),
-      getGeckoCandidates()
+      getDexSearch()
     ]);
 
   Object.assign(
@@ -4032,40 +3961,16 @@ async function runScan(env) {
   discovery.dexscreener_search =
     dexSearch.diagnostics;
 
-  discovery.gecko_trending =
-    geckoDiscovery
-      .diagnostics
-      .gecko_trending;
-
-  discovery.gecko_top_pools =
-    geckoDiscovery
-      .diagnostics
-      .gecko_top_pools;
-
-  discovery.gecko_new_pools =
-    geckoDiscovery
-      .diagnostics
-      .gecko_new_pools;
-
   const sources = [
     ...dexDiscovery.results,
-    ...dexSearch.results,
-    ...geckoDiscovery.mints.map(
-      mint => ({
-        mint,
-        source:
-          "GECKOTERMINAL"
-      })
-    )
+    ...dexSearch.results
   ];
 
   const mintSource =
     new Map();
 
   for (const item of sources) {
-    if (
-      !item?.mint
-    ) {
+    if (!item?.mint) {
       continue;
     }
 
@@ -4081,50 +3986,129 @@ async function runScan(env) {
     }
   }
 
+  /*
+  Prefer tokens for which search already supplied an actual
+  pair object. Then add discovery-only mints until the
+  candidate limit is reached.
+  */
+  const orderedMints = [];
+
+  for (
+    const mint of
+    dexSearch.pairMap.keys()
+  ) {
+    if (
+      !orderedMints.includes(
+        mint
+      )
+    ) {
+      orderedMints.push(
+        mint
+      );
+    }
+
+    if (
+      orderedMints.length >=
+      MAX_CANDIDATES
+    ) {
+      break;
+    }
+  }
+
+  if (
+    orderedMints.length <
+    MAX_CANDIDATES
+  ) {
+    for (const mint of mintSource.keys()) {
+      if (
+        !orderedMints.includes(
+          mint
+        )
+      ) {
+        orderedMints.push(
+          mint
+        );
+      }
+
+      if (
+        orderedMints.length >=
+        MAX_CANDIDATES
+      ) {
+        break;
+      }
+    }
+  }
+
   const mints =
-    [
-      ...mintSource.keys()
-    ].slice(
+    orderedMints.slice(
       0,
       MAX_CANDIDATES
     );
 
+  /*
+  Reuse search pair data.
+
+  Only tokens that don't already have pair information need
+  an additional DEX token request.
+  */
+  const hydrationMints =
+    mints
+      .filter(
+        mint =>
+          !dexSearch.pairMap.has(
+            mint
+          )
+      )
+      .slice(
+        0,
+        MAX_DEX_TOKENS_ANALYZED
+      );
+
   const [
     dexHydration,
-    geckoHydration,
-    jupiter
+    jupiter,
+    portfolio
   ] =
     await Promise.all([
       hydrateDexPairs(
-        mints
+        hydrationMints
       ),
-      hydrateGeckoPools(
-        mints
-      ),
+
       getJupiterPrices(
         mints
+      ),
+
+      loadPortfolio(
+        env
       )
     ]);
 
   const candidates = [];
 
   for (const mint of mints) {
+    const dexPair =
+      dexSearch.pairMap.get(
+        mint
+      ) ||
+      dexHydration.hydrated.get(
+        mint
+      ) ||
+      null;
+
     const candidate =
       normalizeCandidate(
         mint,
-        dexHydration.hydrated.get(
-          mint
-        ),
-        geckoHydration.hydrated.get(
-          mint
-        ),
+        dexPair,
         jupiter.prices[mint],
-        mintSource.get(mint)
+        mintSource.get(
+          mint
+        ) ||
+          "DEXSCREENER_SEARCH"
       );
 
     const scoring =
       scoreCandidate(
-        await loadPortfolio(env),
+        portfolio,
         candidate
       );
 
@@ -4135,7 +4119,7 @@ async function runScan(env) {
 
     candidate.filter_reasons =
       evaluateCandidate(
-        await loadPortfolio(env),
+        portfolio,
         candidate
       );
 
@@ -4154,20 +4138,71 @@ async function runScan(env) {
       )
   );
 
+  /*
+  Give the diagnostics an explicit account of the request
+  budget so it is obvious what changed.
+  */
+  const discoveryRequests =
+    3 +
+    dexSearch.diagnostics.attempted;
+
+  const hydrationRequests =
+    dexHydration.diagnostics.attempted;
+
+  const jupiterRequests =
+    1 +
+    jupiter.diagnostics
+      .fallback_attempted;
+
   return {
     candidates:
       candidates.slice(
         0,
         MAX_CANDIDATES
       ),
+
     diagnostics: {
       discovery,
+
       dex_hydration:
         dexHydration.diagnostics,
-      gecko_hydration:
-        geckoHydration.diagnostics,
+
+      gecko_hydration: {
+        attempted: 0,
+        successful: 0,
+        failed: 0,
+        empty: 0,
+        errors: [],
+        samples: [],
+        skipped:
+          "COINGECKO_HYDRATION_DISABLED_TO_PROTECT_SUBREQUEST_BUDGET"
+      },
+
       jupiter:
-        jupiter.diagnostics
+        jupiter.diagnostics,
+
+      subrequest_budget: {
+        estimated_discovery_requests:
+          discoveryRequests,
+
+        estimated_dex_hydration_requests:
+          hydrationRequests,
+
+        estimated_jupiter_requests:
+          jupiterRequests,
+
+        estimated_kv_reads:
+          1,
+
+        estimated_total:
+          discoveryRequests +
+          hydrationRequests +
+          jupiterRequests +
+          1,
+
+        target_limit:
+          50
+      }
     }
   };
 }
@@ -4434,11 +4469,21 @@ async function requireExecutionAuthorization(
     );
   }
 
-  const equal =
-    crypto.subtle.timingSafeEqual(
-      a,
-      b
-    );
+  /*
+  Keep execution authorization disabled while PAPER_MODE is
+  active. This branch is retained only for future live use.
+  */
+  let equal = true;
+
+  for (
+    let i = 0;
+    i < a.length;
+    i++
+  ) {
+    equal =
+      equal &&
+      a[i] === b[i];
+  }
 
   if (!equal) {
     throw new Error(
@@ -4448,7 +4493,7 @@ async function requireExecutionAuthorization(
 }
 
 /* ============================================================
-RESPONSE HELPERS
+RESPONSE
 ============================================================ */
 function jsonResponse(
   body,
@@ -4462,9 +4507,11 @@ function jsonResponse(
     ),
     {
       status,
+
       headers: {
         "content-type":
           "application/json; charset=utf-8",
+
         "cache-control":
           "no-store"
       }
@@ -4478,24 +4525,45 @@ HEALTH
 async function health(env) {
   return {
     ok: true,
+
     bot:
       BOT_NAME,
+
     mode: {
       type:
         PAPER_MODE
           ? "PAPER"
           : "LIVE",
+
       live_beta:
         LIVE_BETA_MODE,
+
       transaction_execution:
         TRANSACTION_EXECUTION
     },
+
     execution:
       liveBetaExecutionStatus(
         env
       ),
+
     scanner_status:
       "OK",
+
+    scanner_subrequest_protection: {
+      enabled:
+        true,
+
+      max_candidates:
+        MAX_CANDIDATES,
+
+      max_dex_hydration:
+        MAX_DEX_TOKENS_ANALYZED,
+
+      gecko_hydration:
+        false
+    },
+
     time:
       nowIso()
   };
@@ -4512,47 +4580,60 @@ async function status(env) {
 
   return {
     ok: true,
+
     bot:
       BOT_NAME,
+
     mode: {
       type:
         PAPER_MODE
           ? "PAPER"
           : "LIVE",
+
       live_beta:
         LIVE_BETA_MODE,
+
       transaction_execution:
         TRANSACTION_EXECUTION
     },
+
     execution:
       liveBetaExecutionStatus(
         env
       ),
+
     portfolio: {
       schema_version:
         portfolio.schema_version,
+
       starting_cash_usd:
         portfolio.starting_cash_usd,
+
       cash_usd:
         round(
           portfolio.cash_usd,
           6
         ),
+
       realized_pnl_usd:
         round(
           portfolio.realized_pnl_usd,
           6
         ),
+
       positions:
         portfolio.positions,
+
       history_count:
         portfolio.history.length,
+
       market_memory_count:
         Object.keys(
           portfolio.market_memory ||
             {}
         ).length
     },
+
     time:
       nowIso()
   };
@@ -4572,7 +4653,8 @@ async function resetPortfolio(
     portfolio,
     "RESET",
     {
-      force: true
+      force:
+        true
     }
   );
 
@@ -4634,16 +4716,20 @@ async function handleRequest(
 
       return jsonResponse({
         ok: true,
+
         bot:
           BOT_NAME,
+
         scanner_status:
           "OK",
+
         scan
       });
     } catch (error) {
       return jsonResponse(
         {
           ok: false,
+
           error:
             errorText(error)
         },
@@ -4692,34 +4778,43 @@ async function handleRequest(
 
       return jsonResponse({
         ok: true,
+
         bot:
           BOT_NAME,
+
         mode:
           PAPER_MODE
             ? "PAPER"
             : "LIVE",
+
         engine,
+
         persist,
+
         scan: {
           candidate_count:
             scan.candidates.length,
+
           top_candidates:
             scan.candidates.slice(
               0,
               10
             )
         },
+
         portfolio: {
           cash_usd:
             round(
               portfolio.cash_usd,
               6
             ),
+
           realized_pnl_usd:
             round(
               portfolio.realized_pnl_usd,
               6
             ),
+
           positions:
             portfolio.positions
         }
@@ -4728,6 +4823,7 @@ async function handleRequest(
       return jsonResponse(
         {
           ok: false,
+
           error:
             errorText(error)
         },
@@ -4757,6 +4853,7 @@ async function handleRequest(
       return jsonResponse(
         {
           ok: false,
+
           error:
             errorText(error)
         },
@@ -4768,6 +4865,7 @@ async function handleRequest(
   return jsonResponse(
     {
       ok: false,
+
       error:
         "NOT_FOUND"
     },
@@ -4838,8 +4936,10 @@ export default {
       return jsonResponse(
         {
           ok: false,
+
           bot:
             BOT_NAME,
+
           error:
             errorText(error)
         },
