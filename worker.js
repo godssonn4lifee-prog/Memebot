@@ -31,6 +31,13 @@ CLOUDFLARE FREE REQUEST PROTECTION
 - KV portfolio read: 1
 - Confirmation polling: max 3
 - No GeckoTerminal requests
+
+LIVE SAFETY FIXES
+- Minimum entry score: 20
+- DexScreener 429/1015 exponential backoff
+- Severe DEX/Jupiter price mismatch rejection
+- Scheduled-run outcome accounting
+- Reduced redundant KV writes
 ============================================================
 */
 
@@ -66,6 +73,9 @@ const TRAILING_STOP = 0.03;
 const REVERSAL_CONFIRMATIONS_REQUIRED = 2;
 const PROFIT_REVERSAL_SELL_RATIO = 1.20;
 
+/*
+LOWERED AS REQUESTED.
+*/
 const MIN_ENTRY_SCORE = 20;
 const MIN_MOMENTUM_SCORE = 3;
 const MIN_SETUP_SCORE = 3;
@@ -93,30 +103,36 @@ const HOURLY_SELL_RATIO = 1.43;
 
 const MAX_CANDIDATES = 30;
 
-/*
-Reduced from 20 to 10.
-
-Search results already contain full pair objects, so hydration
-is only needed for discovery-only tokens.
-*/
 const MAX_DEX_TOKENS_ANALYZED = 10;
-
 const MAX_JUPITER_PRICE_CHECKS = 20;
 
-/*
-This is a planning budget, not a fake hard limit.
-The actual scanner is deliberately kept well below the
-Workers Free 50-subrequest ceiling before live execution.
-*/
 const MAX_EXTERNAL_REQUEST_BUDGET = 40;
 
-/*
-Three confirmation/status requests are sufficient for a bounded
-confirmation window while leaving considerably more request
-headroom for the rest of the live transaction.
-*/
 const MAX_CONFIRMATION_POLLS = 3;
 const CONFIRMATION_POLL_INTERVAL_MS = 2500;
+
+/*
+If DEXScreener returns HTTP 429 / Cloudflare 1015,
+do not keep hitting it every minute.
+
+Backoff:
+1st rate limit  = 5 minutes
+2nd             = 10 minutes
+3rd             = 20 minutes
+maximum         = 30 minutes
+*/
+const DEX_BACKOFF_BASE_SECONDS = 300;
+const DEX_BACKOFF_MAX_SECONDS = 1800;
+
+/*
+If DEXScreener and Jupiter disagree by more than 25%,
+the candidate is rejected.
+
+This specifically protects against cases like:
+DEX = $21.58
+Jupiter = $0.004456
+*/
+const MAX_PRICE_MISMATCH_RATIO = 0.25;
 
 const DEX_BASE = "https://api.dexscreener.com";
 const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";
@@ -126,11 +142,6 @@ const JUPITER_SWAP_API = "https://quote-api.jup.ag/v6/swap";
 const SOL_MINT =
   "So11111111111111111111111111111111111111112";
 
-/*
-IMPORTANT:
-This is the existing Cloudflare KV binding.
-Do NOT replace this with a secret or environment variable.
-*/
 const PORTFOLIO_KEY = "LIVE_BETA_PORTFOLIO";
 
 /* ============================================================
@@ -202,6 +213,28 @@ function logError(event, error, data = {}) {
   }
 }
 
+function relativePriceDifference(a, b) {
+  const first = safeNumber(a);
+  const second = safeNumber(b);
+
+  if (
+    first <= 0 ||
+    second <= 0
+  ) {
+    return null;
+  }
+
+  const denominator =
+    Math.min(first, second);
+
+  if (denominator <= 0) {
+    return null;
+  }
+
+  return Math.abs(first - second) /
+    denominator;
+}
+
 /* ============================================================
 FETCH
 ============================================================ */
@@ -264,7 +297,8 @@ async function fetchJsonSafe(url, options = {}) {
         ok: false,
         status: response.status,
         data: null,
-        error: `INVALID_JSON:${errorText(error)}`,
+        error:
+          `INVALID_JSON:${errorText(error)}`,
         body_preview: null,
         duration_ms: duration
       };
@@ -300,6 +334,10 @@ function createRuntimeState() {
     last_scheduled_run_ok: null,
     last_scheduled_error: null,
     last_run_duration_ms: 0,
+
+    last_run_outcome: null,
+    last_run_rate_limited: false,
+
     last_scan_candidate_count: 0,
     last_eligible_candidate_count: 0,
     last_buy_count: 0,
@@ -308,10 +346,18 @@ function createRuntimeState() {
     last_top_candidate: null,
     last_trade_signature: null,
     last_trade_type: null,
+
     total_scheduled_runs: 0,
     total_successful_scheduled_runs: 0,
     total_failed_scheduled_runs: 0,
+    total_rate_limited_runs: 0,
+
     last_scan_diagnostics: null,
+
+    dex_rate_limit_count: 0,
+    dex_backoff_until: 0,
+    dex_backoff_seconds: 0,
+    last_dex_rate_limit_at: null,
 
     current_stage: null,
     current_stage_started_at: null,
@@ -341,33 +387,124 @@ function createEmptyPortfolio() {
   };
 }
 
-async function loadPortfolio(env) {
+function normalizeRuntimeCounters(portfolio) {
+  const runtime =
+    portfolio.runtime ||
+    createRuntimeState();
+
+  runtime.total_scheduled_runs =
+    Math.max(
+      0,
+      Math.floor(
+        safeNumber(
+          runtime.total_scheduled_runs
+        )
+      )
+    );
+
+  runtime.total_successful_scheduled_runs =
+    Math.max(
+      0,
+      Math.floor(
+        safeNumber(
+          runtime.total_successful_scheduled_runs
+        )
+      )
+    );
+
+  runtime.total_failed_scheduled_runs =
+    Math.max(
+      0,
+      Math.floor(
+        safeNumber(
+          runtime.total_failed_scheduled_runs
+        )
+      )
+    );
+
+  runtime.total_rate_limited_runs =
+    Math.max(
+      0,
+      Math.floor(
+        safeNumber(
+          runtime.total_rate_limited_runs
+        )
+      )
+    );
+
   /*
-  The only KV binding used by this worker is BOT_KV.
+  Repair impossible legacy totals such as:
+  total = 187
+  success = 25
+  failed = 174
+
+  Keep the recorded total authoritative and bring
+  the failure count back into a mathematically valid range.
   */
-  if (!env.BOT_KV) {
-    throw new Error("MISSING_BOT_KV_BINDING");
+  const counted =
+    runtime.total_successful_scheduled_runs +
+    runtime.total_failed_scheduled_runs;
+
+  if (
+    counted >
+    runtime.total_scheduled_runs
+  ) {
+    runtime.total_failed_scheduled_runs =
+      Math.max(
+        0,
+        runtime.total_scheduled_runs -
+          runtime.total_successful_scheduled_runs
+      );
   }
 
-  const raw = await env.BOT_KV.get(PORTFOLIO_KEY);
+  if (
+    runtime.total_successful_scheduled_runs >
+    runtime.total_scheduled_runs
+  ) {
+    runtime.total_successful_scheduled_runs =
+      runtime.total_scheduled_runs;
+
+    runtime.total_failed_scheduled_runs =
+      0;
+  }
+
+  portfolio.runtime =
+    runtime;
+}
+
+async function loadPortfolio(env) {
+  if (!env.BOT_KV) {
+    throw new Error(
+      "MISSING_BOT_KV_BINDING"
+    );
+  }
+
+  const raw =
+    await env.BOT_KV.get(
+      PORTFOLIO_KEY
+    );
 
   if (!raw) {
     return createEmptyPortfolio();
   }
 
   try {
-    const portfolio = JSON.parse(raw);
+    const portfolio =
+      JSON.parse(raw);
 
     if (
-      safeNumber(portfolio.schema_version) !==
-        SCHEMA_VERSION ||
+      safeNumber(
+        portfolio.schema_version
+      ) !== SCHEMA_VERSION ||
       portfolio.mode !== "LIVE"
     ) {
       logEvent(
         "PORTFOLIO_RESET_SCHEMA_MISMATCH",
         {
-          stored_schema: portfolio.schema_version,
-          stored_mode: portfolio.mode
+          stored_schema:
+            portfolio.schema_version,
+          stored_mode:
+            portfolio.mode
         }
       );
 
@@ -379,21 +516,23 @@ async function loadPortfolio(env) {
     portfolio.cooldowns ||= {};
     portfolio.market_memory ||= {};
 
-    const defaults = createRuntimeState();
+    const defaults =
+      createRuntimeState();
 
     portfolio.runtime = {
       ...defaults,
       ...(portfolio.runtime || {})
     };
 
-    portfolio.cash_usd = clamp(
-      safeNumber(
-        portfolio.cash_usd,
-        STARTING_CASH_USD
-      ),
-      0,
-      MAX_LIVE_BANKROLL_USD
-    );
+    portfolio.cash_usd =
+      clamp(
+        safeNumber(
+          portfolio.cash_usd,
+          STARTING_CASH_USD
+        ),
+        0,
+        MAX_LIVE_BANKROLL_USD
+      );
 
     portfolio.realized_pnl_usd =
       safeNumber(
@@ -405,8 +544,17 @@ async function loadPortfolio(env) {
         portfolio.last_persist_at
       );
 
-    cleanupCooldowns(portfolio);
-    cleanupMarketMemory(portfolio);
+    normalizeRuntimeCounters(
+      portfolio
+    );
+
+    cleanupCooldowns(
+      portfolio
+    );
+
+    cleanupMarketMemory(
+      portfolio
+    );
 
     return portfolio;
   } catch (error) {
@@ -420,9 +568,10 @@ async function loadPortfolio(env) {
 }
 
 function persistenceAgeMs(portfolio) {
-  const last = safeNumber(
-    portfolio.last_persist_at
-  );
+  const last =
+    safeNumber(
+      portfolio.last_persist_at
+    );
 
   return last
     ? Date.now() - last
@@ -460,7 +609,8 @@ async function savePortfolio(
     };
   }
 
-  const persistedAt = Date.now();
+  const persistedAt =
+    Date.now();
 
   const payload = {
     ...portfolio,
@@ -506,7 +656,8 @@ function addHistory(
   });
 
   if (
-    portfolio.history.length > 500
+    portfolio.history.length >
+    500
   ) {
     portfolio.history =
       portfolio.history.slice(-500);
@@ -517,7 +668,9 @@ function setStage(
   portfolio,
   stage
 ) {
-  if (!portfolio?.runtime) return;
+  if (!portfolio?.runtime) {
+    return;
+  }
 
   portfolio.runtime.current_stage =
     stage;
@@ -537,7 +690,9 @@ function completeStage(
   portfolio,
   stage
 ) {
-  if (!portfolio?.runtime) return;
+  if (!portfolio?.runtime) {
+    return;
+  }
 
   portfolio.runtime.last_completed_stage =
     stage;
@@ -558,7 +713,9 @@ function failStage(
   stage,
   error
 ) {
-  if (!portfolio?.runtime) return;
+  if (!portfolio?.runtime) {
+    return;
+  }
 
   portfolio.runtime.last_error_stage =
     stage;
@@ -575,6 +732,134 @@ function failStage(
     {
       stage
     }
+  );
+}
+
+/* ============================================================
+DEX RATE LIMIT BACKOFF
+============================================================ */
+
+function dexBackoffActive(
+  portfolio
+) {
+  return (
+    safeNumber(
+      portfolio?.runtime
+        ?.dex_backoff_until
+    ) >
+    Date.now()
+  );
+}
+
+function registerDexRateLimit(
+  portfolio
+) {
+  if (!portfolio?.runtime) {
+    return;
+  }
+
+  const previous =
+    safeNumber(
+      portfolio.runtime
+        .dex_rate_limit_count
+    );
+
+  const count =
+    Math.min(
+      previous + 1,
+      10
+    );
+
+  const exponent =
+    Math.min(
+      count - 1,
+      3
+    );
+
+  const seconds =
+    Math.min(
+      DEX_BACKOFF_MAX_SECONDS,
+      DEX_BACKOFF_BASE_SECONDS *
+        (2 ** exponent)
+    );
+
+  portfolio.runtime.dex_rate_limit_count =
+    count;
+
+  portfolio.runtime.dex_backoff_seconds =
+    seconds;
+
+  portfolio.runtime.dex_backoff_until =
+    Date.now() +
+    seconds * 1000;
+
+  portfolio.runtime.last_dex_rate_limit_at =
+    nowIso();
+
+  logEvent(
+    "DEX_RATE_LIMIT_BACKOFF",
+    {
+      count,
+      seconds,
+      until:
+        new Date(
+          portfolio.runtime
+            .dex_backoff_until
+        ).toISOString()
+    }
+  );
+}
+
+function clearDexRateLimit(
+  portfolio
+) {
+  if (!portfolio?.runtime) {
+    return;
+  }
+
+  portfolio.runtime.dex_rate_limit_count =
+    0;
+
+  portfolio.runtime.dex_backoff_until =
+    0;
+
+  portfolio.runtime.dex_backoff_seconds =
+    0;
+}
+
+function responseWasRateLimited(
+  response
+) {
+  if (
+    safeNumber(
+      response?.status
+    ) === 429
+  ) {
+    return true;
+  }
+
+  const text =
+    `${response?.error || ""} ${response?.body_preview || ""}`
+      .toLowerCase();
+
+  return (
+    text.includes("1015") ||
+    text.includes("rate limit") ||
+    text.includes("too many requests")
+  );
+}
+
+function diagnosticsContainRateLimit(
+  diagnostics
+) {
+  return (
+    Array.isArray(diagnostics) &&
+    diagnostics.some(
+      item =>
+        responseWasRateLimited(
+          item
+        )
+    )
   );
 }
 
@@ -668,7 +953,9 @@ async function getDexDiscovery() {
         item?.tokenAddress ||
         item?.address;
 
-      if (!mint) continue;
+      if (!mint) {
+        continue;
+      }
 
       results.push({
         mint,
@@ -767,7 +1054,9 @@ async function getDexSearch() {
       const mint =
         pair?.baseToken?.address;
 
-      if (!mint) continue;
+      if (!mint) {
+        continue;
+      }
 
       const existing =
         pairMap.get(mint);
@@ -950,7 +1239,9 @@ function extractJupiterPrice(
   data,
   mint
 ) {
-  if (!data) return null;
+  if (!data) {
+    return null;
+  }
 
   const direct =
     data?.data?.[mint] ||
@@ -1142,11 +1433,23 @@ function normalizeCandidate(
       pair?.priceUsd
     );
 
-  const price =
-    dexPrice ||
+  const jupPrice =
     safeNumber(
       jupiterPrice
     );
+
+  const price =
+    dexPrice ||
+    jupPrice;
+
+  const priceMismatch =
+    dexPrice > 0 &&
+    jupPrice > 0
+      ? relativePriceDifference(
+          dexPrice,
+          jupPrice
+        )
+      : null;
 
   const changes =
     pair?.priceChange ||
@@ -1214,57 +1517,74 @@ function normalizeCandidate(
     pair_url:
       pair?.url ||
       null,
+
     price_usd:
       price,
+
     liquidity_usd:
       liquidityAvailable
         ? safeNumber(
             pair.liquidity.usd
           )
         : 0,
+
     liquidity_data_available:
       !!liquidityAvailable,
+
     volume_24h_usd:
       volume24Available
         ? safeNumber(
             pair.volume.h24
           )
         : 0,
+
     volume_24h_data_available:
       !!volume24Available,
+
     volume_1h_usd:
       volume1Available
         ? safeNumber(
             pair.volume.h1
           )
         : 0,
+
     volume_1h_data_available:
       !!volume1Available,
+
     change_5m:
       change5m,
+
     change_1h:
       change1h,
+
     change_6h:
       change6h,
+
     change_24h:
       change24h,
+
     pair_created_at:
       pairCreatedAt ||
       null,
+
     age_days:
       ageDays,
+
     quote_symbol:
       pair?.quoteToken?.symbol ||
       null,
+
     jupiter_price_usd:
-      safeNumber(
-        jupiterPrice
-      ) ||
+      jupPrice ||
       null,
+
+    price_mismatch_ratio:
+      priceMismatch,
+
     price_source:
       dexPrice > 0
         ? "DEXSCREENER"
-        : jupiterPrice > 0
+        : jupPrice > 0
           ? "JUPITER"
           : "NONE"
   };
@@ -1648,6 +1968,19 @@ function scoreCandidate(
     risk += 8;
   }
 
+  /*
+  Severe price mismatch is treated as risk rather than merely
+  an informational diagnostic.
+  */
+  if (
+    safeNumber(
+      candidate.price_mismatch_ratio
+    ) >
+    MAX_PRICE_MISMATCH_RATIO
+  ) {
+    risk += 50;
+  }
+
   let newTokenPenalty = 0;
 
   if (
@@ -1835,6 +2168,17 @@ function evaluateCandidate(
   ) {
     reasons.push(
       "CHASE_24H"
+    );
+  }
+
+  if (
+    safeNumber(
+      candidate.price_mismatch_ratio
+    ) >
+    MAX_PRICE_MISMATCH_RATIO
+  ) {
+    reasons.push(
+      "PRICE_SOURCE_MISMATCH"
     );
   }
 
@@ -3055,7 +3399,7 @@ async function broadcastAndConfirm(
   for (
     let poll = 1;
     poll <=
-      MAX_CONFIRMATION_POLLS;
+    MAX_CONFIRMATION_POLLS;
     poll++
   ) {
     const result =
@@ -3209,6 +3553,25 @@ async function liveBuy(
 ) {
   requireLiveConfig(env);
 
+  /*
+  Final safety check immediately before the live swap.
+  */
+  const candidateReasons =
+    evaluateCandidate(
+      portfolio,
+      candidate
+    );
+
+  if (
+    candidateReasons.length
+  ) {
+    throw new Error(
+      `LIVE_BUY_CANDIDATE_REJECTED:${candidateReasons.join(
+        ","
+      )}`
+    );
+  }
+
   const amountUsd =
     MAX_LIVE_TRADE_USD;
 
@@ -3269,7 +3632,9 @@ async function liveBuy(
       symbol:
         candidate.symbol,
       amount_usd:
-        amountUsd
+        amountUsd,
+      score:
+        candidate.score
     }
   );
 
@@ -3742,6 +4107,105 @@ async function liveSell(
 SCAN
 ============================================================ */
 
+function emptyBackoffScan(
+  portfolio,
+  started
+) {
+  const until =
+    safeNumber(
+      portfolio.runtime
+        .dex_backoff_until
+    );
+
+  const remaining =
+    Math.max(
+      0,
+      until - Date.now()
+    );
+
+  const diagnostics = {
+    duration_ms:
+      Date.now() -
+      started,
+
+    dexscreener_backoff_active:
+      true,
+
+    dexscreener_backoff_remaining_ms:
+      remaining,
+
+    dexscreener_backoff_remaining_seconds:
+      Math.ceil(
+        remaining / 1000
+      ),
+
+    dexscreener_discovery:
+      0,
+
+    dexscreener_discovery_unique:
+      0,
+
+    dexscreener_search_pairs:
+      0,
+
+    dexscreener_search_unique_mints:
+      0,
+
+    dex_hydration_requested:
+      0,
+
+    dex_hydration:
+      0,
+
+    jupiter_prices_requested:
+      0,
+
+    jupiter_prices:
+      0,
+
+    candidate_count:
+      0,
+
+    eligible_candidate_count:
+      0,
+
+    top_candidate:
+      null,
+
+    estimated_external_requests:
+      0,
+
+    configured_request_budget:
+      MAX_EXTERNAL_REQUEST_BUDGET,
+
+    target_cloudflare_free_limit:
+      50,
+
+    rate_limited:
+      true,
+
+    rate_limit_reason:
+      "DEXSCREENER_BACKOFF_ACTIVE",
+
+    endpoint_diagnostics: {
+      dexscreener_discovery: [],
+      dexscreener_search: [],
+      dex_hydration: [],
+      jupiter_prices: {
+        requested: 0,
+        error:
+          "DEXSCREENER_BACKOFF_ACTIVE"
+      }
+    }
+  };
+
+  return {
+    candidates: [],
+    diagnostics,
+    portfolio
+  };
+}
+
 async function runScan(
   env,
   existingPortfolio = null
@@ -3753,11 +4217,31 @@ async function runScan(
     "SCAN_START"
   );
 
+  const portfolio =
+    existingPortfolio ||
+    await loadPortfolio(
+      env
+    );
+
   /*
-  The three discovery calls and three search calls are kept
-  sequential within their respective functions. This prevents
-  excessive simultaneous outgoing connections.
+  Do not touch DexScreener while it is rate-limited.
+  This is the primary fix for the repeating HTTP 429/1015 cycle.
   */
+  if (
+    dexBackoffActive(
+      portfolio
+    )
+  ) {
+    logEvent(
+      "SCAN_SKIPPED_DEX_BACKOFF"
+    );
+
+    return emptyBackoffScan(
+      portfolio,
+      started
+    );
+  }
+
   const [
     dexDiscovery,
     dexSearch
@@ -3766,6 +4250,30 @@ async function runScan(
       getDexDiscovery(),
       getDexSearch()
     ]);
+
+  const discoveryRateLimited =
+    diagnosticsContainRateLimit(
+      dexDiscovery.diagnostics
+    );
+
+  const searchRateLimited =
+    diagnosticsContainRateLimit(
+      dexSearch.diagnostics
+    );
+
+  const dexRateLimited =
+    discoveryRateLimited ||
+    searchRateLimited;
+
+  if (dexRateLimited) {
+    registerDexRateLimit(
+      portfolio
+    );
+  } else {
+    clearDexRateLimit(
+      portfolio
+    );
+  }
 
   const sourceMap =
     new Map();
@@ -3842,9 +4350,99 @@ async function runScan(
     );
 
   /*
-  Search results already contain pair objects.
-  Only discovery-only tokens consume hydration requests.
+  If all DexScreener sources are rate-limited,
+  do not spend additional requests on hydration/Jupiter.
   */
+  const anyUsableDexData =
+    mints.length > 0;
+
+  if (
+    dexRateLimited &&
+    !anyUsableDexData
+  ) {
+    const diagnostics = {
+      duration_ms:
+        Date.now() -
+        started,
+
+      dexscreener_discovery:
+        dexDiscovery.results.length,
+
+      dexscreener_discovery_unique:
+        new Set(
+          dexDiscovery.results.map(
+            item =>
+              item.mint
+          )
+        ).size,
+
+      dexscreener_search_pairs:
+        dexSearch.results.length,
+
+      dexscreener_search_unique_mints:
+        dexSearch.pairMap.size,
+
+      dex_hydration_requested:
+        0,
+
+      dex_hydration:
+        0,
+
+      jupiter_prices_requested:
+        0,
+
+      jupiter_prices:
+        0,
+
+      candidate_count:
+        0,
+
+      eligible_candidate_count:
+        0,
+
+      top_candidate:
+        null,
+
+      estimated_external_requests:
+        6,
+
+      configured_request_budget:
+        MAX_EXTERNAL_REQUEST_BUDGET,
+
+      target_cloudflare_free_limit:
+        50,
+
+      rate_limited:
+        true,
+
+      rate_limit_reason:
+        "DEXSCREENER_HTTP_429_OR_1015",
+
+      endpoint_diagnostics: {
+        dexscreener_discovery:
+          dexDiscovery.diagnostics,
+
+        dexscreener_search:
+          dexSearch.diagnostics,
+
+        dex_hydration: [],
+
+        jupiter_prices: {
+          requested: 0,
+          returned_count: 0,
+          error:
+            "SKIPPED_AFTER_DEX_RATE_LIMIT"
+        }
+      }
+    };
+
+    return {
+      candidates: [],
+      diagnostics,
+      portfolio
+    };
+  }
+
   const hydrationMints =
     mints
       .filter(
@@ -3858,21 +4456,9 @@ async function runScan(
         MAX_DEX_TOKENS_ANALYZED
       );
 
-  /*
-  If the caller already loaded the portfolio, do not issue
-  another KV read during the same invocation.
-  */
-  const portfolioPromise =
-    existingPortfolio
-      ? Promise.resolve(
-          existingPortfolio
-        )
-      : loadPortfolio(env);
-
   const [
     hydrationResult,
-    jupiterResult,
-    portfolio
+    jupiterResult
   ] =
     await Promise.all([
       hydrateDexPairs(
@@ -3880,8 +4466,7 @@ async function runScan(
       ),
       getJupiterPrices(
         mints
-      ),
-      portfolioPromise
+      )
     ]);
 
   const hydrated =
@@ -3961,24 +4546,11 @@ async function runScan(
     finalCandidates[0] ||
     null;
 
-  /*
-  Approximate scanner-only request count:
-    3 discovery
-    3 search
-    hydration count
-    1 Jupiter
-    1 KV read only when portfolio wasn't supplied
-  */
   const estimatedRequests =
     3 +
     3 +
     hydrationMints.length +
-    1 +
-    (
-      existingPortfolio
-        ? 0
-        : 1
-    );
+    1;
 
   const diagnostics = {
     duration_ms:
@@ -4051,6 +4623,20 @@ async function runScan(
     target_cloudflare_free_limit:
       50,
 
+    rate_limited:
+      dexRateLimited,
+
+    rate_limit_reason:
+      dexRateLimited
+        ? "DEXSCREENER_HTTP_429_OR_1015"
+        : null,
+
+    dex_backoff_until:
+      safeNumber(
+        portfolio.runtime
+          .dex_backoff_until
+      ),
+
     endpoint_diagnostics: {
       dexscreener_discovery:
         dexDiscovery.diagnostics,
@@ -4078,7 +4664,9 @@ async function runScan(
       top:
         diagnostics.top_candidate,
       estimated_requests:
-        diagnostics.estimated_external_requests
+        diagnostics.estimated_external_requests,
+      rate_limited:
+        diagnostics.rate_limited
     }
   );
 
@@ -4121,10 +4709,6 @@ async function runLiveEngine(
 
   let sells = 0;
 
-  /*
-  Exit logic is preserved.
-  Each confirmed sell immediately persists its new state.
-  */
   for (
     const position of [
       ...portfolio.positions
@@ -4157,12 +4741,14 @@ async function runLiveEngine(
       reason
     );
 
-    await savePortfolio(
-      env,
-      portfolio,
-      "LIVE_SELL",
-      true
-    );
+    /*
+    Do not force another KV write here.
+    The scheduled runner performs one consolidated final
+    persistence after the complete live engine.
+
+    This avoids multiple writes to the same KV key inside
+    the same invocation.
+    */
 
     sells++;
   }
@@ -4232,13 +4818,6 @@ async function runLiveEngine(
         env,
         portfolio,
         candidate
-      );
-
-      await savePortfolio(
-        env,
-        portfolio,
-        "LIVE_BUY",
-        true
       );
 
       buys++;
@@ -4464,7 +5043,21 @@ async function health(
         MIN_VOLUME_1H_USD,
 
       new_token_min_liquidity_usd:
-        NEW_TOKEN_MIN_LIQUIDITY_USD
+        NEW_TOKEN_MIN_LIQUIDITY_USD,
+
+      max_price_mismatch_ratio:
+        MAX_PRICE_MISMATCH_RATIO
+    },
+
+    dex_rate_limit_protection: {
+      enabled:
+        true,
+
+      base_backoff_seconds:
+        DEX_BACKOFF_BASE_SECONDS,
+
+      maximum_backoff_seconds:
+        DEX_BACKOFF_MAX_SECONDS
     },
 
     logging: {
@@ -4609,6 +5202,31 @@ async function handleRequest(
           env
         );
 
+      /*
+      /scan is diagnostic-only. If the scanner had to register
+      a DexScreener rate-limit backoff, persist that state so a
+      subsequent scheduled invocation does not immediately
+      hammer DexScreener again.
+      */
+      if (
+        scan.diagnostics
+          ?.rate_limited
+      ) {
+        try {
+          await savePortfolio(
+            env,
+            scan.portfolio,
+            "SCAN_RATE_LIMIT_BACKOFF",
+            true
+          );
+        } catch (persistError) {
+          logError(
+            "HTTP_SCAN_BACKOFF_PERSIST_FAILED",
+            persistError
+          );
+        }
+      }
+
       return jsonResponse({
         ok:
           true,
@@ -4685,11 +5303,6 @@ async function scheduledRun(
       env
     );
 
-    /*
-    One KV portfolio load for the entire scheduled run.
-    The scanner reuses this object instead of reading BOT_KV
-    again.
-    */
     portfolio =
       await loadPortfolio(
         env
@@ -4705,6 +5318,12 @@ async function scheduledRun(
 
     portfolio.runtime.last_scheduled_error =
       null;
+
+    portfolio.runtime.last_run_outcome =
+      null;
+
+    portfolio.runtime.last_run_rate_limited =
+      false;
 
     setStage(
       portfolio,
@@ -4768,21 +5387,71 @@ async function scheduledRun(
       scan.diagnostics;
 
     /*
-    Save diagnostics once before trading.
-    This is intentionally one forced KV write.
+    A rate-limited scan is NOT a worker failure.
+    It is a completed scheduled run with no trading attempt.
     */
-    try {
+    if (
+      scan.diagnostics
+        ?.rate_limited
+    ) {
+      portfolio.runtime.last_scheduled_run_ok =
+        true;
+
+      portfolio.runtime.last_scheduled_error =
+        null;
+
+      portfolio.runtime.last_run_rate_limited =
+        true;
+
+      portfolio.runtime.last_run_outcome =
+        "RATE_LIMITED";
+
+      portfolio.runtime.total_rate_limited_runs++;
+
+      portfolio.runtime.last_run_duration_ms =
+        Date.now() -
+        started;
+
+      portfolio.runtime.last_buy_count =
+        0;
+
+      portfolio.runtime.last_sell_count =
+        0;
+
+      portfolio.runtime.last_positions_count =
+        portfolio.positions.length;
+
+      portfolio.runtime.current_stage =
+        null;
+
+      /*
+      One consolidated write for this run.
+      */
       await savePortfolio(
         env,
         portfolio,
-        "SCAN_DIAGNOSTICS",
+        "SCHEDULED_RATE_LIMITED",
         true
       );
-    } catch (persistError) {
-      logError(
-        "SCAN_DIAGNOSTICS_PERSIST_FAILED",
-        persistError
+
+      logEvent(
+        "SCHEDULED_RUN_RATE_LIMITED",
+        {
+          duration_ms:
+            Date.now() -
+            started,
+          positions:
+            portfolio.positions.length
+        }
       );
+
+      return {
+        ok:
+          true,
+
+        rate_limited:
+          true
+      };
     }
 
     setStage(
@@ -4810,6 +5479,15 @@ async function scheduledRun(
 
     portfolio.runtime.last_scheduled_error =
       null;
+
+    portfolio.runtime.last_run_rate_limited =
+      false;
+
+    portfolio.runtime.last_run_outcome =
+      engine.buys > 0 ||
+      engine.sells > 0
+        ? "TRADE_EXECUTED"
+        : "NO_TRADE";
 
     portfolio.runtime.last_error_stage =
       null;
@@ -4844,23 +5522,22 @@ async function scheduledRun(
       "PERSIST";
 
     /*
-    Trade functions already force-persist after confirmed
-    trades. For a no-trade run, only checkpoint when due.
+    IMPORTANT:
+    One consolidated persistence write per scheduled invocation.
+
+    This prevents multiple rapid writes to the same BOT_KV key,
+    while still persisting confirmed live trade state before
+    the invocation completes.
     */
-    if (
-      checkpointDue(
-        portfolio
-      ) &&
-      engine.buys === 0 &&
-      engine.sells === 0
-    ) {
-      await savePortfolio(
-        env,
-        portfolio,
-        "LIVE_CHECKPOINT",
-        true
-      );
-    }
+    await savePortfolio(
+      env,
+      portfolio,
+      engine.buys > 0 ||
+      engine.sells > 0
+        ? "SCHEDULED_TRADE_COMPLETE"
+        : "SCHEDULED_SUCCESS",
+      true
+    );
 
     completeStage(
       portfolio,
@@ -4871,15 +5548,9 @@ async function scheduledRun(
       null;
 
     /*
-    Final runtime persistence.
-    One KV write, not several redundant writes.
+    The persist above included all final runtime state.
+    No second forced KV write is performed.
     */
-    await savePortfolio(
-      env,
-      portfolio,
-      "SCHEDULED_SUCCESS",
-      true
-    );
 
     logEvent(
       "SCHEDULED_RUN_SUCCESS",
@@ -4894,7 +5565,10 @@ async function scheduledRun(
         positions:
           engine.positions,
         eligible:
-          engine.eligible_candidates
+          engine.eligible_candidates,
+        outcome:
+          portfolio.runtime
+            .last_run_outcome
       }
     );
 
@@ -4933,6 +5607,12 @@ async function scheduledRun(
 
       portfolio.runtime.last_scheduled_error =
         message;
+
+      portfolio.runtime.last_run_outcome =
+        "FAILED";
+
+      portfolio.runtime.last_run_rate_limited =
+        false;
 
       portfolio.runtime.last_run_duration_ms =
         Date.now() -
@@ -5016,9 +5696,6 @@ export default {
     env,
     ctx
   ) {
-    /*
-    The scheduled operation itself is awaited.
-    */
     await scheduledRun(
       env
     );
