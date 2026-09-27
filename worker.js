@@ -4,10 +4,11 @@ const BOT_NAME = "memebott";
 ============================================================
 MEMEBOTT — LEAN LIVE TRADING — SCHEMA 5
 ============================================================
+
 LIVE ONLY
 
 - Jupiter price / quote / swap execution
-- DexScreener discovery
+- DexScreener search discovery
 - $20 maximum tracked bankroll
 - $2 maximum live trade
 - $10 minimum ledger cash reserve
@@ -15,32 +16,34 @@ LIVE ONLY
 - Maximum 7 positions
 - Maximum 1 new buy per run
 - Stop loss / trailing stop / reversal protection
-- Candidate scoring and short-term market memory
+- Candidate scoring and market memory
 - BOT_KV persistence
 - Scheduled automatic execution
 - Persistent runtime diagnostics
-- Bounded transaction confirmation polling
+- Bounded confirmation polling
 - No public live execution HTTP endpoints
 
-DEXSCREENER PROTECTION
-- Uses SEARCH as the primary discovery source.
-- Token profiles / boosts endpoints are disabled because they
-  add requests without reliably improving candidate quality.
-- No per-token hydration when SEARCH already supplied the pair.
-- Jupiter price validation remains enabled.
-- A 429/1015 no longer permanently turns every later scan into
-  candidates=[] for the entire backoff window.
-- Existing positions can still be managed during DEX backoff
-  using persisted position data plus fresh Jupiter prices where
-  possible.
-- Backoff is persisted, but only prevents repeated DexScreener
-  hammering; it does NOT erase candidates or portfolio state.
+DEX PROTECTION
+- Three lightweight search queries only.
+- No token profiles.
+- No boosts.
+- No GeckoTerminal.
+- No per-token hydration.
+- Dex rate limits are tracked PER SEARCH QUERY.
+- One rate-limited query does not disable the other queries.
+- Old global backoff state is automatically migrated/cleared.
+- Jupiter can still refresh known positions during Dex limits.
+- Jupiter-only data cannot open new positions.
 
 LIVE SAFETY
 - Minimum entry score: 20
 - DEX/Jupiter severe price mismatch rejection
-- Scheduled-run outcome accounting
-- Reduced KV writes
+- $2 maximum live trade
+- $20 maximum tracked bankroll
+- $10 minimum ledger reserve
+- 0.01 SOL on-chain reserve
+- Maximum 7 positions
+- Maximum 1 new buy per scheduled run
 ============================================================
 */
 
@@ -64,7 +67,6 @@ const COOLDOWN_SECONDS = 60;
 const MIN_SOL_RESERVE = 0.01;
 
 const MIN_PERSIST_INTERVAL_SECONDS = 120;
-const CHECKPOINT_INTERVAL_SECONDS = 300;
 
 const MAX_MEMORY_CANDIDATES = 12;
 const MAX_MEMORY_OBSERVATIONS = 4;
@@ -73,8 +75,10 @@ const MIN_HISTORY_OBSERVATIONS = 2;
 const STOP_LOSS = -0.01;
 const TRAILING_ACTIVATION = 0.01;
 const TRAILING_STOP = 0.03;
+
 const REVERSAL_CONFIRMATIONS_REQUIRED = 2;
-const PROFIT_REVERSAL_SELL_RATIO = 1.20;
+const SHORT_TERM_SELL_RATIO = 1.50;
+const HOURLY_SELL_RATIO = 1.43;
 
 const MIN_ENTRY_SCORE = 20;
 const MIN_MOMENTUM_SCORE = 3;
@@ -98,59 +102,29 @@ const EXTREME_1H_MOVE = 0.50;
 const STRONG_NEGATIVE_6H = -0.15;
 const STRONG_NEGATIVE_5M = -0.03;
 const BOUNCE_5M = 0.07;
-const SHORT_TERM_SELL_RATIO = 1.50;
-const HOURLY_SELL_RATIO = 1.43;
 
 const MAX_CANDIDATES = 30;
 
-/*
-PRIMARY DEX DISCOVERY
-
-Three separate DexScreener search calls are retained because
-different search terms can surface different Solana pairs.
-
-Token profile/boost discovery is intentionally removed.
-Those endpoints were consuming request budget and were one
-of the unnecessary sources of 429/1015 pressure.
-*/
 const DEX_SEARCH_QUERIES = [
   "SOL",
   "meme",
   "pump"
 ];
 
-const MAX_DEX_TOKENS_ANALYZED = 10;
 const MAX_JUPITER_PRICE_CHECKS = 20;
-
-/*
-Normal scan:
-3 Dex searches
-+ optional hydration for discovery-only tokens
-+ 1 Jupiter batch
-
-No 3-request profile/boost discovery block anymore.
-*/
-const MAX_EXTERNAL_REQUEST_BUDGET = 30;
+const MAX_EXTERNAL_REQUEST_BUDGET = 10;
 
 const MAX_CONFIRMATION_POLLS = 3;
 const CONFIRMATION_POLL_INTERVAL_MS = 2500;
 
 /*
-429 / 1015 backoff.
+Per-query Dex backoff.
 
-The important behavioral fix is that backoff is now scoped to
-DexScreener requests. It does NOT make the entire scanner
-blind forever and does NOT return an empty scan merely because
-the previous invocation was rate-limited.
-
-During backoff:
-- no DexScreener request is made
-- Jupiter can still refresh known mints / held positions
-- existing positions remain manageable
-- portfolio state remains intact
+This replaces the old global scanner backoff.
+One query being rate-limited does not stop the other queries.
 */
-const DEX_BACKOFF_BASE_SECONDS = 120;
-const DEX_BACKOFF_MAX_SECONDS = 900;
+const DEX_BACKOFF_BASE_SECONDS = 60;
+const DEX_BACKOFF_MAX_SECONDS = 300;
 
 const MAX_PRICE_MISMATCH_RATIO = 0.25;
 
@@ -163,6 +137,12 @@ const SOL_MINT =
   "So11111111111111111111111111111111111111112";
 
 const PORTFOLIO_KEY = "LIVE_BETA_PORTFOLIO";
+
+/*
+Incrementing this does NOT change the portfolio schema.
+It only migrates old runtime counters once.
+*/
+const RUNTIME_COUNTER_VERSION = 2;
 
 /* ============================================================
 UTILITY
@@ -241,13 +221,8 @@ function relativePriceDifference(a, b) {
     return null;
   }
 
-  const denominator = Math.min(first, second);
-
-  if (denominator <= 0) {
-    return null;
-  }
-
-  return Math.abs(first - second) / denominator;
+  return Math.abs(first - second) /
+    Math.min(first, second);
 }
 
 /* ============================================================
@@ -312,8 +287,7 @@ async function fetchJsonSafe(url, options = {}) {
         ok: false,
         status: response.status,
         data: null,
-        error:
-          `INVALID_JSON:${errorText(error)}`,
+        error: `INVALID_JSON:${errorText(error)}`,
         body_preview: null,
         duration_ms: duration
       };
@@ -339,6 +313,22 @@ async function fetchJsonSafe(url, options = {}) {
   }
 }
 
+function responseWasRateLimited(response) {
+  if (safeNumber(response?.status) === 429) {
+    return true;
+  }
+
+  const text =
+    `${response?.error || ""} ${response?.body_preview || ""}`
+      .toLowerCase();
+
+  return (
+    text.includes("1015") ||
+    text.includes("rate limit") ||
+    text.includes("too many requests")
+  );
+}
+
 /* ============================================================
 PORTFOLIO
 ============================================================ */
@@ -359,6 +349,7 @@ function createRuntimeState() {
     last_sell_count: 0,
     last_positions_count: 0,
     last_top_candidate: null,
+
     last_trade_signature: null,
     last_trade_type: null,
 
@@ -369,10 +360,22 @@ function createRuntimeState() {
 
     last_scan_diagnostics: null,
 
+    /*
+    Legacy/global fields are retained for status compatibility.
+    They are no longer used to disable the whole scanner.
+    */
     dex_rate_limit_count: 0,
     dex_backoff_until: 0,
     dex_backoff_seconds: 0,
     last_dex_rate_limit_at: null,
+
+    /*
+    New per-query backoff map.
+    */
+    dex_query_backoff_untils: {},
+
+    runtime_counter_version:
+      RUNTIME_COUNTER_VERSION,
 
     current_stage: null,
     current_stage_started_at: null,
@@ -387,25 +390,65 @@ function createEmptyPortfolio() {
   return {
     schema_version: SCHEMA_VERSION,
     mode: "LIVE",
-    starting_cash_usd: STARTING_CASH_USD,
-    cash_usd: STARTING_CASH_USD,
+
+    starting_cash_usd:
+      STARTING_CASH_USD,
+
+    cash_usd:
+      STARTING_CASH_USD,
+
     realized_pnl_usd: 0,
+
     positions: [],
     history: [],
     cooldowns: {},
     market_memory: {},
-    runtime: createRuntimeState(),
-    created_at: nowIso(),
-    updated_at: nowIso(),
+
+    runtime:
+      createRuntimeState(),
+
+    created_at:
+      nowIso(),
+
+    updated_at:
+      nowIso(),
+
     last_persist_at: 0,
     last_persist_reason: null
   };
 }
 
-function normalizeRuntimeCounters(portfolio) {
+function migrateRuntimeCounters(portfolio) {
   const runtime =
     portfolio.runtime ||
     createRuntimeState();
+
+  /*
+  The old counters were polluted by previous worker behavior.
+  Reset them once while preserving cash, positions, history and
+  market memory.
+  */
+  if (
+    safeNumber(
+      runtime.runtime_counter_version
+    ) !== RUNTIME_COUNTER_VERSION
+  ) {
+    runtime.total_scheduled_runs = 0;
+    runtime.total_successful_scheduled_runs = 0;
+    runtime.total_failed_scheduled_runs = 0;
+    runtime.total_rate_limited_runs = 0;
+
+    runtime.runtime_counter_version =
+      RUNTIME_COUNTER_VERSION;
+
+    logEvent(
+      "RUNTIME_COUNTERS_MIGRATED",
+      {
+        version:
+          RUNTIME_COUNTER_VERSION
+      }
+    );
+  }
 
   runtime.total_scheduled_runs =
     Math.max(
@@ -447,28 +490,82 @@ function normalizeRuntimeCounters(portfolio) {
       )
     );
 
+  portfolio.runtime = runtime;
+}
+
+function migrateDexBackoff(portfolio) {
+  const runtime =
+    portfolio.runtime ||
+    createRuntimeState();
+
+  /*
+  Remove the old global 1200-second backoff immediately.
+  The old code could persist a longer backoff than the current
+  code allowed.
+  */
+  const oldUntil =
+    safeNumber(
+      runtime.dex_backoff_until
+    );
+
+  const oldSeconds =
+    safeNumber(
+      runtime.dex_backoff_seconds
+    );
+
   if (
-    runtime.total_successful_scheduled_runs >
-    runtime.total_scheduled_runs
+    oldUntil > Date.now() ||
+    oldSeconds > 0
   ) {
-    runtime.total_successful_scheduled_runs =
-      runtime.total_scheduled_runs;
+    logEvent(
+      "LEGACY_DEX_BACKOFF_CLEARED",
+      {
+        old_until: oldUntil,
+        old_seconds: oldSeconds
+      }
+    );
   }
 
-  const counted =
-    runtime.total_successful_scheduled_runs +
-    runtime.total_failed_scheduled_runs;
+  runtime.dex_backoff_until = 0;
+  runtime.dex_backoff_seconds = 0;
 
-  if (
-    counted >
-    runtime.total_scheduled_runs
+  /*
+  Do not carry the old global rate-limit counter into the new
+  per-query system.
+  */
+  runtime.dex_rate_limit_count = 0;
+
+  runtime.dex_query_backoff_untils =
+    runtime.dex_query_backoff_untils &&
+    typeof runtime.dex_query_backoff_untils ===
+      "object"
+      ? runtime.dex_query_backoff_untils
+      : {};
+
+  for (
+    const query of
+    Object.keys(
+      runtime.dex_query_backoff_untils
+    )
   ) {
-    runtime.total_failed_scheduled_runs =
-      Math.max(
-        0,
-        runtime.total_scheduled_runs -
-          runtime.total_successful_scheduled_runs
+    const until =
+      safeNumber(
+        runtime.dex_query_backoff_untils[
+          query
+        ]
       );
+
+    if (
+      until <= Date.now() ||
+      until >
+        Date.now() +
+          DEX_BACKOFF_MAX_SECONDS *
+            1000
+    ) {
+      delete runtime.dex_query_backoff_untils[
+        query
+      ];
+    }
   }
 
   portfolio.runtime = runtime;
@@ -543,7 +640,11 @@ async function loadPortfolio(env) {
         portfolio.last_persist_at
       );
 
-    normalizeRuntimeCounters(
+    migrateRuntimeCounters(
+      portfolio
+    );
+
+    migrateDexBackoff(
       portfolio
     );
 
@@ -577,13 +678,6 @@ function persistenceAgeMs(portfolio) {
     : Infinity;
 }
 
-function checkpointDue(portfolio) {
-  return (
-    persistenceAgeMs(portfolio) >=
-    CHECKPOINT_INTERVAL_SECONDS * 1000
-  );
-}
-
 async function savePortfolio(
   env,
   portfolio,
@@ -613,14 +707,21 @@ async function savePortfolio(
 
   const payload = {
     ...portfolio,
-    mode: "LIVE",
-    schema_version: SCHEMA_VERSION,
+
+    mode:
+      "LIVE",
+
+    schema_version:
+      SCHEMA_VERSION,
+
     updated_at:
       new Date(
         persistedAt
       ).toISOString(),
+
     last_persist_at:
       persistedAt,
+
     last_persist_reason:
       reason
   };
@@ -730,56 +831,144 @@ function failStage(
 }
 
 /* ============================================================
-DEX RATE LIMIT BACKOFF
+DEX QUERY BACKOFF
 ============================================================ */
 
-function dexBackoffActive(
-  portfolio
+function queryBackoffActive(
+  portfolio,
+  query
 ) {
-  return (
+  const until =
     safeNumber(
       portfolio?.runtime
-        ?.dex_backoff_until
-    ) >
-    Date.now()
-  );
+        ?.dex_query_backoff_untils
+        ?.[
+          query
+        ]
+    );
+
+  return until > Date.now();
 }
 
-function dexBackoffRemainingMs(
+function activeDexBackoffQueries(
   portfolio
 ) {
-  return Math.max(
-    0,
-    safeNumber(
-      portfolio?.runtime
-        ?.dex_backoff_until
-    ) - Date.now()
-  );
+  const result = {};
+
+  const map =
+    portfolio?.runtime
+      ?.dex_query_backoff_untils ||
+    {};
+
+  for (
+    const [
+      query,
+      untilValue
+    ] of Object.entries(map)
+  ) {
+    const until =
+      safeNumber(
+        untilValue
+      );
+
+    if (
+      until > Date.now()
+    ) {
+      result[query] =
+        until;
+    }
+  }
+
+  return result;
 }
 
-function registerDexRateLimit(
+function anyDexQueryBackoffActive(
   portfolio
 ) {
-  if (!portfolio?.runtime) {
+  return Object.keys(
+    activeDexBackoffQueries(
+      portfolio
+    )
+  ).length > 0;
+}
+
+function syncLegacyBackoffFields(
+  portfolio
+) {
+  const active =
+    activeDexBackoffQueries(
+      portfolio
+    );
+
+  const untils =
+    Object.values(active);
+
+  if (!untils.length) {
+    portfolio.runtime.dex_backoff_until =
+      0;
+
+    portfolio.runtime.dex_backoff_seconds =
+      0;
+
     return;
   }
+
+  const maxUntil =
+    Math.max(
+      ...untils
+    );
+
+  portfolio.runtime.dex_backoff_until =
+    maxUntil;
+
+  portfolio.runtime.dex_backoff_seconds =
+    Math.ceil(
+      (
+        maxUntil -
+        Date.now()
+      ) / 1000
+    );
+}
+
+function registerDexQueryRateLimit(
+  portfolio,
+  query
+) {
+  if (!portfolio.runtime.dex_query_backoff_untils) {
+    portfolio.runtime.dex_query_backoff_untils =
+      {};
+  }
+
+  const key =
+    String(query);
 
   const previous =
     safeNumber(
       portfolio.runtime
-        .dex_rate_limit_count
+        .dex_query_backoff_counts
+        ?.[
+          key
+        ]
     );
+
+  if (
+    !portfolio.runtime
+      .dex_query_backoff_counts
+  ) {
+    portfolio.runtime
+      .dex_query_backoff_counts = {};
+  }
 
   const count =
     Math.min(
       previous + 1,
-      10
+      6
     );
 
   const exponent =
     Math.min(
       count - 1,
-      3
+      2
     );
 
   const seconds =
@@ -789,83 +978,62 @@ function registerDexRateLimit(
         (2 ** exponent)
     );
 
-  portfolio.runtime.dex_rate_limit_count =
+  portfolio.runtime
+    .dex_query_backoff_counts[key] =
     count;
 
-  portfolio.runtime.dex_backoff_seconds =
-    seconds;
-
-  portfolio.runtime.dex_backoff_until =
+  portfolio.runtime
+    .dex_query_backoff_untils[key] =
     Date.now() +
     seconds * 1000;
 
   portfolio.runtime.last_dex_rate_limit_at =
     nowIso();
 
+  syncLegacyBackoffFields(
+    portfolio
+  );
+
   logEvent(
-    "DEX_RATE_LIMIT_BACKOFF",
+    "DEX_QUERY_RATE_LIMIT_BACKOFF",
     {
+      query: key,
       count,
-      seconds,
-      until:
-        new Date(
-          portfolio.runtime
-            .dex_backoff_until
-        ).toISOString()
+      seconds
     }
   );
 }
 
-function clearDexRateLimit(
-  portfolio
-) {
-  if (!portfolio?.runtime) {
-    return;
-  }
-
-  portfolio.runtime.dex_rate_limit_count =
-    0;
-
-  portfolio.runtime.dex_backoff_until =
-    0;
-
-  portfolio.runtime.dex_backoff_seconds =
-    0;
-}
-
-function responseWasRateLimited(
-  response
+function clearDexQueryRateLimit(
+  portfolio,
+  query
 ) {
   if (
-    safeNumber(
-      response?.status
-    ) === 429
+    !portfolio.runtime
+      .dex_query_backoff_untils
   ) {
-    return true;
+    portfolio.runtime
+      .dex_query_backoff_untils =
+      {};
   }
 
-  const text =
-    `${response?.error || ""} ${response?.body_preview || ""}`
-      .toLowerCase();
+  delete portfolio.runtime
+    .dex_query_backoff_untils[
+      query
+    ];
 
-  return (
-    text.includes("1015") ||
-    text.includes("rate limit") ||
-    text.includes("too many requests")
-  );
-}
+  if (
+    portfolio.runtime
+      .dex_query_backoff_counts
+  ) {
+    delete portfolio.runtime
+      .dex_query_backoff_counts[
+        query
+      ];
+  }
 
-function diagnosticsContainRateLimit(
-  diagnostics
-) {
-  return (
-    Array.isArray(diagnostics) &&
-    diagnostics.some(
-      item =>
-        responseWasRateLimited(
-          item
-        )
-    )
+  syncLegacyBackoffFields(
+    portfolio
   );
 }
 
@@ -873,19 +1041,49 @@ function diagnosticsContainRateLimit(
 DEXSCREENER SEARCH
 ============================================================ */
 
-async function getDexSearch() {
+async function getDexSearch(
+  portfolio
+) {
   const pairMap =
     new Map();
 
-  const results = [];
   const diagnostics = [];
+
+  let requestCount = 0;
+  let rateLimitedCount = 0;
 
   for (
     const query of
     DEX_SEARCH_QUERIES
   ) {
+    if (
+      queryBackoffActive(
+        portfolio,
+        query
+      )
+    ) {
+      diagnostics.push({
+        query,
+        skipped: true,
+        skip_reason:
+          "QUERY_BACKOFF_ACTIVE",
+        backoff_until:
+          safeNumber(
+            portfolio.runtime
+              .dex_query_backoff_untils
+              ?.[
+                query
+              ]
+          )
+      });
+
+      continue;
+    }
+
     const url =
       `${DEX_BASE}/latest/dex/search?q=${encodeURIComponent(query)}`;
+
+    requestCount++;
 
     const response =
       await fetchJsonSafe(url);
@@ -897,9 +1095,29 @@ async function getDexSearch() {
         ? response.data.pairs
         : [];
 
+    const rateLimited =
+      responseWasRateLimited(
+        response
+      );
+
+    if (rateLimited) {
+      rateLimitedCount++;
+
+      registerDexQueryRateLimit(
+        portfolio,
+        query
+      );
+    } else if (
+      response.ok
+    ) {
+      clearDexQueryRateLimit(
+        portfolio,
+        query
+      );
+    }
+
     diagnostics.push({
       query,
-      url,
       ok:
         response.ok,
       status:
@@ -910,10 +1128,8 @@ async function getDexSearch() {
         response.error,
       body_preview:
         response.body_preview,
-      response_has_pairs:
-        Array.isArray(
-          response.data?.pairs
-        ),
+      rate_limited:
+        rateLimited,
       response_pair_count:
         pairs.length,
       solana_pair_count:
@@ -953,168 +1169,56 @@ async function getDexSearch() {
           mint,
           pair
         );
-      } else {
-        const oldLiquidity =
-          safeNumber(
-            existing?.liquidity?.usd
-          );
-
-        const newLiquidity =
-          safeNumber(
-            pair?.liquidity?.usd
-          );
-
-        const oldVolume =
-          safeNumber(
-            existing?.volume?.h24
-          );
-
-        const newVolume =
-          safeNumber(
-            pair?.volume?.h24
-          );
-
-        if (
-          newLiquidity >
-            oldLiquidity ||
-          (
-            newLiquidity ===
-              oldLiquidity &&
-            newVolume >
-              oldVolume
-          )
-        ) {
-          pairMap.set(
-            mint,
-            pair
-          );
-        }
+        continue;
       }
 
-      results.push({
-        mint,
-        source:
-          "DEXSCREENER_SEARCH"
-      });
-    }
-  }
+      const oldLiquidity =
+        safeNumber(
+          existing?.liquidity?.usd
+        );
 
-  return {
-    results,
-    pairMap,
-    diagnostics
-  };
-}
+      const newLiquidity =
+        safeNumber(
+          pair?.liquidity?.usd
+        );
 
-/* ============================================================
-DEX HYDRATION
-============================================================ */
+      const oldVolume =
+        safeNumber(
+          existing?.volume?.h24
+        );
 
-async function hydrateDexPairs(
-  mints
-) {
-  const targets =
-    unique(mints).slice(
-      0,
-      MAX_DEX_TOKENS_ANALYZED
-    );
+      const newVolume =
+        safeNumber(
+          pair?.volume?.h24
+        );
 
-  const hydrated =
-    new Map();
-
-  const diagnostics = [];
-
-  for (
-    const mint of targets
-  ) {
-    const url =
-      `${DEX_BASE}/latest/dex/tokens/${encodeURIComponent(mint)}`;
-
-    const response =
-      await fetchJsonSafe(url);
-
-    const pairs =
-      Array.isArray(
-        response.data?.pairs
-      )
-        ? response.data.pairs.filter(
-            pair =>
-              String(
-                pair?.chainId || ""
-              ).toLowerCase() ===
-              "solana"
-          )
-        : [];
-
-    diagnostics.push({
-      mint,
-      url,
-      ok:
-        response.ok,
-      status:
-        response.status,
-      duration_ms:
-        response.duration_ms,
-      error:
-        response.error,
-      body_preview:
-        response.body_preview,
-      response_pair_count:
-        Array.isArray(
-          response.data?.pairs
+      if (
+        newLiquidity >
+          oldLiquidity ||
+        (
+          newLiquidity ===
+            oldLiquidity &&
+          newVolume >
+            oldVolume
         )
-          ? response.data.pairs.length
-          : 0,
-      solana_pair_count:
-        pairs.length
-    });
-
-    if (
-      !response.ok ||
-      !pairs.length
-    ) {
-      continue;
-    }
-
-    pairs.sort(
-      (a, b) => {
-        const liquidityDifference =
-          safeNumber(
-            b?.liquidity?.usd
-          ) -
-          safeNumber(
-            a?.liquidity?.usd
-          );
-
-        if (
-          liquidityDifference !==
-          0
-        ) {
-          return liquidityDifference;
-        }
-
-        return (
-          safeNumber(
-            b?.volume?.h24
-          ) -
-          safeNumber(
-            a?.volume?.h24
-          )
+      ) {
+        pairMap.set(
+          mint,
+          pair
         );
       }
-    );
-
-    hydrated.set(
-      mint,
-      pairs[0]
-    );
+    }
   }
 
+  syncLegacyBackoffFields(
+    portfolio
+  );
+
   return {
-    hydrated,
+    pairMap,
     diagnostics,
-    requested:
-      targets.length
+    requestCount,
+    rateLimitedCount
   };
 }
 
@@ -1137,8 +1241,7 @@ function extractJupiterPrice(
 
   if (
     direct &&
-    typeof direct ===
-      "object" &&
+    typeof direct === "object" &&
     !Array.isArray(direct)
   ) {
     for (
@@ -1389,19 +1492,25 @@ function normalizeCandidate(
 
   return {
     mint,
+
     symbol:
       pair?.baseToken?.symbol ||
       null,
+
     name:
       pair?.baseToken?.name ||
       null,
+
     source,
+
     dex_id:
       pair?.dexId ||
       null,
+
     pair_address:
       pair?.pairAddress ||
       null,
+
     pair_url:
       pair?.url ||
       null,
@@ -1576,34 +1685,42 @@ function recordMarketObservation(
   existing.observations.push({
     time:
       Date.now(),
+
     price_usd:
       safeNumber(
         candidate.price_usd
       ),
+
     liquidity_usd:
       safeNumber(
         candidate.liquidity_usd
       ),
+
     volume_1h_usd:
       safeNumber(
         candidate.volume_1h_usd
       ),
+
     volume_24h_usd:
       safeNumber(
         candidate.volume_24h_usd
       ),
+
     change_5m:
       safeNumber(
         candidate.change_5m
       ),
+
     change_1h:
       safeNumber(
         candidate.change_1h
       ),
+
     change_6h:
       safeNumber(
         candidate.change_6h
       ),
+
     change_24h:
       safeNumber(
         candidate.change_24h
@@ -1911,10 +2028,7 @@ function scoreCandidate(
       round(risk, 2),
 
     new_token_penalty:
-      round(
-        newTokenPenalty,
-        2
-      )
+      round(newTokenPenalty, 2)
   };
 }
 
@@ -2093,88 +2207,26 @@ function evaluateCandidate(
   return reasons;
 }
 
-/* ============================================================
-ELIGIBILITY
-============================================================ */
-
 function getEligibleCandidates(
   portfolio,
   candidates
 ) {
   return candidates.filter(
-    candidate => {
-      if (
-        safeNumber(
-          candidate.score
-        ) <
-        MIN_ENTRY_SCORE
-      ) {
-        return false;
-      }
-
-      if (
-        safeNumber(
-          candidate.momentum_score
-        ) <
-        MIN_MOMENTUM_SCORE
-      ) {
-        return false;
-      }
-
-      if (
-        safeNumber(
-          candidate.setup_score
-        ) <
-        MIN_SETUP_SCORE
-      ) {
-        return false;
-      }
-
-      return (
-        evaluateCandidate(
-          portfolio,
-          candidate
-        ).length === 0
-      );
-    }
+    candidate =>
+      safeNumber(
+        candidate.score
+      ) >= MIN_ENTRY_SCORE &&
+      safeNumber(
+        candidate.momentum_score
+      ) >= MIN_MOMENTUM_SCORE &&
+      safeNumber(
+        candidate.setup_score
+      ) >= MIN_SETUP_SCORE &&
+      evaluateCandidate(
+        portfolio,
+        candidate
+      ).length === 0
   );
-}
-
-/* ============================================================
-PORTFOLIO VALUE
-============================================================ */
-
-function calculateEquity(
-  portfolio,
-  candidateMap
-) {
-  let equity =
-    safeNumber(
-      portfolio.cash_usd
-    );
-
-  for (
-    const position of
-    portfolio.positions
-  ) {
-    const candidate =
-      candidateMap.get(
-        position.mint
-      );
-
-    equity += candidate
-      ? safeNumber(
-          position.quantity
-        ) *
-        safeNumber(
-          candidate.price_usd
-        )
-      : safeNumber(
-          position.cost_usd
-        );
-  }
-
-  return equity;
 }
 
 /* ============================================================
@@ -3042,7 +3094,7 @@ async function getSolUsdPrice() {
 JUPITER
 ============================================================ */
 
-async function jupiterHeaders(
+function jupiterHeaders(
   env,
   json = false
 ) {
@@ -3104,7 +3156,7 @@ async function jupiterQuote(
       url.toString(),
       {
         headers:
-          await jupiterHeaders(
+          jupiterHeaders(
             env
           )
       }
@@ -3132,7 +3184,7 @@ async function jupiterSwapTransaction(
       {
         method: "POST",
         headers:
-          await jupiterHeaders(
+          jupiterHeaders(
             env,
             true
           ),
@@ -3328,15 +3380,6 @@ async function executeLiveSwap(
     );
   }
 
-  logEvent(
-    "JUPITER_QUOTE_START",
-    {
-      inputMint,
-      outputMint,
-      amount: String(amount)
-    }
-  );
-
   const quote =
     await jupiterQuote(
       env,
@@ -3345,25 +3388,12 @@ async function executeLiveSwap(
       amount
     );
 
-  logEvent(
-    "JUPITER_QUOTE_OK",
-    {
-      inputMint,
-      outputMint,
-      amount: String(amount)
-    }
-  );
-
   const swap =
     await jupiterSwapTransaction(
       env,
       quote,
       walletPublicKey
     );
-
-  logEvent(
-    "JUPITER_SWAP_TRANSACTION_OK"
-  );
 
   const confirmation =
     await broadcastAndConfirm(
@@ -3389,17 +3419,15 @@ async function liveBuy(
 ) {
   requireLiveConfig(env);
 
-  const candidateReasons =
+  const reasons =
     evaluateCandidate(
       portfolio,
       candidate
     );
 
-  if (
-    candidateReasons.length
-  ) {
+  if (reasons.length) {
     throw new Error(
-      `LIVE_BUY_CANDIDATE_REJECTED:${candidateReasons.join(
+      `LIVE_BUY_CANDIDATE_REJECTED:${reasons.join(
         ","
       )}`
     );
@@ -3407,15 +3435,6 @@ async function liveBuy(
 
   const amountUsd =
     MAX_LIVE_TRADE_USD;
-
-  if (
-    amountUsd >
-    MAX_LIVE_TRADE_USD
-  ) {
-    throw new Error(
-      "LIVE_TRADE_LIMIT_EXCEEDED"
-    );
-  }
 
   if (
     portfolio.positions.length >=
@@ -3456,20 +3475,6 @@ async function liveBuy(
       "MINIMUM_CASH_RESERVE_REQUIRED"
     );
   }
-
-  logEvent(
-    "LIVE_BUY_START",
-    {
-      mint:
-        candidate.mint,
-      symbol:
-        candidate.symbol,
-      amount_usd:
-        amountUsd,
-      score:
-        candidate.score
-    }
-  );
 
   const solPrice =
     await getSolUsdPrice();
@@ -3552,12 +3557,6 @@ async function liveBuy(
     );
   }
 
-  /*
-  IMPORTANT:
-  Ledger accounting remains based on the configured $2
-  trade size. The raw Jupiter output is retained for the
-  actual on-chain token amount.
-  */
   const quantity =
     amountUsd / price;
 
@@ -3569,42 +3568,51 @@ async function liveBuy(
       MAX_LIVE_BANKROLL_USD
     );
 
-  const position = {
+  portfolio.positions.push({
     mint:
       candidate.mint,
+
     symbol:
       candidate.symbol ||
       null,
+
     name:
       candidate.name ||
       null,
+
     entry_price_usd:
       price,
+
     quantity,
+
     quantity_raw:
       quantityRaw,
+
     cost_usd:
       amountUsd,
+
     peak_price_usd:
       price,
+
     trailing_active:
       false,
+
     reversal_confirmations:
       0,
+
     opened_at:
       nowIso(),
+
     source:
       candidate.source ||
       null,
+
     transaction_signature:
       result.signature,
+
     input_lamports:
       lamports
-  };
-
-  portfolio.positions.push(
-    position
-  );
+  });
 
   addHistory(
     portfolio,
@@ -3649,8 +3657,6 @@ async function liveBuy(
     {
       mint:
         candidate.mint,
-      symbol:
-        candidate.symbol,
       signature:
         result.signature,
       amount_usd:
@@ -3658,7 +3664,7 @@ async function liveBuy(
     }
   );
 
-  return position;
+  return true;
 }
 
 /* ============================================================
@@ -3688,17 +3694,6 @@ async function liveSell(
       "LIVE_POSITION_MISSING_RAW_TOKEN_AMOUNT"
     );
   }
-
-  logEvent(
-    "LIVE_SELL_START",
-    {
-      mint:
-        position.mint,
-      symbol:
-        position.symbol,
-      reason
-    }
-  );
 
   const walletPublicKey =
     await getLiveWalletPublicKey(
@@ -3739,8 +3734,7 @@ async function liveSell(
         ?.amount;
 
     if (
-      amount !==
-      undefined
+      amount !== undefined
     ) {
       onChainRaw +=
         BigInt(
@@ -3915,24 +3909,13 @@ async function liveSell(
     }
   );
 
-  return {
-    proceeds,
-    pnl,
-    signature:
-      result.signature
-  };
+  return true;
 }
 
 /* ============================================================
-BACKOFF POSITION PRICE REFRESH
+JUPITER-ONLY POSITION REFRESH
 ============================================================ */
 
-/*
-When DexScreener is unavailable, known portfolio positions can
-still receive Jupiter prices. This prevents the scanner from
-turning a temporary DEX rate limit into a completely blind
-trading engine.
-*/
 async function buildBackoffCandidates(
   env,
   portfolio
@@ -3961,13 +3944,9 @@ async function buildBackoffCandidates(
   if (!targets.length) {
     return {
       candidates: [],
-      diagnostics: {
-        source:
-          "JUPITER_BACKOFF_REFRESH",
-        requested:
-          0,
-        returned:
-          0
+      jupiter: {
+        requested: 0,
+        returned_count: 0
       }
     };
   }
@@ -4002,31 +3981,33 @@ async function buildBackoffCandidates(
         mint
       ];
 
-    const last =
+    const observations =
       Array.isArray(
         memory?.observations
-      ) &&
-      memory.observations.length
-        ? memory.observations[
-            memory.observations.length - 1
-          ]
-        : null;
+      )
+        ? memory.observations
+        : [];
+
+    const last =
+      observations[
+        observations.length - 1
+      ] || null;
 
     const candidate = {
       mint,
+
       symbol:
         position?.symbol ||
         memory?.symbol ||
         null,
+
       name:
         position?.name ||
         memory?.name ||
         null,
+
       source:
-        "JUPITER_BACKOFF_REFRESH",
-      dex_id: null,
-      pair_address: null,
-      pair_url: null,
+        "JUPITER_POSITION_REFRESH",
 
       price_usd:
         price,
@@ -4037,9 +4018,7 @@ async function buildBackoffCandidates(
         ),
 
       liquidity_data_available:
-        safeNumber(
-          last?.liquidity_usd
-        ) > 0,
+        false,
 
       volume_24h_usd:
         safeNumber(
@@ -4047,9 +4026,7 @@ async function buildBackoffCandidates(
         ),
 
       volume_24h_data_available:
-        safeNumber(
-          last?.volume_24h_usd
-        ) > 0,
+        false,
 
       volume_1h_usd:
         safeNumber(
@@ -4057,9 +4034,7 @@ async function buildBackoffCandidates(
         ),
 
       volume_1h_data_available:
-        safeNumber(
-          last?.volume_1h_usd
-        ) > 0,
+        false,
 
       change_5m:
         safeNumber(
@@ -4081,8 +4056,11 @@ async function buildBackoffCandidates(
           last?.change_24h
         ),
 
-      pair_created_at: null,
-      age_days: null,
+      pair_created_at:
+        null,
+
+      age_days:
+        null,
 
       quote_symbol:
         "USD",
@@ -4128,103 +4106,14 @@ async function buildBackoffCandidates(
 
   return {
     candidates,
-    diagnostics: {
-      source:
-        "JUPITER_BACKOFF_REFRESH",
-      requested:
-        targets.length,
-      returned:
-        candidates.length,
-      jupiter:
-        jupiter.diagnostics
-    }
+    jupiter:
+      jupiter.diagnostics
   };
 }
 
 /* ============================================================
 SCAN
 ============================================================ */
-
-function backoffDiagnostics(
-  portfolio,
-  started,
-  jupiterDiagnostics = null
-) {
-  const remaining =
-    dexBackoffRemainingMs(
-      portfolio
-    );
-
-  return {
-    duration_ms:
-      Date.now() -
-      started,
-
-    dexscreener_backoff_active:
-      true,
-
-    dexscreener_backoff_remaining_ms:
-      remaining,
-
-    dexscreener_backoff_remaining_seconds:
-      Math.ceil(
-        remaining / 1000
-      ),
-
-    dexscreener_search_requests:
-      0,
-
-    dex_hydration_requested:
-      0,
-
-    dex_hydration:
-      0,
-
-    jupiter_prices_requested:
-      jupiterDiagnostics
-        ?.requested ||
-      0,
-
-    jupiter_prices:
-      jupiterDiagnostics
-        ?.returned_count ||
-      0,
-
-    candidate_count: 0,
-
-    eligible_candidate_count: 0,
-
-    top_candidate: null,
-
-    estimated_external_requests:
-      jupiterDiagnostics
-        ? 1
-        : 0,
-
-    configured_request_budget:
-      MAX_EXTERNAL_REQUEST_BUDGET,
-
-    target_cloudflare_free_limit:
-      50,
-
-    rate_limited: true,
-
-    rate_limit_reason:
-      "DEXSCREENER_BACKOFF_ACTIVE",
-
-    endpoint_diagnostics: {
-      dexscreener_search: [],
-      dex_hydration: [],
-      jupiter_prices:
-        jupiterDiagnostics || {
-          requested: 0,
-          returned_count: 0,
-          error:
-            "NOT_REQUESTED"
-        }
-    }
-  };
-}
 
 async function runScan(
   env,
@@ -4233,220 +4122,162 @@ async function runScan(
   const started =
     Date.now();
 
-  logEvent(
-    "SCAN_START"
-  );
-
   const portfolio =
     existingPortfolio ||
     await loadPortfolio(env);
 
-  /*
-  FIX:
-  A DEX backoff no longer returns a completely empty scan
-  without attempting to refresh known positions.
-
-  This avoids:
-    candidates: []
-    eligible: 0
-    forever
-
-  during a DexScreener 429/1015 period.
-  */
-  if (
-    dexBackoffActive(
+  const dex =
+    await getDexSearch(
       portfolio
-    )
-  ) {
-    logEvent(
-      "SCAN_DEX_BACKOFF_ACTIVE",
-      {
-        remaining_ms:
-          dexBackoffRemainingMs(
-            portfolio
-          )
-      }
     );
 
+  const mints =
+    [...dex.pairMap.keys()]
+      .slice(
+        0,
+        MAX_CANDIDATES
+      );
+
+  /*
+  If every search is unavailable/backed off, use Jupiter for
+  known positions/memory instead.
+  */
+  if (
+    mints.length === 0
+  ) {
     const fallback =
       await buildBackoffCandidates(
         env,
         portfolio
       );
 
-    const diagnostics =
-      backoffDiagnostics(
-        portfolio,
+    const diagnostics = {
+      duration_ms:
+        Date.now() -
         started,
-        fallback.diagnostics
-          ?.jupiter ||
-          null
-      );
 
-    diagnostics.candidate_count =
-      fallback.candidates.length;
+      dexscreener_backoff_active:
+        anyDexQueryBackoffActive(
+          portfolio
+        ),
 
-    diagnostics.eligible_candidate_count =
-      getEligibleCandidates(
-        portfolio,
-        fallback.candidates
-      ).length;
+      dexscreener_backoff_remaining_seconds:
+        Math.ceil(
+          Math.max(
+            0,
+            safeNumber(
+              portfolio.runtime
+                .dex_backoff_until
+            ) -
+              Date.now()
+          ) / 1000
+        ),
 
-    diagnostics.top_candidate =
-      fallback.candidates[0]
-        ? {
-            mint:
-              fallback.candidates[0]
-                .mint,
-            symbol:
-              fallback.candidates[0]
-                .symbol,
-            name:
-              fallback.candidates[0]
-                .name,
-            score:
-              fallback.candidates[0]
-                .score,
-            filter_reasons:
-              fallback.candidates[0]
-                .filter_reasons
-          }
-        : null;
+      dexscreener_search_requests:
+        dex.requestCount,
 
-    diagnostics.endpoint_diagnostics =
-      {
-        dexscreener_search: [],
-        dex_hydration: [],
+      dexscreener_search_rate_limited:
+        dex.rateLimitedCount,
+
+      candidate_count:
+        fallback.candidates.length,
+
+      eligible_candidate_count:
+        getEligibleCandidates(
+          portfolio,
+          fallback.candidates
+        ).length,
+
+      jupiter_prices_requested:
+        fallback.jupiter?.requested ||
+        0,
+
+      jupiter_prices:
+        fallback.jupiter?.returned_count ||
+        0,
+
+      estimated_external_requests:
+        dex.requestCount +
+        (
+          fallback.jupiter
+            ? 1
+            : 0
+        ),
+
+      configured_request_budget:
+        MAX_EXTERNAL_REQUEST_BUDGET,
+
+      target_cloudflare_free_limit:
+        50,
+
+      rate_limited:
+        dex.rateLimitedCount > 0 ||
+        anyDexQueryBackoffActive(
+          portfolio
+        ),
+
+      rate_limit_reason:
+        dex.rateLimitedCount > 0
+          ? "DEXSCREENER_RATE_LIMITED"
+          : anyDexQueryBackoffActive(
+              portfolio
+            )
+            ? "DEX_QUERY_BACKOFF_ACTIVE"
+            : null,
+
+      endpoint_diagnostics: {
+        dexscreener_search:
+          dex.diagnostics,
+
         jupiter_prices:
-          fallback.diagnostics
-            ?.jupiter ||
-          null
-      };
+          fallback.jupiter
+      }
+    };
 
     return {
       candidates:
         fallback.candidates,
+
       diagnostics,
+
       portfolio
     };
-  }
-
-  /*
-  PRIMARY DISCOVERY:
-  Only the three search endpoints are called.
-
-  This removes the previous six-request discovery block
-  (3 profiles + 3 boosts/search) and substantially reduces
-  the chance of repeating DexScreener 429/1015 responses.
-  */
-  const dexSearch =
-    await getDexSearch();
-
-  const dexRateLimited =
-    diagnosticsContainRateLimit(
-      dexSearch.diagnostics
-    );
-
-  if (dexRateLimited) {
-    registerDexRateLimit(
-      portfolio
-    );
-  } else {
-    clearDexRateLimit(
-      portfolio
-    );
   }
 
   const sourceMap =
     new Map();
 
   for (
-    const item of
-    dexSearch.results
+    const [
+      mint
+    ] of dex.pairMap
   ) {
-    if (
-      item?.mint &&
-      !sourceMap.has(
-        item.mint
-      )
-    ) {
-      sourceMap.set(
-        item.mint,
-        item.source
-      );
-    }
-  }
-
-  const orderedMints =
-    [];
-
-  for (
-    const mint of
-    dexSearch.pairMap.keys()
-  ) {
-    if (
-      !orderedMints.includes(
-        mint
-      )
-    ) {
-      orderedMints.push(
-        mint
-      );
-    }
-
-    if (
-      orderedMints.length >=
-      MAX_CANDIDATES
-    ) {
-      break;
-    }
-  }
-
-  /*
-  If a search endpoint is rate-limited but other search
-  endpoints returned usable pairs, keep those pairs.
-  */
-  const mints =
-    orderedMints.slice(
-      0,
-      MAX_CANDIDATES
+    sourceMap.set(
+      mint,
+      "DEXSCREENER_SEARCH"
     );
+  }
 
-  /*
-  No point doing hydration if SEARCH already gave us pairs.
-  Hydration is reserved for future discovery-only sources,
-  which are currently disabled.
-  */
-  const hydrationMints = [];
-
-  /*
-  Jupiter validation remains one batch request.
-  */
-  const jupiterResult =
+  const jupiter =
     await getJupiterPrices(
       mints
     );
 
-  const jupiterPrices =
-    jupiterResult.prices;
-
-  const candidates =
-    [];
+  const candidates = [];
 
   for (
     const mint of mints
   ) {
     const pair =
-      dexSearch.pairMap.get(
+      dex.pairMap.get(
         mint
-      ) ||
-      null;
+      );
 
     const candidate =
       normalizeCandidate(
         mint,
         pair,
-        jupiterPrices[mint],
+        jupiter.prices[mint],
         sourceMap.get(
           mint
         ) ||
@@ -4498,46 +4329,50 @@ async function runScan(
     finalCandidates[0] ||
     null;
 
-  /*
-  3 Dex searches + 1 Jupiter batch.
-  */
-  const estimatedRequests =
-    DEX_SEARCH_QUERIES.length +
-    1;
+  const rateLimited =
+    dex.rateLimitedCount > 0;
 
   const diagnostics = {
     duration_ms:
       Date.now() -
       started,
 
+    dexscreener_backoff_active:
+      anyDexQueryBackoffActive(
+        portfolio
+      ),
+
+    dexscreener_backoff_remaining_seconds:
+      Math.ceil(
+        Math.max(
+          0,
+          safeNumber(
+            portfolio.runtime
+              .dex_backoff_until
+          ) -
+            Date.now()
+        ) / 1000
+      ),
+
     dexscreener_search_requests:
-      DEX_SEARCH_QUERIES.length,
+      dex.requestCount,
 
-    dexscreener_search_pairs:
-      dexSearch.results.length,
-
-    dexscreener_search_unique_mints:
-      dexSearch.pairMap.size,
-
-    dex_hydration_requested:
-      0,
-
-    dex_hydration:
-      0,
-
-    jupiter_prices_requested:
-      mints.length,
-
-    jupiter_prices:
-      Object.keys(
-        jupiterPrices
-      ).length,
+    dexscreener_search_rate_limited:
+      dex.rateLimitedCount,
 
     candidate_count:
       finalCandidates.length,
 
     eligible_candidate_count:
       eligible.length,
+
+    jupiter_prices_requested:
+      mints.length,
+
+    jupiter_prices:
+      Object.keys(
+        jupiter.prices
+      ).length,
 
     top_candidate:
       top
@@ -4560,7 +4395,8 @@ async function runScan(
         : null,
 
     estimated_external_requests:
-      estimatedRequests,
+      dex.requestCount +
+      1,
 
     configured_request_budget:
       MAX_EXTERNAL_REQUEST_BUDGET,
@@ -4569,27 +4405,19 @@ async function runScan(
       50,
 
     rate_limited:
-      dexRateLimited,
+      rateLimited,
 
     rate_limit_reason:
-      dexRateLimited
+      rateLimited
         ? "DEXSCREENER_HTTP_429_OR_1015"
         : null,
 
-    dex_backoff_until:
-      safeNumber(
-        portfolio.runtime
-          .dex_backoff_until
-      ),
-
     endpoint_diagnostics: {
       dexscreener_search:
-        dexSearch.diagnostics,
-
-      dex_hydration: [],
+        dex.diagnostics,
 
       jupiter_prices:
-        jupiterResult.diagnostics
+        jupiter.diagnostics
     }
   };
 
@@ -4598,23 +4426,29 @@ async function runScan(
     {
       duration_ms:
         diagnostics.duration_ms,
+
       candidates:
         diagnostics.candidate_count,
+
       eligible:
         diagnostics.eligible_candidate_count,
+
       top:
         diagnostics.top_candidate,
-      estimated_requests:
+
+      requests:
         diagnostics.estimated_external_requests,
-      rate_limited:
-        diagnostics.rate_limited
+
+      rate_limited
     }
   );
 
   return {
     candidates:
       finalCandidates,
+
     diagnostics,
+
     portfolio
   };
 }
@@ -4688,18 +4522,23 @@ async function runLiveEngine(
   let buys = 0;
 
   /*
-  A Jupiter-only backoff refresh is intentionally NOT allowed
-  to open new positions because it lacks current Dex liquidity
-  and volume validation.
-
-  It is safe for managing existing positions, not for new buys.
+  Jupiter-only refreshes do not contain fresh DEX liquidity and
+  volume data, so they are never allowed to create a new buy.
   */
-  const canOpenNewPositions =
-    !scan.diagnostics
-      ?.dexscreener_backoff_active;
+  const canBuy =
+    !(
+      scan.diagnostics
+        ?.rate_limit_reason ===
+      "DEX_QUERY_BACKOFF_ACTIVE" &&
+      scan.candidates.every(
+        candidate =>
+          candidate.source ===
+          "JUPITER_POSITION_REFRESH"
+      )
+    );
 
   if (
-    canOpenNewPositions &&
+    canBuy &&
     portfolio.positions.length <
       MAX_POSITIONS
   ) {
@@ -4785,6 +4624,7 @@ async function runLiveEngine(
       portfolio.positions.length,
     eligible_candidates:
       eligible.length,
+
     top_candidate:
       scan.candidates[0]
         ? {
@@ -4932,22 +4772,25 @@ async function health(env) {
       enabled:
         true,
 
+      search_queries:
+        DEX_SEARCH_QUERIES,
+
       max_candidates:
         MAX_CANDIDATES,
-
-      max_dex_hydration:
-        MAX_DEX_TOKENS_ANALYZED,
 
       max_jupiter_prices:
         MAX_JUPITER_PRICE_CHECKS,
 
-      dex_discovery_profiles:
+      token_profiles:
         false,
 
-      dex_discovery_boosts:
+      token_boosts:
         false,
 
-      gecko_hydration:
+      token_hydration:
+        false,
+
+      gecko_terminal:
         false
     },
 
@@ -5001,25 +4844,14 @@ async function health(env) {
       enabled:
         true,
 
+      per_query:
+        true,
+
       base_backoff_seconds:
         DEX_BACKOFF_BASE_SECONDS,
 
       maximum_backoff_seconds:
-        DEX_BACKOFF_MAX_SECONDS,
-
-      behavior:
-        "JUPITER_POSITION_REFRESH_DURING_BACKOFF"
-    },
-
-    logging: {
-      console_logging:
-        true,
-
-      persistent_stage_tracking:
-        true,
-
-      persistent_error_tracking:
-        true
+        DEX_BACKOFF_MAX_SECONDS
     },
 
     time:
@@ -5142,30 +4974,26 @@ async function handleRequest(
     pathname === "/scan"
   ) {
     try {
+      const portfolio =
+        await loadPortfolio(
+          env
+        );
+
       const scan =
-        await runScan(env);
+        await runScan(
+          env,
+          portfolio
+        );
 
       /*
-      Persist Dex backoff state from diagnostic scans.
+      Persist migrated backoff/runtime state.
       */
-      if (
-        scan.diagnostics
-          ?.rate_limited
-      ) {
-        try {
-          await savePortfolio(
-            env,
-            scan.portfolio,
-            "SCAN_RATE_LIMIT_BACKOFF",
-            true
-          );
-        } catch (persistError) {
-          logError(
-            "HTTP_SCAN_BACKOFF_PERSIST_FAILED",
-            persistError
-          );
-        }
-      }
+      await savePortfolio(
+        env,
+        portfolio,
+        "HTTP_SCAN_STATE",
+        true
+      );
 
       return jsonResponse({
         ok: true,
@@ -5227,10 +5055,14 @@ async function scheduledRun(env) {
       "SCHEDULED_RUN_START"
     );
 
-    requireLiveConfig(env);
+    requireLiveConfig(
+      env
+    );
 
     portfolio =
-      await loadPortfolio(env);
+      await loadPortfolio(
+        env
+      );
 
     portfolio.runtime.total_scheduled_runs++;
 
@@ -5311,10 +5143,8 @@ async function scheduledRun(env) {
       scan.diagnostics;
 
     /*
-    IMPORTANT:
-    A DexScreener rate limit is not counted as a failed worker
-    invocation. Existing positions can still be refreshed from
-    Jupiter during the backoff.
+    A rate-limited scanner is a successful scheduled worker
+    execution. It is not counted as a failure.
     */
     if (
       scan.diagnostics
@@ -5351,22 +5181,17 @@ async function scheduledRun(env) {
       portfolio.runtime.current_stage =
         null;
 
+      portfolio.runtime.last_completed_stage =
+        "SCAN";
+
+      portfolio.runtime.last_completed_stage_at =
+        nowIso();
+
       await savePortfolio(
         env,
         portfolio,
         "SCHEDULED_RATE_LIMITED",
         true
-      );
-
-      logEvent(
-        "SCHEDULED_RUN_RATE_LIMITED",
-        {
-          duration_ms:
-            Date.now() -
-            started,
-          positions:
-            portfolio.positions.length
-        }
       );
 
       return {
@@ -5439,6 +5264,11 @@ async function scheduledRun(env) {
 
     portfolio.runtime.total_successful_scheduled_runs++;
 
+    /*
+    Fix:
+    complete the persist stage BEFORE saving so status does not
+    permanently show current_stage = PERSIST.
+    */
     setStage(
       portfolio,
       "PERSIST"
@@ -5446,6 +5276,14 @@ async function scheduledRun(env) {
 
     currentStage =
       "PERSIST";
+
+    completeStage(
+      portfolio,
+      "PERSIST"
+    );
+
+    portfolio.runtime.current_stage =
+      null;
 
     await savePortfolio(
       env,
@@ -5460,28 +5298,25 @@ async function scheduledRun(env) {
       true
     );
 
-    completeStage(
-      portfolio,
-      "PERSIST"
-    );
-
-    portfolio.runtime.current_stage =
-      null;
-
     logEvent(
       "SCHEDULED_RUN_SUCCESS",
       {
         duration_ms:
           Date.now() -
           started,
+
         buys:
           engine.buys,
+
         sells:
           engine.sells,
+
         positions:
           engine.positions,
+
         eligible:
           engine.eligible_candidates,
+
         outcome:
           portfolio.runtime
             .last_run_outcome
@@ -5556,6 +5391,7 @@ async function scheduledRun(env) {
       {
         stage:
           currentStage,
+
         duration_ms:
           Date.now() -
           started
