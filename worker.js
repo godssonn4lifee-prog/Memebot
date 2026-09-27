@@ -2,13 +2,13 @@ const BOT_NAME = "memebott";
 
 /*
 ============================================================
-MEMEBOTT — LEAN LIVE TRADING — SCHEMA 5
+MEMEBOTT — LIVE TRADING — SCHEMA 5
 ============================================================
 
 LIVE ONLY
 
 - Jupiter price / quote / swap execution
-- DexScreener search discovery
+- DexScreener discovery + search + token hydration
 - $20 maximum tracked bankroll
 - $2 maximum live trade
 - $10 minimum ledger cash reserve
@@ -23,17 +23,16 @@ LIVE ONLY
 - Bounded confirmation polling
 - No public live execution HTTP endpoints
 
-DEX PROTECTION
-- Three lightweight search queries only.
-- No token profiles.
-- No boosts.
-- No GeckoTerminal.
-- No per-token hydration.
-- Dex rate limits are tracked PER SEARCH QUERY.
-- One rate-limited query does not disable the other queries.
-- Old global backoff state is automatically migrated/cleared.
-- Jupiter can still refresh known positions during Dex limits.
-- Jupiter-only data cannot open new positions.
+DEX DISCOVERY
+- DexScreener token profiles
+- DexScreener latest boosts
+- DexScreener top boosts
+- DexScreener SOL search
+- DexScreener meme search
+- DexScreener pump search
+- DexScreener token hydration
+- Jupiter remains the price verification layer
+- GeckoTerminal is not used
 
 LIVE SAFETY
 - Minimum entry score: 20
@@ -105,24 +104,49 @@ const BOUNCE_5M = 0.07;
 
 const MAX_CANDIDATES = 30;
 
+/*
+Restored working DexScreener discovery path.
+*/
 const DEX_SEARCH_QUERIES = [
   "SOL",
   "meme",
   "pump"
 ];
 
+const DEX_DISCOVERY_ENDPOINTS = [
+  {
+    name: "token_profiles",
+    path: "/token-profiles/latest/v1"
+  },
+  {
+    name: "latest_boosts",
+    path: "/token-boosts/latest/v1"
+  },
+  {
+    name: "top_boosts",
+    path: "/token-boosts/top/v1"
+  }
+];
+
+/*
+Hydrate discovery mints through DexScreener's token endpoint.
+Kept bounded so the scanner remains comfortably below the
+Cloudflare Workers Free subrequest ceiling.
+*/
+const MAX_DEX_HYDRATIONS = 20;
+
 const MAX_JUPITER_PRICE_CHECKS = 20;
-const MAX_EXTERNAL_REQUEST_BUDGET = 10;
+
+/*
+The restored scanner can use:
+3 discovery + 3 searches + up to 20 hydrations + 1 Jupiter
+price request, plus occasional known-position fallback.
+*/
+const MAX_EXTERNAL_REQUEST_BUDGET = 30;
 
 const MAX_CONFIRMATION_POLLS = 3;
 const CONFIRMATION_POLL_INTERVAL_MS = 2500;
 
-/*
-Per-query Dex backoff.
-
-This replaces the old global scanner backoff.
-One query being rate-limited does not stop the other queries.
-*/
 const DEX_BACKOFF_BASE_SECONDS = 60;
 const DEX_BACKOFF_MAX_SECONDS = 300;
 
@@ -138,10 +162,6 @@ const SOL_MINT =
 
 const PORTFOLIO_KEY = "LIVE_BETA_PORTFOLIO";
 
-/*
-Incrementing this does NOT change the portfolio schema.
-It only migrates old runtime counters once.
-*/
 const RUNTIME_COUNTER_VERSION = 2;
 
 /* ============================================================
@@ -360,19 +380,13 @@ function createRuntimeState() {
 
     last_scan_diagnostics: null,
 
-    /*
-    Legacy/global fields are retained for status compatibility.
-    They are no longer used to disable the whole scanner.
-    */
     dex_rate_limit_count: 0,
     dex_backoff_until: 0,
     dex_backoff_seconds: 0,
     last_dex_rate_limit_at: null,
 
-    /*
-    New per-query backoff map.
-    */
     dex_query_backoff_untils: {},
+    dex_query_backoff_counts: {},
 
     runtime_counter_version:
       RUNTIME_COUNTER_VERSION,
@@ -423,11 +437,6 @@ function migrateRuntimeCounters(portfolio) {
     portfolio.runtime ||
     createRuntimeState();
 
-  /*
-  The old counters were polluted by previous worker behavior.
-  Reset them once while preserving cash, positions, history and
-  market memory.
-  */
   if (
     safeNumber(
       runtime.runtime_counter_version
@@ -498,11 +507,6 @@ function migrateDexBackoff(portfolio) {
     portfolio.runtime ||
     createRuntimeState();
 
-  /*
-  Remove the old global 1200-second backoff immediately.
-  The old code could persist a longer backoff than the current
-  code allowed.
-  */
   const oldUntil =
     safeNumber(
       runtime.dex_backoff_until
@@ -528,11 +532,6 @@ function migrateDexBackoff(portfolio) {
 
   runtime.dex_backoff_until = 0;
   runtime.dex_backoff_seconds = 0;
-
-  /*
-  Do not carry the old global rate-limit counter into the new
-  per-query system.
-  */
   runtime.dex_rate_limit_count = 0;
 
   runtime.dex_query_backoff_untils =
@@ -540,6 +539,13 @@ function migrateDexBackoff(portfolio) {
     typeof runtime.dex_query_backoff_untils ===
       "object"
       ? runtime.dex_query_backoff_untils
+      : {};
+
+  runtime.dex_query_backoff_counts =
+    runtime.dex_query_backoff_counts &&
+    typeof runtime.dex_query_backoff_counts ===
+      "object"
+      ? runtime.dex_query_backoff_counts
       : {};
 
   for (
@@ -842,9 +848,7 @@ function queryBackoffActive(
     safeNumber(
       portfolio?.runtime
         ?.dex_query_backoff_untils
-        ?.[
-          query
-        ]
+        ?.[query]
     );
 
   return until > Date.now();
@@ -939,6 +943,11 @@ function registerDexQueryRateLimit(
       {};
   }
 
+  if (!portfolio.runtime.dex_query_backoff_counts) {
+    portfolio.runtime.dex_query_backoff_counts =
+      {};
+  }
+
   const key =
     String(query);
 
@@ -946,18 +955,8 @@ function registerDexQueryRateLimit(
     safeNumber(
       portfolio.runtime
         .dex_query_backoff_counts
-        ?.[
-          key
-        ]
+        ?.[key]
     );
-
-  if (
-    !portfolio.runtime
-      .dex_query_backoff_counts
-  ) {
-    portfolio.runtime
-      .dex_query_backoff_counts = {};
-  }
 
   const count =
     Math.min(
@@ -1028,13 +1027,144 @@ function clearDexQueryRateLimit(
   ) {
     delete portfolio.runtime
       .dex_query_backoff_counts[
-        query
-      ];
+      query
+    ];
   }
 
   syncLegacyBackoffFields(
     portfolio
   );
+}
+
+/* ============================================================
+DEX DISCOVERY
+============================================================ */
+
+function extractDiscoveryMints(
+  data,
+  source
+) {
+  const list =
+    Array.isArray(data)
+      ? data
+      : Array.isArray(data?.data)
+        ? data.data
+        : [];
+
+  const results = [];
+
+  for (
+    const item of list
+  ) {
+    const chainId =
+      String(
+        item?.chainId ||
+        item?.chain ||
+        ""
+      ).toLowerCase();
+
+    if (
+      chainId &&
+      chainId !== "solana"
+    ) {
+      continue;
+    }
+
+    const mint =
+      item?.tokenAddress ||
+      item?.address ||
+      item?.baseToken?.address ||
+      null;
+
+    if (!mint) {
+      continue;
+    }
+
+    results.push({
+      mint,
+      source
+    });
+  }
+
+  return results;
+}
+
+async function getDexDiscovery(
+  portfolio
+) {
+  const diagnostics = [];
+  const discoveries = [];
+
+  let requestCount = 0;
+  let rateLimitedCount = 0;
+
+  for (
+    const endpoint of
+    DEX_DISCOVERY_ENDPOINTS
+  ) {
+    const url =
+      `${DEX_BASE}${endpoint.path}`;
+
+    requestCount++;
+
+    const response =
+      await fetchJsonSafe(url);
+
+    const items =
+      extractDiscoveryMints(
+        response.data,
+        endpoint.name
+      );
+
+    const rateLimited =
+      responseWasRateLimited(
+        response
+      );
+
+    if (rateLimited) {
+      rateLimitedCount++;
+    }
+
+    diagnostics.push({
+      endpoint:
+        endpoint.name,
+
+      path:
+        endpoint.path,
+
+      ok:
+        response.ok,
+
+      status:
+        response.status,
+
+      duration_ms:
+        response.duration_ms,
+
+      error:
+        response.error,
+
+      body_preview:
+        response.body_preview,
+
+      rate_limited:
+        rateLimited,
+
+      discovered_count:
+        items.length
+    });
+
+    discoveries.push(
+      ...items
+    );
+  }
+
+  return {
+    discoveries,
+    diagnostics,
+    requestCount,
+    rateLimitedCount
+  };
 }
 
 /* ============================================================
@@ -1071,9 +1201,7 @@ async function getDexSearch(
           safeNumber(
             portfolio.runtime
               .dex_query_backoff_untils
-              ?.[
-                query
-              ]
+              ?.[query]
           )
       });
 
@@ -1213,6 +1341,165 @@ async function getDexSearch(
   syncLegacyBackoffFields(
     portfolio
   );
+
+  return {
+    pairMap,
+    diagnostics,
+    requestCount,
+    rateLimitedCount
+  };
+}
+
+/* ============================================================
+DEX TOKEN HYDRATION
+============================================================ */
+
+async function hydrateDexTokens(
+  mintMap
+) {
+  const pairMap =
+    new Map();
+
+  const diagnostics = [];
+
+  let requestCount = 0;
+  let rateLimitedCount = 0;
+
+  const mints =
+    unique(
+      [...mintMap.keys()]
+    ).slice(
+      0,
+      MAX_DEX_HYDRATIONS
+    );
+
+  for (
+    const mint of mints
+  ) {
+    const url =
+      `${DEX_BASE}/latest/dex/tokens/${encodeURIComponent(
+        mint
+      )}`;
+
+    requestCount++;
+
+    const response =
+      await fetchJsonSafe(url);
+
+    const pairs =
+      Array.isArray(
+        response.data?.pairs
+      )
+        ? response.data.pairs
+        : [];
+
+    const rateLimited =
+      responseWasRateLimited(
+        response
+      );
+
+    if (rateLimited) {
+      rateLimitedCount++;
+    }
+
+    let bestPair = null;
+
+    for (
+      const pair of pairs
+    ) {
+      if (
+        String(
+          pair?.chainId || ""
+        ).toLowerCase() !==
+        "solana"
+      ) {
+        continue;
+      }
+
+      if (
+        String(
+          pair?.baseToken?.address ||
+          ""
+        ) !==
+        mint
+      ) {
+        continue;
+      }
+
+      if (!bestPair) {
+        bestPair = pair;
+        continue;
+      }
+
+      const bestLiquidity =
+        safeNumber(
+          bestPair?.liquidity?.usd
+        );
+
+      const currentLiquidity =
+        safeNumber(
+          pair?.liquidity?.usd
+        );
+
+      const bestVolume =
+        safeNumber(
+          bestPair?.volume?.h24
+        );
+
+      const currentVolume =
+        safeNumber(
+          pair?.volume?.h24
+        );
+
+      if (
+        currentLiquidity >
+          bestLiquidity ||
+        (
+          currentLiquidity ===
+            bestLiquidity &&
+          currentVolume >
+            bestVolume
+        )
+      ) {
+        bestPair = pair;
+      }
+    }
+
+    if (bestPair) {
+      pairMap.set(
+        mint,
+        bestPair
+      );
+    }
+
+    diagnostics.push({
+      mint,
+      ok:
+        response.ok,
+      status:
+        response.status,
+      duration_ms:
+        response.duration_ms,
+      error:
+        response.error,
+      body_preview:
+        response.body_preview,
+      rate_limited:
+        rateLimited,
+      pair_count:
+        pairs.length,
+      solana_pair_count:
+        pairs.filter(
+          pair =>
+            String(
+              pair?.chainId || ""
+            ).toLowerCase() ===
+            "solana"
+        ).length,
+      selected:
+        !!bestPair
+    });
+  }
 
   return {
     pairMap,
@@ -4126,10 +4413,95 @@ async function runScan(
     existingPortfolio ||
     await loadPortfolio(env);
 
+  /*
+  Restore the original broader DexScreener discovery flow.
+  Discovery can still produce mints even when search endpoints
+  are temporarily returning 429/1015.
+  */
+  const discovery =
+    await getDexDiscovery(
+      portfolio
+    );
+
   const dex =
     await getDexSearch(
       portfolio
     );
+
+  const discoveredMints =
+    unique(
+      discovery.discoveries.map(
+        item =>
+          item.mint
+      )
+    );
+
+  /*
+  Search pairs are immediately useful because they already
+  contain market metadata. Discovery-only mints are hydrated
+  below so they receive the same liquidity/volume data.
+  */
+  const candidateMintSet =
+    unique([
+      ...dex.pairMap.keys(),
+      ...discoveredMints
+    ]);
+
+  const hydrationTargets =
+    candidateMintSet
+      .filter(
+        mint =>
+          !dex.pairMap.has(mint)
+      )
+      .slice(
+        0,
+        MAX_DEX_HYDRATIONS
+      );
+
+  const hydrationSeed =
+    new Map();
+
+  for (
+    const mint of
+    hydrationTargets
+  ) {
+    hydrationSeed.set(
+      mint,
+      true
+    );
+  }
+
+  const hydration =
+    hydrationSeed.size
+      ? await hydrateDexTokens(
+          hydrationSeed
+        )
+      : {
+          pairMap: new Map(),
+          diagnostics: [],
+          requestCount: 0,
+          rateLimitedCount: 0
+        };
+
+  /*
+  Search data wins for a mint when available.
+  Hydration supplies the discovery-only mints.
+  */
+  for (
+    const [
+      mint,
+      pair
+    ] of hydration.pairMap
+  ) {
+    if (
+      !dex.pairMap.has(mint)
+    ) {
+      dex.pairMap.set(
+        mint,
+        pair
+      );
+    }
+  }
 
   const mints =
     [...dex.pairMap.keys()]
@@ -4139,8 +4511,9 @@ async function runScan(
       );
 
   /*
-  If every search is unavailable/backed off, use Jupiter for
-  known positions/memory instead.
+  If DexScreener returned no usable market pairs at all,
+  retain the Jupiter known-position/memory refresh behavior.
+  Jupiter-only data still cannot create a new position.
   */
   if (
     mints.length === 0
@@ -4150,6 +4523,16 @@ async function runScan(
         env,
         portfolio
       );
+
+    const totalDexRequests =
+      discovery.requestCount +
+      dex.requestCount +
+      hydration.requestCount;
+
+    const totalDexRateLimits =
+      discovery.rateLimitedCount +
+      dex.rateLimitedCount +
+      hydration.rateLimitedCount;
 
     const diagnostics = {
       duration_ms:
@@ -4173,8 +4556,20 @@ async function runScan(
           ) / 1000
         ),
 
+      dexscreener_discovery_requests:
+        discovery.requestCount,
+
       dexscreener_search_requests:
         dex.requestCount,
+
+      dexscreener_hydration_requests:
+        hydration.requestCount,
+
+      dexscreener_requests:
+        totalDexRequests,
+
+      dexscreener_rate_limited:
+        totalDexRateLimits,
 
       dexscreener_search_rate_limited:
         dex.rateLimitedCount,
@@ -4197,7 +4592,7 @@ async function runScan(
         0,
 
       estimated_external_requests:
-        dex.requestCount +
+        totalDexRequests +
         (
           fallback.jupiter
             ? 1
@@ -4211,13 +4606,13 @@ async function runScan(
         50,
 
       rate_limited:
-        dex.rateLimitedCount > 0 ||
+        totalDexRateLimits > 0 ||
         anyDexQueryBackoffActive(
           portfolio
         ),
 
       rate_limit_reason:
-        dex.rateLimitedCount > 0
+        totalDexRateLimits > 0
           ? "DEXSCREENER_RATE_LIMITED"
           : anyDexQueryBackoffActive(
               portfolio
@@ -4226,8 +4621,14 @@ async function runScan(
             : null,
 
       endpoint_diagnostics: {
+        dexscreener_discovery:
+          discovery.diagnostics,
+
         dexscreener_search:
           dex.diagnostics,
+
+        dexscreener_hydration:
+          hydration.diagnostics,
 
         jupiter_prices:
           fallback.jupiter
@@ -4242,20 +4643,6 @@ async function runScan(
 
       portfolio
     };
-  }
-
-  const sourceMap =
-    new Map();
-
-  for (
-    const [
-      mint
-    ] of dex.pairMap
-  ) {
-    sourceMap.set(
-      mint,
-      "DEXSCREENER_SEARCH"
-    );
   }
 
   const jupiter =
@@ -4273,15 +4660,24 @@ async function runScan(
         mint
       );
 
+    const source =
+      discoveredMints.includes(mint) &&
+      !dex.diagnostics.some(
+        diagnostic =>
+          diagnostic.solana_pair_count >
+          0
+      )
+        ? "DEXSCREENER_DISCOVERY"
+        : dex.pairMap.has(mint)
+          ? "DEXSCREENER"
+          : "DEXSCREENER_SEARCH";
+
     const candidate =
       normalizeCandidate(
         mint,
         pair,
         jupiter.prices[mint],
-        sourceMap.get(
-          mint
-        ) ||
-          "DEXSCREENER_SEARCH"
+        source
       );
 
     Object.assign(
@@ -4329,8 +4725,15 @@ async function runScan(
     finalCandidates[0] ||
     null;
 
-  const rateLimited =
-    dex.rateLimitedCount > 0;
+  const totalDexRequests =
+    discovery.requestCount +
+    dex.requestCount +
+    hydration.requestCount;
+
+  const totalDexRateLimits =
+    discovery.rateLimitedCount +
+    dex.rateLimitedCount +
+    hydration.rateLimitedCount;
 
   const diagnostics = {
     duration_ms:
@@ -4354,8 +4757,20 @@ async function runScan(
         ) / 1000
       ),
 
+    dexscreener_discovery_requests:
+      discovery.requestCount,
+
     dexscreener_search_requests:
       dex.requestCount,
+
+    dexscreener_hydration_requests:
+      hydration.requestCount,
+
+    dexscreener_requests:
+      totalDexRequests,
+
+    dexscreener_rate_limited:
+      totalDexRateLimits,
 
     dexscreener_search_rate_limited:
       dex.rateLimitedCount,
@@ -4395,7 +4810,7 @@ async function runScan(
         : null,
 
     estimated_external_requests:
-      dex.requestCount +
+      totalDexRequests +
       1,
 
     configured_request_budget:
@@ -4405,16 +4820,22 @@ async function runScan(
       50,
 
     rate_limited:
-      rateLimited,
+      totalDexRateLimits > 0,
 
     rate_limit_reason:
-      rateLimited
+      totalDexRateLimits > 0
         ? "DEXSCREENER_HTTP_429_OR_1015"
         : null,
 
     endpoint_diagnostics: {
+      dexscreener_discovery:
+        discovery.diagnostics,
+
       dexscreener_search:
         dex.diagnostics,
+
+      dexscreener_hydration:
+        hydration.diagnostics,
 
       jupiter_prices:
         jupiter.diagnostics
@@ -4436,10 +4857,14 @@ async function runScan(
       top:
         diagnostics.top_candidate,
 
+      dex_requests:
+        diagnostics.dexscreener_requests,
+
       requests:
         diagnostics.estimated_external_requests,
 
-      rate_limited
+      rate_limited:
+        diagnostics.rate_limited
     }
   );
 
@@ -4527,9 +4952,7 @@ async function runLiveEngine(
   */
   const canBuy =
     !(
-      scan.diagnostics
-        ?.rate_limit_reason ===
-      "DEX_QUERY_BACKOFF_ACTIVE" &&
+      scan.candidates.length > 0 &&
       scan.candidates.every(
         candidate =>
           candidate.source ===
@@ -4772,23 +5195,32 @@ async function health(env) {
       enabled:
         true,
 
+      discovery_endpoints:
+        DEX_DISCOVERY_ENDPOINTS.map(
+          endpoint =>
+            endpoint.path
+        ),
+
       search_queries:
         DEX_SEARCH_QUERIES,
 
       max_candidates:
         MAX_CANDIDATES,
 
+      max_dex_hydrations:
+        MAX_DEX_HYDRATIONS,
+
       max_jupiter_prices:
         MAX_JUPITER_PRICE_CHECKS,
 
       token_profiles:
-        false,
+        true,
 
       token_boosts:
-        false,
+        true,
 
       token_hydration:
-        false,
+        true,
 
       gecko_terminal:
         false
@@ -4985,9 +5417,6 @@ async function handleRequest(
           portfolio
         );
 
-      /*
-      Persist migrated backoff/runtime state.
-      */
       await savePortfolio(
         env,
         portfolio,
@@ -5143,8 +5572,9 @@ async function scheduledRun(env) {
       scan.diagnostics;
 
     /*
-    A rate-limited scanner is a successful scheduled worker
-    execution. It is not counted as a failure.
+    If DexScreener is rate-limited AND no usable candidates
+    exist, this run is recorded as rate-limited rather than as
+    a worker failure.
     */
     if (
       scan.diagnostics
@@ -5264,11 +5694,6 @@ async function scheduledRun(env) {
 
     portfolio.runtime.total_successful_scheduled_runs++;
 
-    /*
-    Fix:
-    complete the persist stage BEFORE saving so status does not
-    permanently show current_stage = PERSIST.
-    */
     setStage(
       portfolio,
       "PERSIST"
