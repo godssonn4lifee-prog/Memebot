@@ -44,6 +44,15 @@ LIVE SAFETY
 - 0.01 SOL on-chain reserve
 - Maximum 7 positions
 - Maximum 1 new buy per scheduled run
+
+DEX RATE-LIMIT PROTECTION
+- One global DexScreener cooldown
+- Global cooldown covers discovery, search, and hydration
+- 429 / Cloudflare 1015 immediately stops further Dex calls
+- Global cooldown is persisted in BOT_KV
+- Cron runs do not clear an active Dex cooldown
+- DexScreener is not contacted while global cooldown is active
+- Jupiter continues refreshing known positions / market memory
 ============================================================
 */
 
@@ -80,16 +89,6 @@ const REVERSAL_CONFIRMATIONS_REQUIRED = 2;
 const SHORT_TERM_SELL_RATIO = 1.50;
 const HOURLY_SELL_RATIO = 1.43;
 
-/*
-Loosened entry gate:
-- Score 15 allows stronger setups such as the recent CAT
-  candidate that scored 15.
-- Momentum floor is 0 so a setup does not need positive
-  short-term momentum to qualify.
-- Liquidity, volume, chase, price mismatch, cooldown,
-  position, bankroll, and SOL reserve protections remain
-  enforced separately.
-*/
 const MIN_ENTRY_SCORE = 15;
 const MIN_MOMENTUM_SCORE = 0;
 const MIN_SETUP_SCORE = 3;
@@ -116,9 +115,6 @@ const BOUNCE_5M = 0.07;
 
 const MAX_CANDIDATES = 30;
 
-/*
-Restored working DexScreener discovery path.
-*/
 const DEX_SEARCH_QUERIES = [
   "SOL",
   "meme",
@@ -140,25 +136,21 @@ const DEX_DISCOVERY_ENDPOINTS = [
   }
 ];
 
-/*
-Hydrate discovery mints through DexScreener's token endpoint.
-Kept bounded so the scanner remains comfortably below the
-Cloudflare Workers Free subrequest ceiling.
-*/
 const MAX_DEX_HYDRATIONS = 20;
 
 const MAX_JUPITER_PRICE_CHECKS = 20;
 
-/*
-The restored scanner can use:
-3 discovery + 3 searches + up to 20 hydrations + 1 Jupiter
-price request, plus occasional known-position fallback.
-*/
 const MAX_EXTERNAL_REQUEST_BUDGET = 30;
 
 const MAX_CONFIRMATION_POLLS = 3;
 const CONFIRMATION_POLL_INTERVAL_MS = 2500;
 
+/*
+Global DexScreener backoff.
+
+A single 429 / 1015 causes ALL DexScreener request types
+to stop until this global cooldown expires.
+*/
 const DEX_BACKOFF_BASE_SECONDS = 60;
 const DEX_BACKOFF_MAX_SECONDS = 300;
 
@@ -174,7 +166,7 @@ const SOL_MINT =
 
 const PORTFOLIO_KEY = "LIVE_BETA_PORTFOLIO";
 
-const RUNTIME_COUNTER_VERSION = 2;
+const RUNTIME_COUNTER_VERSION = 3;
 
 /* ============================================================
 UTILITY
@@ -392,11 +384,19 @@ function createRuntimeState() {
 
     last_scan_diagnostics: null,
 
+    /*
+    Global DexScreener protection.
+    */
     dex_rate_limit_count: 0,
     dex_backoff_until: 0,
     dex_backoff_seconds: 0,
     last_dex_rate_limit_at: null,
 
+    /*
+    Retained for compatibility with previously stored
+    diagnostics. These are no longer used as the primary
+    protection mechanism.
+    */
     dex_query_backoff_untils: {},
     dex_query_backoff_counts: {},
 
@@ -454,10 +454,49 @@ function migrateRuntimeCounters(portfolio) {
       runtime.runtime_counter_version
     ) !== RUNTIME_COUNTER_VERSION
   ) {
-    runtime.total_scheduled_runs = 0;
-    runtime.total_successful_scheduled_runs = 0;
-    runtime.total_failed_scheduled_runs = 0;
-    runtime.total_rate_limited_runs = 0;
+    /*
+    Do not erase the scheduled counters merely because
+    the runtime diagnostic schema changed.
+    */
+    runtime.total_scheduled_runs =
+      Math.max(
+        0,
+        Math.floor(
+          safeNumber(
+            runtime.total_scheduled_runs
+          )
+        )
+      );
+
+    runtime.total_successful_scheduled_runs =
+      Math.max(
+        0,
+        Math.floor(
+          safeNumber(
+            runtime.total_successful_scheduled_runs
+          )
+        )
+      );
+
+    runtime.total_failed_scheduled_runs =
+      Math.max(
+        0,
+        Math.floor(
+          safeNumber(
+            runtime.total_failed_scheduled_runs
+          )
+        )
+      );
+
+    runtime.total_rate_limited_runs =
+      Math.max(
+        0,
+        Math.floor(
+          safeNumber(
+            runtime.total_rate_limited_runs
+          )
+        )
+      );
 
     runtime.runtime_counter_version =
       RUNTIME_COUNTER_VERSION;
@@ -514,38 +553,71 @@ function migrateRuntimeCounters(portfolio) {
   portfolio.runtime = runtime;
 }
 
+/*
+Normalize the persisted DexScreener backoff without clearing
+an active cooldown.
+
+This is the critical fix for the repeated cron 429 problem.
+*/
 function migrateDexBackoff(portfolio) {
   const runtime =
     portfolio.runtime ||
     createRuntimeState();
 
-  const oldUntil =
+  const now =
+    Date.now();
+
+  const storedUntil =
     safeNumber(
       runtime.dex_backoff_until
     );
 
-  const oldSeconds =
+  const storedSeconds =
     safeNumber(
       runtime.dex_backoff_seconds
     );
 
+  /*
+  Never clear a future global cooldown.
+  If an old cooldown has already expired, clear only the
+  expired timer fields.
+  */
   if (
-    oldUntil > Date.now() ||
-    oldSeconds > 0
+    storedUntil > now
   ) {
-    logEvent(
-      "LEGACY_DEX_BACKOFF_CLEARED",
-      {
-        old_until: oldUntil,
-        old_seconds: oldSeconds
-      }
-    );
+    runtime.dex_backoff_until =
+      storedUntil;
+
+    runtime.dex_backoff_seconds =
+      Math.ceil(
+        (
+          storedUntil -
+          now
+        ) / 1000
+      );
+  } else {
+    runtime.dex_backoff_until = 0;
+    runtime.dex_backoff_seconds = 0;
   }
 
-  runtime.dex_backoff_until = 0;
-  runtime.dex_backoff_seconds = 0;
-  runtime.dex_rate_limit_count = 0;
+  /*
+  Preserve the accumulated global rate-limit count.
+  */
+  runtime.dex_rate_limit_count =
+    Math.max(
+      0,
+      Math.floor(
+        safeNumber(
+          runtime.dex_rate_limit_count
+        )
+      )
+    );
 
+  /*
+  Retain legacy query maps but clean expired entries.
+  They are no longer used to decide whether DexScreener
+  should be contacted.
+  */
   runtime.dex_query_backoff_untils =
     runtime.dex_query_backoff_untils &&
     typeof runtime.dex_query_backoff_untils ===
@@ -574,11 +646,7 @@ function migrateDexBackoff(portfolio) {
       );
 
     if (
-      until <= Date.now() ||
-      until >
-        Date.now() +
-          DEX_BACKOFF_MAX_SECONDS *
-            1000
+      until <= now
     ) {
       delete runtime.dex_query_backoff_untils[
         query
@@ -849,13 +917,195 @@ function failStage(
 }
 
 /* ============================================================
-DEX QUERY BACKOFF
+GLOBAL DEXSCREENER BACKOFF
 ============================================================ */
 
+/*
+Returns true whenever ANY global DexScreener cooldown is
+currently active.
+
+This is the only gate used before DexScreener network calls.
+*/
+function dexGlobalBackoffActive(
+  portfolio
+) {
+  const until =
+    safeNumber(
+      portfolio?.runtime
+        ?.dex_backoff_until
+    );
+
+  return until > Date.now();
+}
+
+function dexGlobalBackoffRemainingSeconds(
+  portfolio
+) {
+  const until =
+    safeNumber(
+      portfolio?.runtime
+        ?.dex_backoff_until
+    );
+
+  return Math.max(
+    0,
+    Math.ceil(
+      (
+        until -
+        Date.now()
+      ) / 1000
+    )
+  );
+}
+
+/*
+Register one global DexScreener rate limit.
+
+Important:
+- discovery
+- search
+- hydration
+
+all call this same function.
+
+A 429 therefore creates one shared cooldown rather than
+three independent retry loops.
+*/
+function registerDexRateLimit(
+  portfolio,
+  source = "UNKNOWN"
+) {
+  if (!portfolio.runtime) {
+    portfolio.runtime =
+      createRuntimeState();
+  }
+
+  const previousCount =
+    safeNumber(
+      portfolio.runtime.dex_rate_limit_count
+    );
+
+  const count =
+    Math.min(
+      previousCount + 1,
+      6
+    );
+
+  /*
+  1st hit  = 60s
+  2nd hit  = 120s
+  3rd+ hit = 240s
+  capped at 300s.
+  */
+  const exponent =
+    Math.min(
+      count - 1,
+      2
+    );
+
+  const seconds =
+    Math.min(
+      DEX_BACKOFF_MAX_SECONDS,
+      DEX_BACKOFF_BASE_SECONDS *
+        (2 ** exponent)
+    );
+
+  const now =
+    Date.now();
+
+  /*
+  Never shorten an already-active cooldown.
+  */
+  const existingUntil =
+    safeNumber(
+      portfolio.runtime.dex_backoff_until
+    );
+
+  const newUntil =
+    Math.max(
+      existingUntil,
+      now +
+        seconds * 1000
+    );
+
+  portfolio.runtime.dex_rate_limit_count =
+    count;
+
+  portfolio.runtime.dex_backoff_until =
+    newUntil;
+
+  portfolio.runtime.dex_backoff_seconds =
+    Math.ceil(
+      (
+        newUntil -
+        now
+      ) / 1000
+    );
+
+  portfolio.runtime.last_dex_rate_limit_at =
+    nowIso();
+
+  logEvent(
+    "DEX_GLOBAL_RATE_LIMIT_BACKOFF",
+    {
+      source,
+      count,
+      backoff_seconds:
+        portfolio.runtime
+          .dex_backoff_seconds,
+      backoff_until:
+        new Date(
+          newUntil
+        ).toISOString()
+    }
+  );
+}
+
+/*
+When the cooldown has naturally expired, remove only the
+active timer. Keep the historical rate-limit count for
+diagnostics.
+*/
+function clearExpiredDexBackoff(
+  portfolio
+) {
+  if (!portfolio?.runtime) {
+    return;
+  }
+
+  const until =
+    safeNumber(
+      portfolio.runtime.dex_backoff_until
+    );
+
+  if (
+    until > 0 &&
+    until <= Date.now()
+  ) {
+    portfolio.runtime.dex_backoff_until =
+      0;
+
+    portfolio.runtime.dex_backoff_seconds =
+      0;
+  }
+}
+
+/*
+Compatibility helper for old query-level diagnostics.
+The global cooldown supersedes individual query cooldowns.
+*/
 function queryBackoffActive(
   portfolio,
   query
 ) {
+  if (
+    dexGlobalBackoffActive(
+      portfolio
+    )
+  ) {
+    return true;
+  }
+
   const until =
     safeNumber(
       portfolio?.runtime
@@ -870,6 +1120,18 @@ function activeDexBackoffQueries(
   portfolio
 ) {
   const result = {};
+
+  if (
+    dexGlobalBackoffActive(
+      portfolio
+    )
+  ) {
+    result.global =
+      safeNumber(
+        portfolio.runtime
+          .dex_backoff_until
+      );
+  }
 
   const map =
     portfolio?.runtime
@@ -901,55 +1163,54 @@ function activeDexBackoffQueries(
 function anyDexQueryBackoffActive(
   portfolio
 ) {
-  return Object.keys(
-    activeDexBackoffQueries(
-      portfolio
-    )
-  ).length > 0;
+  return dexGlobalBackoffActive(
+    portfolio
+  );
 }
 
+/*
+Legacy compatibility function.
+
+The actual protection is now global.
+*/
 function syncLegacyBackoffFields(
   portfolio
 ) {
-  const active =
-    activeDexBackoffQueries(
+  clearExpiredDexBackoff(
+    portfolio
+  );
+
+  if (
+    dexGlobalBackoffActive(
       portfolio
-    );
-
-  const untils =
-    Object.values(active);
-
-  if (!untils.length) {
+    )
+  ) {
+    portfolio.runtime.dex_backoff_seconds =
+      dexGlobalBackoffRemainingSeconds(
+        portfolio
+      );
+  } else {
     portfolio.runtime.dex_backoff_until =
       0;
 
     portfolio.runtime.dex_backoff_seconds =
       0;
-
-    return;
   }
-
-  const maxUntil =
-    Math.max(
-      ...untils
-    );
-
-  portfolio.runtime.dex_backoff_until =
-    maxUntil;
-
-  portfolio.runtime.dex_backoff_seconds =
-    Math.ceil(
-      (
-        maxUntil -
-        Date.now()
-      ) / 1000
-    );
 }
 
+/*
+Legacy per-query registration retained so old runtime fields
+remain understandable. It ALSO registers the global cooldown.
+*/
 function registerDexQueryRateLimit(
   portfolio,
   query
 ) {
+  registerDexRateLimit(
+    portfolio,
+    `QUERY:${query}`
+  );
+
   if (!portfolio.runtime.dex_query_backoff_untils) {
     portfolio.runtime.dex_query_backoff_untils =
       {};
@@ -976,42 +1237,17 @@ function registerDexQueryRateLimit(
       6
     );
 
-  const exponent =
-    Math.min(
-      count - 1,
-      2
-    );
-
-  const seconds =
-    Math.min(
-      DEX_BACKOFF_MAX_SECONDS,
-      DEX_BACKOFF_BASE_SECONDS *
-        (2 ** exponent)
-    );
-
   portfolio.runtime
     .dex_query_backoff_counts[key] =
     count;
 
   portfolio.runtime
     .dex_query_backoff_untils[key] =
-    Date.now() +
-    seconds * 1000;
-
-  portfolio.runtime.last_dex_rate_limit_at =
-    nowIso();
+    portfolio.runtime
+      .dex_backoff_until;
 
   syncLegacyBackoffFields(
     portfolio
-  );
-
-  logEvent(
-    "DEX_QUERY_RATE_LIMIT_BACKOFF",
-    {
-      query: key,
-      count,
-      seconds
-    }
   );
 }
 
@@ -1033,19 +1269,9 @@ function clearDexQueryRateLimit(
       query
     ];
 
-  if (
-    portfolio.runtime
-      .dex_query_backoff_counts
-  ) {
-    delete portfolio.runtime
-      .dex_query_backoff_counts[
-      query
-    ];
-  }
-
-  syncLegacyBackoffFields(
-    portfolio
-  );
+  /*
+  Do not clear the GLOBAL cooldown here.
+  */
 }
 
 /* ============================================================
@@ -1110,10 +1336,129 @@ async function getDexDiscovery(
   let requestCount = 0;
   let rateLimitedCount = 0;
 
+  /*
+  CRITICAL:
+  Do not make even the first discovery request while the
+  global DexScreener cooldown is active.
+  */
+  if (
+    dexGlobalBackoffActive(
+      portfolio
+    )
+  ) {
+    const remaining =
+      dexGlobalBackoffRemainingSeconds(
+        portfolio
+      );
+
+    for (
+      const endpoint of
+      DEX_DISCOVERY_ENDPOINTS
+    ) {
+      diagnostics.push({
+        endpoint:
+          endpoint.name,
+
+        path:
+          endpoint.path,
+
+        ok:
+          false,
+
+        status:
+          null,
+
+        duration_ms:
+          0,
+
+        error:
+          null,
+
+        body_preview:
+          null,
+
+        rate_limited:
+          false,
+
+        discovered_count:
+          0,
+
+        skipped:
+          true,
+
+        skip_reason:
+          "GLOBAL_DEX_BACKOFF_ACTIVE",
+
+        backoff_remaining_seconds:
+          remaining
+      });
+    }
+
+    return {
+      discoveries,
+      diagnostics,
+      requestCount: 0,
+      rateLimitedCount: 0,
+      skipped: true
+    };
+  }
+
   for (
     const endpoint of
     DEX_DISCOVERY_ENDPOINTS
   ) {
+    /*
+    A previous endpoint in THIS SAME scan may have triggered
+    the global cooldown. Stop immediately.
+    */
+    if (
+      dexGlobalBackoffActive(
+        portfolio
+      )
+    ) {
+      diagnostics.push({
+        endpoint:
+          endpoint.name,
+
+        path:
+          endpoint.path,
+
+        ok:
+          false,
+
+        status:
+          null,
+
+        duration_ms:
+          0,
+
+        error:
+          null,
+
+        body_preview:
+          null,
+
+        rate_limited:
+          false,
+
+        discovered_count:
+          0,
+
+        skipped:
+          true,
+
+        skip_reason:
+          "GLOBAL_DEX_BACKOFF_ACTIVATED_DURING_SCAN",
+
+        backoff_remaining_seconds:
+          dexGlobalBackoffRemainingSeconds(
+            portfolio
+          )
+      });
+
+      break;
+    }
+
     const url =
       `${DEX_BASE}${endpoint.path}`;
 
@@ -1135,6 +1480,14 @@ async function getDexDiscovery(
 
     if (rateLimited) {
       rateLimitedCount++;
+
+      /*
+      Immediately activate the global cooldown.
+      */
+      registerDexRateLimit(
+        portfolio,
+        `DISCOVERY:${endpoint.name}`
+      );
     }
 
     diagnostics.push({
@@ -1166,6 +1519,14 @@ async function getDexDiscovery(
         items.length
     });
 
+    /*
+    Do not continue hammering the other discovery endpoints
+    after a 429/1015.
+    */
+    if (rateLimited) {
+      break;
+    }
+
     discoveries.push(
       ...items
     );
@@ -1175,7 +1536,8 @@ async function getDexDiscovery(
     discoveries,
     diagnostics,
     requestCount,
-    rateLimitedCount
+    rateLimitedCount,
+    skipped: false
   };
 }
 
@@ -1194,30 +1556,87 @@ async function getDexSearch(
   let requestCount = 0;
   let rateLimitedCount = 0;
 
+  /*
+  Global cooldown means ZERO DexScreener search requests.
+  */
+  if (
+    dexGlobalBackoffActive(
+      portfolio
+    )
+  ) {
+    const remaining =
+      dexGlobalBackoffRemainingSeconds(
+        portfolio
+      );
+
+    for (
+      const query of
+      DEX_SEARCH_QUERIES
+    ) {
+      diagnostics.push({
+        query,
+
+        skipped:
+          true,
+
+        skip_reason:
+          "GLOBAL_DEX_BACKOFF_ACTIVE",
+
+        backoff_until:
+          safeNumber(
+            portfolio.runtime
+              .dex_backoff_until
+          ),
+
+        backoff_remaining_seconds:
+          remaining
+      });
+    }
+
+    return {
+      pairMap,
+      diagnostics,
+      requestCount: 0,
+      rateLimitedCount: 0,
+      skipped: true
+    };
+  }
+
   for (
     const query of
     DEX_SEARCH_QUERIES
   ) {
+    /*
+    Stop immediately if discovery or an earlier search request
+    activated the global cooldown.
+    */
     if (
-      queryBackoffActive(
-        portfolio,
-        query
+      dexGlobalBackoffActive(
+        portfolio
       )
     ) {
       diagnostics.push({
         query,
-        skipped: true,
+
+        skipped:
+          true,
+
         skip_reason:
-          "QUERY_BACKOFF_ACTIVE",
+          "GLOBAL_DEX_BACKOFF_ACTIVE",
+
         backoff_until:
           safeNumber(
             portfolio.runtime
-              .dex_query_backoff_untils
-              ?.[query]
+              .dex_backoff_until
+          ),
+
+        backoff_remaining_seconds:
+          dexGlobalBackoffRemainingSeconds(
+            portfolio
           )
       });
 
-      continue;
+      break;
     }
 
     const url =
@@ -1258,20 +1677,28 @@ async function getDexSearch(
 
     diagnostics.push({
       query,
+
       ok:
         response.ok,
+
       status:
         response.status,
+
       duration_ms:
         response.duration_ms,
+
       error:
         response.error,
+
       body_preview:
         response.body_preview,
+
       rate_limited:
         rateLimited,
+
       response_pair_count:
         pairs.length,
+
       solana_pair_count:
         pairs.filter(
           pair =>
@@ -1281,6 +1708,13 @@ async function getDexSearch(
             "solana"
         ).length
     });
+
+    if (rateLimited) {
+      /*
+      Do not process another DexScreener query.
+      */
+      break;
+    }
 
     for (
       const pair of pairs
@@ -1358,7 +1792,8 @@ async function getDexSearch(
     pairMap,
     diagnostics,
     requestCount,
-    rateLimitedCount
+    rateLimitedCount,
+    skipped: false
   };
 }
 
@@ -1367,7 +1802,8 @@ DEX TOKEN HYDRATION
 ============================================================ */
 
 async function hydrateDexTokens(
-  mintMap
+  mintMap,
+  portfolio
 ) {
   const pairMap =
     new Map();
@@ -1376,6 +1812,37 @@ async function hydrateDexTokens(
 
   let requestCount = 0;
   let rateLimitedCount = 0;
+
+  /*
+  Never hydrate while the global DexScreener cooldown is active.
+  */
+  if (
+    dexGlobalBackoffActive(
+      portfolio
+    )
+  ) {
+    return {
+      pairMap,
+      diagnostics: [
+        {
+          skipped:
+            true,
+
+          skip_reason:
+            "GLOBAL_DEX_BACKOFF_ACTIVE",
+
+          backoff_remaining_seconds:
+            dexGlobalBackoffRemainingSeconds(
+              portfolio
+            )
+        }
+      ],
+
+      requestCount: 0,
+      rateLimitedCount: 0,
+      skipped: true
+    };
+  }
 
   const mints =
     unique(
@@ -1388,6 +1855,33 @@ async function hydrateDexTokens(
   for (
     const mint of mints
   ) {
+    /*
+    Stop hydration immediately if any previous hydration
+    request triggered the global cooldown.
+    */
+    if (
+      dexGlobalBackoffActive(
+        portfolio
+      )
+    ) {
+      diagnostics.push({
+        mint,
+
+        skipped:
+          true,
+
+        skip_reason:
+          "GLOBAL_DEX_BACKOFF_ACTIVATED_DURING_HYDRATION",
+
+        backoff_remaining_seconds:
+          dexGlobalBackoffRemainingSeconds(
+            portfolio
+          )
+      });
+
+      break;
+    }
+
     const url =
       `${DEX_BASE}/latest/dex/tokens/${encodeURIComponent(
         mint
@@ -1412,6 +1906,11 @@ async function hydrateDexTokens(
 
     if (rateLimited) {
       rateLimitedCount++;
+
+      registerDexRateLimit(
+        portfolio,
+        `HYDRATION:${mint}`
+      );
     }
 
     let bestPair = null;
@@ -1486,20 +1985,28 @@ async function hydrateDexTokens(
 
     diagnostics.push({
       mint,
+
       ok:
         response.ok,
+
       status:
         response.status,
+
       duration_ms:
         response.duration_ms,
+
       error:
         response.error,
+
       body_preview:
         response.body_preview,
+
       rate_limited:
         rateLimited,
+
       pair_count:
         pairs.length,
+
       solana_pair_count:
         pairs.filter(
           pair =>
@@ -1508,16 +2015,25 @@ async function hydrateDexTokens(
             ).toLowerCase() ===
             "solana"
         ).length,
+
       selected:
         !!bestPair
     });
+
+    if (rateLimited) {
+      /*
+      One 429 is enough. Do not continue hydration.
+      */
+      break;
+    }
   }
 
   return {
     pairMap,
     diagnostics,
     requestCount,
-    rateLimitedCount
+    rateLimitedCount,
+    skipped: false
   };
 }
 
@@ -1638,16 +2154,22 @@ async function getJupiterPrices(
   const diagnostics = {
     requested:
       targets.length,
+
     ok:
       response.ok,
+
     status:
       response.status,
+
     duration_ms:
       response.duration_ms,
+
     error:
       response.error,
+
     body_preview:
       response.body_preview,
+
     returned_count: 0
   };
 
@@ -4212,7 +4734,7 @@ async function liveSell(
 }
 
 /* ============================================================
-JUPITER-ONLY POSITION REFRESH
+JUPITER-ONLY POSITION / MEMORY REFRESH
 ============================================================ */
 
 async function buildBackoffCandidates(
@@ -4425,21 +4947,215 @@ async function runScan(
     existingPortfolio ||
     await loadPortfolio(env);
 
+  clearExpiredDexBackoff(
+    portfolio
+  );
+
   /*
-  Restore the original broader DexScreener discovery flow.
-  Discovery can still produce mints even when search endpoints
-  are temporarily returning 429/1015.
+  ============================================================
+  GLOBAL DEX BACKOFF PATH
+  ============================================================
+
+  If DexScreener is cooling down, do NOT call:
+  - token profiles
+  - latest boosts
+  - top boosts
+  - search
+  - hydration
+
+  Instead, use Jupiter to refresh known positions and
+  market-memory tokens.
+
+  This prevents every one-minute cron invocation from
+  repeating the same DexScreener 429/1015 cycle.
   */
+  if (
+    dexGlobalBackoffActive(
+      portfolio
+    )
+  ) {
+    const remaining =
+      dexGlobalBackoffRemainingSeconds(
+        portfolio
+      );
+
+    const fallback =
+      await buildBackoffCandidates(
+        env,
+        portfolio
+      );
+
+    const diagnostics = {
+      duration_ms:
+        Date.now() -
+        started,
+
+      dexscreener_backoff_active:
+        true,
+
+      dexscreener_backoff_remaining_seconds:
+        remaining,
+
+      dexscreener_discovery_requests:
+        0,
+
+      dexscreener_search_requests:
+        0,
+
+      dexscreener_hydration_requests:
+        0,
+
+      dexscreener_requests:
+        0,
+
+      dexscreener_rate_limited:
+        0,
+
+      dexscreener_search_rate_limited:
+        0,
+
+      dexscreener_global_backoff:
+        true,
+
+      dexscreener_skip_reason:
+        "GLOBAL_DEX_BACKOFF_ACTIVE",
+
+      candidate_count:
+        fallback.candidates.length,
+
+      eligible_candidate_count:
+        getEligibleCandidates(
+          portfolio,
+          fallback.candidates
+        ).length,
+
+      jupiter_prices_requested:
+        fallback.jupiter?.requested ||
+        0,
+
+      jupiter_prices:
+        fallback.jupiter?.returned_count ||
+        0,
+
+      estimated_external_requests:
+        fallback.jupiter
+          ? 1
+          : 0,
+
+      configured_request_budget:
+        MAX_EXTERNAL_REQUEST_BUDGET,
+
+      target_cloudflare_free_limit:
+        50,
+
+      rate_limited:
+        true,
+
+      rate_limit_reason:
+        "DEXSCREENER_GLOBAL_BACKOFF_ACTIVE",
+
+      endpoint_diagnostics: {
+        dexscreener_discovery: [
+          {
+            skipped:
+              true,
+            skip_reason:
+              "GLOBAL_DEX_BACKOFF_ACTIVE",
+            backoff_remaining_seconds:
+              remaining
+          }
+        ],
+
+        dexscreener_search: [
+          {
+            skipped:
+              true,
+            skip_reason:
+              "GLOBAL_DEX_BACKOFF_ACTIVE",
+            backoff_remaining_seconds:
+              remaining
+          }
+        ],
+
+        dexscreener_hydration: [
+          {
+            skipped:
+              true,
+            skip_reason:
+              "GLOBAL_DEX_BACKOFF_ACTIVE",
+            backoff_remaining_seconds:
+              remaining
+          }
+        ],
+
+        jupiter_prices:
+          fallback.jupiter
+      }
+    };
+
+    logEvent(
+      "SCAN_DEX_BACKOFF",
+      {
+        remaining_seconds:
+          remaining,
+
+        jupiter_candidates:
+          fallback.candidates.length
+      }
+    );
+
+    return {
+      candidates:
+        fallback.candidates,
+
+      diagnostics,
+
+      portfolio
+    };
+  }
+
+  /*
+  ============================================================
+  NORMAL DEX SCAN
+  ============================================================
+  */
+
   const discovery =
     await getDexDiscovery(
       portfolio
     );
 
+  /*
+  If discovery hit a 429, getDexDiscovery has already
+  activated the global cooldown. Do NOT call search.
+  */
   const dex =
-    await getDexSearch(
+    dexGlobalBackoffActive(
       portfolio
-    );
+    )
+      ? {
+          pairMap:
+            new Map(),
+          diagnostics: [
+            {
+              skipped:
+                true,
+              skip_reason:
+                "GLOBAL_DEX_BACKOFF_ACTIVE_AFTER_DISCOVERY"
+            }
+          ],
+          requestCount: 0,
+          rateLimitedCount: 0,
+          skipped: true
+        }
+      : await getDexSearch(
+          portfolio
+        );
 
+  /*
+  If search hit a 429, getDexSearch has activated the global
+  cooldown. Do NOT call hydration.
+  */
   const discoveredMints =
     unique(
       discovery.discoveries.map(
@@ -4448,11 +5164,6 @@ async function runScan(
       )
     );
 
-  /*
-  Search pairs are immediately useful because they already
-  contain market metadata. Discovery-only mints are hydrated
-  below so they receive the same liquidity/volume data.
-  */
   const candidateMintSet =
     unique([
       ...dex.pairMap.keys(),
@@ -4484,20 +5195,44 @@ async function runScan(
   }
 
   const hydration =
-    hydrationSeed.size
+    !dexGlobalBackoffActive(
+      portfolio
+    ) && hydrationSeed.size
       ? await hydrateDexTokens(
-          hydrationSeed
+          hydrationSeed,
+          portfolio
         )
       : {
-          pairMap: new Map(),
-          diagnostics: [],
+          pairMap:
+            new Map(),
+          diagnostics:
+            dexGlobalBackoffActive(
+              portfolio
+            )
+              ? [
+                  {
+                    skipped:
+                      true,
+                    skip_reason:
+                      "GLOBAL_DEX_BACKOFF_ACTIVE_BEFORE_HYDRATION",
+                    backoff_remaining_seconds:
+                      dexGlobalBackoffRemainingSeconds(
+                        portfolio
+                      )
+                  }
+                ]
+              : [],
           requestCount: 0,
-          rateLimitedCount: 0
+          rateLimitedCount: 0,
+          skipped:
+            dexGlobalBackoffActive(
+              portfolio
+            )
         };
 
   /*
   Search data wins for a mint when available.
-  Hydration supplies the discovery-only mints.
+  Hydration supplies discovery-only mints.
   */
   for (
     const [
@@ -4523,12 +5258,19 @@ async function runScan(
       );
 
   /*
-  If DexScreener returned no usable market pairs at all,
-  retain the Jupiter known-position/memory refresh behavior.
-  Jupiter-only data still cannot create a new position.
+  If a rate limit occurred and no usable DEX pairs remain,
+  use Jupiter-only refresh.
   */
   if (
-    mints.length === 0
+    mints.length === 0 &&
+    (
+      discovery.rateLimitedCount > 0 ||
+      dex.rateLimitedCount > 0 ||
+      hydration.rateLimitedCount > 0 ||
+      dexGlobalBackoffActive(
+        portfolio
+      )
+    )
   ) {
     const fallback =
       await buildBackoffCandidates(
@@ -4552,20 +5294,13 @@ async function runScan(
         started,
 
       dexscreener_backoff_active:
-        anyDexQueryBackoffActive(
+        dexGlobalBackoffActive(
           portfolio
         ),
 
       dexscreener_backoff_remaining_seconds:
-        Math.ceil(
-          Math.max(
-            0,
-            safeNumber(
-              portfolio.runtime
-                .dex_backoff_until
-            ) -
-              Date.now()
-          ) / 1000
+        dexGlobalBackoffRemainingSeconds(
+          portfolio
         ),
 
       dexscreener_discovery_requests:
@@ -4585,6 +5320,11 @@ async function runScan(
 
       dexscreener_search_rate_limited:
         dex.rateLimitedCount,
+
+      dexscreener_global_backoff:
+        dexGlobalBackoffActive(
+          portfolio
+        ),
 
       candidate_count:
         fallback.candidates.length,
@@ -4619,17 +5359,17 @@ async function runScan(
 
       rate_limited:
         totalDexRateLimits > 0 ||
-        anyDexQueryBackoffActive(
+        dexGlobalBackoffActive(
           portfolio
         ),
 
       rate_limit_reason:
         totalDexRateLimits > 0
           ? "DEXSCREENER_RATE_LIMITED"
-          : anyDexQueryBackoffActive(
+          : dexGlobalBackoffActive(
               portfolio
             )
-            ? "DEX_QUERY_BACKOFF_ACTIVE"
+            ? "DEXSCREENER_GLOBAL_BACKOFF_ACTIVE"
             : null,
 
       endpoint_diagnostics: {
@@ -4657,6 +5397,11 @@ async function runScan(
     };
   }
 
+  /*
+  If DexScreener happened to hit a 429 but some pairs were
+  already collected, continue with those already-received
+  pairs. No additional Dex requests will occur.
+  */
   const jupiter =
     await getJupiterPrices(
       mints
@@ -4753,20 +5498,13 @@ async function runScan(
       started,
 
     dexscreener_backoff_active:
-      anyDexQueryBackoffActive(
+      dexGlobalBackoffActive(
         portfolio
       ),
 
     dexscreener_backoff_remaining_seconds:
-      Math.ceil(
-        Math.max(
-          0,
-          safeNumber(
-            portfolio.runtime
-              .dex_backoff_until
-          ) -
-            Date.now()
-        ) / 1000
+      dexGlobalBackoffRemainingSeconds(
+        portfolio
       ),
 
     dexscreener_discovery_requests:
@@ -4786,6 +5524,11 @@ async function runScan(
 
     dexscreener_search_rate_limited:
       dex.rateLimitedCount,
+
+    dexscreener_global_backoff:
+      dexGlobalBackoffActive(
+        portfolio
+      ),
 
     candidate_count:
       finalCandidates.length,
@@ -4876,7 +5619,10 @@ async function runScan(
         diagnostics.estimated_external_requests,
 
       rate_limited:
-        diagnostics.rate_limited
+        diagnostics.rate_limited,
+
+      global_dex_backoff:
+        diagnostics.dexscreener_backoff_active
     }
   );
 
@@ -4959,8 +5705,7 @@ async function runLiveEngine(
   let buys = 0;
 
   /*
-  Jupiter-only refreshes do not contain fresh DEX liquidity and
-  volume data, so they are never allowed to create a new buy.
+  Jupiter-only refreshes never create a new buy.
   */
   const canBuy =
     !(
@@ -4970,6 +5715,10 @@ async function runLiveEngine(
           candidate.source ===
           "JUPITER_POSITION_REFRESH"
       )
+    ) &&
+    !(
+      scan.diagnostics
+        ?.dexscreener_global_backoff
     );
 
   if (
@@ -5288,7 +6037,19 @@ async function health(env) {
       enabled:
         true,
 
-      per_query:
+      scope:
+        "GLOBAL",
+
+      discovery_protected:
+        true,
+
+      search_protected:
+        true,
+
+      hydration_protected:
+        true,
+
+      persisted_in_kv:
         true,
 
       base_backoff_seconds:
@@ -5312,6 +6073,10 @@ async function status(env) {
     await loadPortfolio(
       env
     );
+
+  clearExpiredDexBackoff(
+    portfolio
+  );
 
   return {
     ok: true,
@@ -5372,7 +6137,19 @@ async function status(env) {
     },
 
     runtime:
-      portfolio.runtime,
+      {
+        ...portfolio.runtime,
+
+        dex_backoff_active:
+          dexGlobalBackoffActive(
+            portfolio
+          ),
+
+        dex_backoff_remaining_seconds:
+          dexGlobalBackoffRemainingSeconds(
+            portfolio
+          )
+      },
 
     time:
       nowIso()
@@ -5584,13 +6361,15 @@ async function scheduledRun(env) {
       scan.diagnostics;
 
     /*
-    If DexScreener is rate-limited AND no usable candidates
-    exist, this run is recorded as rate-limited rather than as
-    a worker failure.
+    A global DexScreener cooldown is NOT treated as a worker
+    failure. Jupiter-only refreshes may still provide data for
+    existing positions.
     */
     if (
       scan.diagnostics
         ?.rate_limited &&
+      scan.diagnostics
+        ?.dexscreener_global_backoff &&
       scan.candidates.length === 0
     ) {
       portfolio.runtime.last_scheduled_run_ok =
@@ -5756,7 +6535,12 @@ async function scheduledRun(env) {
 
         outcome:
           portfolio.runtime
-            .last_run_outcome
+            .last_run_outcome,
+
+        dex_backoff_active:
+          dexGlobalBackoffActive(
+            portfolio
+          )
       }
     );
 
