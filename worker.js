@@ -17,9 +17,20 @@ LIVE ONLY
 - Maximum 1 new buy per run
 - Stop loss / trailing stop / reversal protection
 - Candidate scoring and short-term market memory
-- KV persistence
+- BOT_KV persistence
 - Scheduled automatic execution
-- Public live execution endpoints removed
+- Persistent runtime diagnostics
+- Bounded transaction confirmation polling
+- No public live execution HTTP endpoints
+
+CLOUDFLARE FREE REQUEST PROTECTION
+- Discovery: 3 requests
+- Search: 3 requests
+- Discovery-only hydration: max 10
+- Jupiter batch price: 1
+- KV portfolio read: 1
+- Confirmation polling: max 3
+- No GeckoTerminal requests
 ============================================================
 */
 
@@ -81,8 +92,31 @@ const SHORT_TERM_SELL_RATIO = 1.50;
 const HOURLY_SELL_RATIO = 1.43;
 
 const MAX_CANDIDATES = 30;
-const MAX_DEX_TOKENS_ANALYZED = 20;
+
+/*
+Reduced from 20 to 10.
+
+Search results already contain full pair objects, so hydration
+is only needed for discovery-only tokens.
+*/
+const MAX_DEX_TOKENS_ANALYZED = 10;
+
 const MAX_JUPITER_PRICE_CHECKS = 20;
+
+/*
+This is a planning budget, not a fake hard limit.
+The actual scanner is deliberately kept well below the
+Workers Free 50-subrequest ceiling before live execution.
+*/
+const MAX_EXTERNAL_REQUEST_BUDGET = 40;
+
+/*
+Three confirmation/status requests are sufficient for a bounded
+confirmation window while leaving considerably more request
+headroom for the rest of the live transaction.
+*/
+const MAX_CONFIRMATION_POLLS = 3;
+const CONFIRMATION_POLL_INTERVAL_MS = 2500;
 
 const DEX_BASE = "https://api.dexscreener.com";
 const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";
@@ -92,6 +126,11 @@ const JUPITER_SWAP_API = "https://quote-api.jup.ag/v6/swap";
 const SOL_MINT =
   "So11111111111111111111111111111111111111112";
 
+/*
+IMPORTANT:
+This is the existing Cloudflare KV binding.
+Do NOT replace this with a secret or environment variable.
+*/
 const PORTFOLIO_KEY = "LIVE_BETA_PORTFOLIO";
 
 /* ============================================================
@@ -121,7 +160,46 @@ function unique(items) {
 }
 
 function errorText(error) {
-  return error instanceof Error ? error.message : String(error);
+  return error instanceof Error
+    ? error.message
+    : String(error);
+}
+
+function compactError(error) {
+  return errorText(error).slice(0, 1000);
+}
+
+function logEvent(event, data = {}) {
+  try {
+    console.log(
+      JSON.stringify({
+        bot: BOT_NAME,
+        event,
+        time: nowIso(),
+        ...data
+      })
+    );
+  } catch {
+    console.log(`MEMEBOTT ${event}`);
+  }
+}
+
+function logError(event, error, data = {}) {
+  try {
+    console.error(
+      JSON.stringify({
+        bot: BOT_NAME,
+        event,
+        time: nowIso(),
+        error: compactError(error),
+        ...data
+      })
+    );
+  } catch {
+    console.error(
+      `MEMEBOTT ${event}: ${compactError(error)}`
+    );
+  }
 }
 
 /* ============================================================
@@ -138,7 +216,9 @@ async function fetchJson(url, options = {}) {
   });
 
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status} from ${url}`);
+    throw new Error(
+      `HTTP ${response.status} from ${url}`
+    );
   }
 
   return await response.json();
@@ -231,7 +311,14 @@ function createRuntimeState() {
     total_scheduled_runs: 0,
     total_successful_scheduled_runs: 0,
     total_failed_scheduled_runs: 0,
-    last_scan_diagnostics: null
+    last_scan_diagnostics: null,
+
+    current_stage: null,
+    current_stage_started_at: null,
+    last_completed_stage: null,
+    last_completed_stage_at: null,
+    last_error_stage: null,
+    last_error_time: null
   };
 }
 
@@ -255,6 +342,13 @@ function createEmptyPortfolio() {
 }
 
 async function loadPortfolio(env) {
+  /*
+  The only KV binding used by this worker is BOT_KV.
+  */
+  if (!env.BOT_KV) {
+    throw new Error("MISSING_BOT_KV_BINDING");
+  }
+
   const raw = await env.BOT_KV.get(PORTFOLIO_KEY);
 
   if (!raw) {
@@ -265,9 +359,18 @@ async function loadPortfolio(env) {
     const portfolio = JSON.parse(raw);
 
     if (
-      safeNumber(portfolio.schema_version) !== SCHEMA_VERSION ||
+      safeNumber(portfolio.schema_version) !==
+        SCHEMA_VERSION ||
       portfolio.mode !== "LIVE"
     ) {
+      logEvent(
+        "PORTFOLIO_RESET_SCHEMA_MISMATCH",
+        {
+          stored_schema: portfolio.schema_version,
+          stored_mode: portfolio.mode
+        }
+      );
+
       return createEmptyPortfolio();
     }
 
@@ -293,23 +396,37 @@ async function loadPortfolio(env) {
     );
 
     portfolio.realized_pnl_usd =
-      safeNumber(portfolio.realized_pnl_usd);
+      safeNumber(
+        portfolio.realized_pnl_usd
+      );
 
     portfolio.last_persist_at =
-      safeNumber(portfolio.last_persist_at);
+      safeNumber(
+        portfolio.last_persist_at
+      );
 
     cleanupCooldowns(portfolio);
     cleanupMarketMemory(portfolio);
 
     return portfolio;
-  } catch {
+  } catch (error) {
+    logError(
+      "PORTFOLIO_PARSE_FAILED_RESETTING",
+      error
+    );
+
     return createEmptyPortfolio();
   }
 }
 
 function persistenceAgeMs(portfolio) {
-  const last = safeNumber(portfolio.last_persist_at);
-  return last ? Date.now() - last : Infinity;
+  const last = safeNumber(
+    portfolio.last_persist_at
+  );
+
+  return last
+    ? Date.now() - last
+    : Infinity;
 }
 
 function checkpointDue(portfolio) {
@@ -325,6 +442,12 @@ async function savePortfolio(
   reason,
   force = false
 ) {
+  if (!env.BOT_KV) {
+    throw new Error(
+      "MISSING_BOT_KV_BINDING"
+    );
+  }
+
   if (
     !force &&
     persistenceAgeMs(portfolio) <
@@ -342,9 +465,14 @@ async function savePortfolio(
   const payload = {
     ...portfolio,
     mode: "LIVE",
-    updated_at: new Date(persistedAt).toISOString(),
-    last_persist_at: persistedAt,
-    last_persist_reason: reason
+    updated_at:
+      new Date(
+        persistedAt
+      ).toISOString(),
+    last_persist_at:
+      persistedAt,
+    last_persist_reason:
+      reason
   };
 
   await env.BOT_KV.put(
@@ -352,9 +480,14 @@ async function savePortfolio(
     JSON.stringify(payload)
   );
 
-  portfolio.updated_at = payload.updated_at;
-  portfolio.last_persist_at = persistedAt;
-  portfolio.last_persist_reason = reason;
+  portfolio.updated_at =
+    payload.updated_at;
+
+  portfolio.last_persist_at =
+    persistedAt;
+
+  portfolio.last_persist_reason =
+    reason;
 
   return {
     saved: true,
@@ -363,16 +496,86 @@ async function savePortfolio(
   };
 }
 
-function addHistory(portfolio, event) {
+function addHistory(
+  portfolio,
+  event
+) {
   portfolio.history.push({
     time: nowIso(),
     ...event
   });
 
-  if (portfolio.history.length > 500) {
+  if (
+    portfolio.history.length > 500
+  ) {
     portfolio.history =
       portfolio.history.slice(-500);
   }
+}
+
+function setStage(
+  portfolio,
+  stage
+) {
+  if (!portfolio?.runtime) return;
+
+  portfolio.runtime.current_stage =
+    stage;
+
+  portfolio.runtime.current_stage_started_at =
+    nowIso();
+
+  logEvent(
+    "STAGE_START",
+    {
+      stage
+    }
+  );
+}
+
+function completeStage(
+  portfolio,
+  stage
+) {
+  if (!portfolio?.runtime) return;
+
+  portfolio.runtime.last_completed_stage =
+    stage;
+
+  portfolio.runtime.last_completed_stage_at =
+    nowIso();
+
+  logEvent(
+    "STAGE_COMPLETE",
+    {
+      stage
+    }
+  );
+}
+
+function failStage(
+  portfolio,
+  stage,
+  error
+) {
+  if (!portfolio?.runtime) return;
+
+  portfolio.runtime.last_error_stage =
+    stage;
+
+  portfolio.runtime.last_error_time =
+    nowIso();
+
+  portfolio.runtime.current_stage =
+    stage;
+
+  logError(
+    "STAGE_FAILED",
+    error,
+    {
+      stage
+    }
+  );
 }
 
 /* ============================================================
@@ -382,52 +585,80 @@ DEXSCREENER DISCOVERY
 async function getDexDiscovery() {
   const endpoints = [
     {
-      name: "token_profiles_latest",
-      url: `${DEX_BASE}/token-profiles/latest/v1`
+      name:
+        "token_profiles_latest",
+      url:
+        `${DEX_BASE}/token-profiles/latest/v1`
     },
     {
-      name: "token_boosts_latest",
-      url: `${DEX_BASE}/token-boosts/latest/v1`
+      name:
+        "token_boosts_latest",
+      url:
+        `${DEX_BASE}/token-boosts/latest/v1`
     },
     {
-      name: "token_boosts_top",
-      url: `${DEX_BASE}/token-boosts/top/v1`
+      name:
+        "token_boosts_top",
+      url:
+        `${DEX_BASE}/token-boosts/top/v1`
     }
   ];
 
   const results = [];
   const diagnostics = [];
 
-  for (const endpoint of endpoints) {
+  for (
+    const endpoint of endpoints
+  ) {
     const response =
-      await fetchJsonSafe(endpoint.url);
+      await fetchJsonSafe(
+        endpoint.url
+      );
 
     diagnostics.push({
-      endpoint: endpoint.name,
-      url: endpoint.url,
-      ok: response.ok,
-      status: response.status,
-      duration_ms: response.duration_ms,
-      error: response.error,
-      body_preview: response.body_preview,
+      endpoint:
+        endpoint.name,
+      url:
+        endpoint.url,
+      ok:
+        response.ok,
+      status:
+        response.status,
+      duration_ms:
+        response.duration_ms,
+      error:
+        response.error,
+      body_preview:
+        response.body_preview,
       response_array:
-        Array.isArray(response.data),
+        Array.isArray(
+          response.data
+        ),
       response_count:
-        Array.isArray(response.data)
+        Array.isArray(
+          response.data
+        )
           ? response.data.length
           : 0
     });
 
     if (
       !response.ok ||
-      !Array.isArray(response.data)
+      !Array.isArray(
+        response.data
+      )
     ) {
       continue;
     }
 
-    for (const item of response.data) {
+    for (
+      const item of
+      response.data
+    ) {
       if (
-        String(item?.chainId || "").toLowerCase() !==
+        String(
+          item?.chainId || ""
+        ).toLowerCase() !==
         "solana"
       ) {
         continue;
@@ -442,9 +673,11 @@ async function getDexDiscovery() {
       results.push({
         mint,
         source:
-          endpoint.name === "token_boosts_top"
+          endpoint.name ===
+          "token_boosts_top"
             ? "DEXSCREENER_TOP_BOOSTS"
-            : endpoint.name === "token_boosts_latest"
+            : endpoint.name ===
+              "token_boosts_latest"
               ? "DEXSCREENER_BOOSTS"
               : "DEXSCREENER"
       });
@@ -468,11 +701,15 @@ async function getDexSearch() {
     "pump"
   ];
 
-  const pairMap = new Map();
+  const pairMap =
+    new Map();
+
   const results = [];
   const diagnostics = [];
 
-  for (const query of queries) {
+  for (
+    const query of queries
+  ) {
     const url =
       `${DEX_BASE}/latest/dex/search?q=${encodeURIComponent(query)}`;
 
@@ -480,33 +717,48 @@ async function getDexSearch() {
       await fetchJsonSafe(url);
 
     const pairs =
-      Array.isArray(response.data?.pairs)
+      Array.isArray(
+        response.data?.pairs
+      )
         ? response.data.pairs
         : [];
 
     diagnostics.push({
       query,
       url,
-      ok: response.ok,
-      status: response.status,
-      duration_ms: response.duration_ms,
-      error: response.error,
-      body_preview: response.body_preview,
+      ok:
+        response.ok,
+      status:
+        response.status,
+      duration_ms:
+        response.duration_ms,
+      error:
+        response.error,
+      body_preview:
+        response.body_preview,
       response_has_pairs:
-        Array.isArray(response.data?.pairs),
+        Array.isArray(
+          response.data?.pairs
+        ),
       response_pair_count:
         pairs.length,
       solana_pair_count:
         pairs.filter(
           pair =>
-            String(pair?.chainId || "").toLowerCase() ===
+            String(
+              pair?.chainId || ""
+            ).toLowerCase() ===
             "solana"
         ).length
     });
 
-    for (const pair of pairs) {
+    for (
+      const pair of pairs
+    ) {
       if (
-        String(pair?.chainId || "").toLowerCase() !==
+        String(
+          pair?.chainId || ""
+        ).toLowerCase() !==
         "solana"
       ) {
         continue;
@@ -521,34 +773,52 @@ async function getDexSearch() {
         pairMap.get(mint);
 
       if (!existing) {
-        pairMap.set(mint, pair);
+        pairMap.set(
+          mint,
+          pair
+        );
       } else {
         const oldLiquidity =
-          safeNumber(existing?.liquidity?.usd);
+          safeNumber(
+            existing?.liquidity?.usd
+          );
 
         const newLiquidity =
-          safeNumber(pair?.liquidity?.usd);
+          safeNumber(
+            pair?.liquidity?.usd
+          );
 
         const oldVolume =
-          safeNumber(existing?.volume?.h24);
+          safeNumber(
+            existing?.volume?.h24
+          );
 
         const newVolume =
-          safeNumber(pair?.volume?.h24);
+          safeNumber(
+            pair?.volume?.h24
+          );
 
         if (
-          newLiquidity > oldLiquidity ||
+          newLiquidity >
+            oldLiquidity ||
           (
-            newLiquidity === oldLiquidity &&
-            newVolume > oldVolume
+            newLiquidity ===
+              oldLiquidity &&
+            newVolume >
+              oldVolume
           )
         ) {
-          pairMap.set(mint, pair);
+          pairMap.set(
+            mint,
+            pair
+          );
         }
       }
 
       results.push({
         mint,
-        source: "DEXSCREENER_SEARCH"
+        source:
+          "DEXSCREENER_SEARCH"
       });
     }
   }
@@ -564,17 +834,23 @@ async function getDexSearch() {
 DEX HYDRATION
 ============================================================ */
 
-async function hydrateDexPairs(mints) {
+async function hydrateDexPairs(
+  mints
+) {
   const targets =
     unique(mints).slice(
       0,
       MAX_DEX_TOKENS_ANALYZED
     );
 
-  const hydrated = new Map();
+  const hydrated =
+    new Map();
+
   const diagnostics = [];
 
-  for (const mint of targets) {
+  for (
+    const mint of targets
+  ) {
     const url =
       `${DEX_BASE}/latest/dex/tokens/${encodeURIComponent(mint)}`;
 
@@ -582,49 +858,75 @@ async function hydrateDexPairs(mints) {
       await fetchJsonSafe(url);
 
     const pairs =
-      Array.isArray(response.data?.pairs)
+      Array.isArray(
+        response.data?.pairs
+      )
         ? response.data.pairs.filter(
             pair =>
               String(
                 pair?.chainId || ""
-              ).toLowerCase() === "solana"
+              ).toLowerCase() ===
+              "solana"
           )
         : [];
 
     diagnostics.push({
       mint,
       url,
-      ok: response.ok,
-      status: response.status,
-      duration_ms: response.duration_ms,
-      error: response.error,
-      body_preview: response.body_preview,
+      ok:
+        response.ok,
+      status:
+        response.status,
+      duration_ms:
+        response.duration_ms,
+      error:
+        response.error,
+      body_preview:
+        response.body_preview,
       response_pair_count:
-        Array.isArray(response.data?.pairs)
+        Array.isArray(
+          response.data?.pairs
+        )
           ? response.data.pairs.length
           : 0,
       solana_pair_count:
         pairs.length
     });
 
-    if (!response.ok || !pairs.length) {
+    if (
+      !response.ok ||
+      !pairs.length
+    ) {
       continue;
     }
 
-    pairs.sort((a, b) => {
-      const liquidityDifference =
-        safeNumber(b?.liquidity?.usd) -
-        safeNumber(a?.liquidity?.usd);
+    pairs.sort(
+      (a, b) => {
+        const liquidityDifference =
+          safeNumber(
+            b?.liquidity?.usd
+          ) -
+          safeNumber(
+            a?.liquidity?.usd
+          );
 
-      if (liquidityDifference !== 0) {
-        return liquidityDifference;
+        if (
+          liquidityDifference !==
+          0
+        ) {
+          return liquidityDifference;
+        }
+
+        return (
+          safeNumber(
+            b?.volume?.h24
+          ) -
+          safeNumber(
+            a?.volume?.h24
+          )
+        );
       }
-
-      return (
-        safeNumber(b?.volume?.h24) -
-        safeNumber(a?.volume?.h24)
-      );
-    });
+    );
 
     hydrated.set(
       mint,
@@ -634,7 +936,9 @@ async function hydrateDexPairs(mints) {
 
   return {
     hydrated,
-    diagnostics
+    diagnostics,
+    requested:
+      targets.length
   };
 }
 
@@ -655,7 +959,8 @@ function extractJupiterPrice(
 
   if (
     direct &&
-    typeof direct === "object" &&
+    typeof direct ===
+      "object" &&
     !Array.isArray(direct)
   ) {
     for (
@@ -667,7 +972,8 @@ function extractJupiterPrice(
         direct.price_usd
       ]
     ) {
-      const price = Number(value);
+      const price =
+        Number(value);
 
       if (
         Number.isFinite(price) &&
@@ -678,23 +984,33 @@ function extractJupiterPrice(
     }
   }
 
-  if (Array.isArray(data?.data)) {
-    for (const item of data.data) {
+  if (
+    Array.isArray(
+      data?.data
+    )
+  ) {
+    for (
+      const item of
+      data.data
+    ) {
       const address =
         item?.id ||
         item?.mint ||
         item?.address;
 
-      if (address !== mint) {
+      if (
+        address !== mint
+      ) {
         continue;
       }
 
-      const price = Number(
-        item?.usdPrice ??
-        item?.usd_price ??
-        item?.price ??
-        item?.priceUsd
-      );
+      const price =
+        Number(
+          item?.usdPrice ??
+          item?.usd_price ??
+          item?.price ??
+          item?.priceUsd
+        );
 
       if (
         Number.isFinite(price) &&
@@ -708,7 +1024,9 @@ function extractJupiterPrice(
   return null;
 }
 
-async function getJupiterPrices(mints) {
+async function getJupiterPrices(
+  mints
+) {
   const targets =
     unique(mints).slice(
       0,
@@ -722,7 +1040,8 @@ async function getJupiterPrices(mints) {
         requested: 0,
         ok: false,
         status: null,
-        error: "NO_MINTS_TO_CHECK"
+        error:
+          "NO_MINTS_TO_CHECK"
       }
     };
   }
@@ -736,12 +1055,18 @@ async function getJupiterPrices(mints) {
     await fetchJsonSafe(url);
 
   const diagnostics = {
-    requested: targets.length,
-    ok: response.ok,
-    status: response.status,
-    duration_ms: response.duration_ms,
-    error: response.error,
-    body_preview: response.body_preview,
+    requested:
+      targets.length,
+    ok:
+      response.ok,
+    status:
+      response.status,
+    duration_ms:
+      response.duration_ms,
+    error:
+      response.error,
+    body_preview:
+      response.body_preview,
     returned_count: 0
   };
 
@@ -754,7 +1079,9 @@ async function getJupiterPrices(mints) {
 
   const prices = {};
 
-  for (const mint of targets) {
+  for (
+    const mint of targets
+  ) {
     const price =
       extractJupiterPrice(
         response.data,
@@ -765,7 +1092,8 @@ async function getJupiterPrices(mints) {
       Number.isFinite(price) &&
       price > 0
     ) {
-      prices[mint] = price;
+      prices[mint] =
+        price;
     }
   }
 
@@ -797,46 +1125,65 @@ function normalizeCandidate(
 
   const volume24Available =
     Number.isFinite(
-      Number(pair?.volume?.h24)
+      Number(
+        pair?.volume?.h24
+      )
     );
 
   const volume1Available =
     Number.isFinite(
-      Number(pair?.volume?.h1)
+      Number(
+        pair?.volume?.h1
+      )
     );
 
   const dexPrice =
-    safeNumber(pair?.priceUsd);
+    safeNumber(
+      pair?.priceUsd
+    );
 
   const price =
     dexPrice ||
-    safeNumber(jupiterPrice);
+    safeNumber(
+      jupiterPrice
+    );
 
   const changes =
-    pair?.priceChange || {};
+    pair?.priceChange ||
+    {};
 
   const change5m =
-    Number.isFinite(Number(changes.m5))
+    Number.isFinite(
+      Number(changes.m5)
+    )
       ? Number(changes.m5) / 100
       : 0;
 
   const change1h =
-    Number.isFinite(Number(changes.h1))
+    Number.isFinite(
+      Number(changes.h1)
+    )
       ? Number(changes.h1) / 100
       : 0;
 
   const change6h =
-    Number.isFinite(Number(changes.h6))
+    Number.isFinite(
+      Number(changes.h6)
+    )
       ? Number(changes.h6) / 100
       : 0;
 
   const change24h =
-    Number.isFinite(Number(changes.h24))
+    Number.isFinite(
+      Number(changes.h24)
+    )
       ? Number(changes.h24) / 100
       : 0;
 
   const pairCreatedAt =
-    safeNumber(pair?.pairCreatedAt);
+    safeNumber(
+      pair?.pairCreatedAt
+    );
 
   const ageDays =
     pairCreatedAt > 0
@@ -852,46 +1199,68 @@ function normalizeCandidate(
   return {
     mint,
     symbol:
-      pair?.baseToken?.symbol || null,
+      pair?.baseToken?.symbol ||
+      null,
     name:
-      pair?.baseToken?.name || null,
+      pair?.baseToken?.name ||
+      null,
     source,
     dex_id:
-      pair?.dexId || null,
+      pair?.dexId ||
+      null,
     pair_address:
-      pair?.pairAddress || null,
+      pair?.pairAddress ||
+      null,
     pair_url:
-      pair?.url || null,
-    price_usd: price,
+      pair?.url ||
+      null,
+    price_usd:
+      price,
     liquidity_usd:
       liquidityAvailable
-        ? safeNumber(pair.liquidity.usd)
+        ? safeNumber(
+            pair.liquidity.usd
+          )
         : 0,
     liquidity_data_available:
       !!liquidityAvailable,
     volume_24h_usd:
       volume24Available
-        ? safeNumber(pair.volume.h24)
+        ? safeNumber(
+            pair.volume.h24
+          )
         : 0,
     volume_24h_data_available:
       !!volume24Available,
     volume_1h_usd:
       volume1Available
-        ? safeNumber(pair.volume.h1)
+        ? safeNumber(
+            pair.volume.h1
+          )
         : 0,
     volume_1h_data_available:
       !!volume1Available,
-    change_5m: change5m,
-    change_1h: change1h,
-    change_6h: change6h,
-    change_24h: change24h,
+    change_5m:
+      change5m,
+    change_1h:
+      change1h,
+    change_6h:
+      change6h,
+    change_24h:
+      change24h,
     pair_created_at:
-      pairCreatedAt || null,
-    age_days: ageDays,
+      pairCreatedAt ||
+      null,
+    age_days:
+      ageDays,
     quote_symbol:
-      pair?.quoteToken?.symbol || null,
+      pair?.quoteToken?.symbol ||
+      null,
     jupiter_price_usd:
-      safeNumber(jupiterPrice) || null,
+      safeNumber(
+        jupiterPrice
+      ) ||
+      null,
     price_source:
       dexPrice > 0
         ? "DEXSCREENER"
@@ -905,9 +1274,12 @@ function normalizeCandidate(
 MARKET MEMORY
 ============================================================ */
 
-function cleanupMarketMemory(portfolio) {
+function cleanupMarketMemory(
+  portfolio
+) {
   const memory =
-    portfolio.market_memory || {};
+    portfolio.market_memory ||
+    {};
 
   const cutoff =
     Date.now() -
@@ -919,14 +1291,18 @@ function cleanupMarketMemory(portfolio) {
   ) {
     if (
       !entry ||
-      safeNumber(entry.last_seen_at) < cutoff
+      safeNumber(
+        entry.last_seen_at
+      ) < cutoff
     ) {
       delete memory[mint];
       continue;
     }
 
     entry.observations =
-      Array.isArray(entry.observations)
+      Array.isArray(
+        entry.observations
+      )
         ? entry.observations.slice(
             -MAX_MEMORY_OBSERVATIONS
           )
@@ -938,8 +1314,12 @@ function cleanupMarketMemory(portfolio) {
       Object.entries(memory)
         .sort(
           (a, b) =>
-            safeNumber(b[1]?.last_seen_at) -
-            safeNumber(a[1]?.last_seen_at)
+            safeNumber(
+              b[1]?.last_seen_at
+            ) -
+            safeNumber(
+              a[1]?.last_seen_at
+            )
         )
         .slice(
           0,
@@ -952,14 +1332,23 @@ function recordMarketObservation(
   portfolio,
   candidate
 ) {
-  if (!candidate?.mint) return;
+  if (!candidate?.mint) {
+    return;
+  }
 
   const existing =
-    portfolio.market_memory[candidate.mint] ||
+    portfolio.market_memory[
+      candidate.mint
+    ] ||
     {
-      mint: candidate.mint,
-      symbol: candidate.symbol || null,
-      name: candidate.name || null,
+      mint:
+        candidate.mint,
+      symbol:
+        candidate.symbol ||
+        null,
+      name:
+        candidate.name ||
+        null,
       observations: []
     };
 
@@ -977,23 +1366,40 @@ function recordMarketObservation(
     Date.now();
 
   existing.observations.push({
-    time: Date.now(),
+    time:
+      Date.now(),
     price_usd:
-      safeNumber(candidate.price_usd),
+      safeNumber(
+        candidate.price_usd
+      ),
     liquidity_usd:
-      safeNumber(candidate.liquidity_usd),
+      safeNumber(
+        candidate.liquidity_usd
+      ),
     volume_1h_usd:
-      safeNumber(candidate.volume_1h_usd),
+      safeNumber(
+        candidate.volume_1h_usd
+      ),
     volume_24h_usd:
-      safeNumber(candidate.volume_24h_usd),
+      safeNumber(
+        candidate.volume_24h_usd
+      ),
     change_5m:
-      safeNumber(candidate.change_5m),
+      safeNumber(
+        candidate.change_5m
+      ),
     change_1h:
-      safeNumber(candidate.change_1h),
+      safeNumber(
+        candidate.change_1h
+      ),
     change_6h:
-      safeNumber(candidate.change_6h),
+      safeNumber(
+        candidate.change_6h
+      ),
     change_24h:
-      safeNumber(candidate.change_24h)
+      safeNumber(
+        candidate.change_24h
+      )
   });
 
   existing.observations =
@@ -1001,10 +1407,13 @@ function recordMarketObservation(
       -MAX_MEMORY_OBSERVATIONS
     );
 
-  portfolio.market_memory[candidate.mint] =
-    existing;
+  portfolio.market_memory[
+    candidate.mint
+  ] = existing;
 
-  cleanupMarketMemory(portfolio);
+  cleanupMarketMemory(
+    portfolio
+  );
 }
 
 function getHistoricalSetupBonus(
@@ -1012,10 +1421,14 @@ function getHistoricalSetupBonus(
   candidate
 ) {
   const memory =
-    portfolio.market_memory?.[candidate.mint];
+    portfolio.market_memory?.[
+      candidate.mint
+    ];
 
   const observations =
-    Array.isArray(memory?.observations)
+    Array.isArray(
+      memory?.observations
+    )
       ? memory.observations
       : [];
 
@@ -1027,38 +1440,59 @@ function getHistoricalSetupBonus(
   }
 
   const previous =
-    observations[observations.length - 1];
+    observations[
+      observations.length - 1
+    ];
 
   let bonus = 0;
 
   const oldPrice =
-    safeNumber(previous.price_usd);
+    safeNumber(
+      previous.price_usd
+    );
 
   const currentPrice =
-    safeNumber(candidate.price_usd);
+    safeNumber(
+      candidate.price_usd
+    );
 
   if (
     oldPrice > 0 &&
     currentPrice > 0
   ) {
     const delta =
-      (currentPrice - oldPrice) /
-      oldPrice;
+      (
+        currentPrice -
+        oldPrice
+      ) / oldPrice;
 
-    if (delta > 0) bonus += 5;
-    if (delta >= 0.01) bonus += 3;
+    if (delta > 0) {
+      bonus += 5;
+    }
+
+    if (delta >= 0.01) {
+      bonus += 3;
+    }
   }
 
   if (
-    safeNumber(candidate.volume_1h_usd) >
-    safeNumber(previous.volume_1h_usd)
+    safeNumber(
+      candidate.volume_1h_usd
+    ) >
+    safeNumber(
+      previous.volume_1h_usd
+    )
   ) {
     bonus += 3;
   }
 
   if (
-    safeNumber(candidate.liquidity_usd) >
-    safeNumber(previous.liquidity_usd)
+    safeNumber(
+      candidate.liquidity_usd
+    ) >
+    safeNumber(
+      previous.liquidity_usd
+    )
   ) {
     bonus += 2;
   }
@@ -1079,57 +1513,138 @@ function scoreCandidate(
   candidate
 ) {
   const liquidity =
-    safeNumber(candidate.liquidity_usd);
+    safeNumber(
+      candidate.liquidity_usd
+    );
 
   const volume24h =
-    safeNumber(candidate.volume_24h_usd);
+    safeNumber(
+      candidate.volume_24h_usd
+    );
 
   const volume1h =
-    safeNumber(candidate.volume_1h_usd);
+    safeNumber(
+      candidate.volume_1h_usd
+    );
 
   const change5m =
-    safeNumber(candidate.change_5m);
+    safeNumber(
+      candidate.change_5m
+    );
 
   const change1h =
-    safeNumber(candidate.change_1h);
+    safeNumber(
+      candidate.change_1h
+    );
 
   const change6h =
-    safeNumber(candidate.change_6h);
+    safeNumber(
+      candidate.change_6h
+    );
 
   let momentum = 0;
   let setup = 0;
   let risk = 0;
 
-  if (change5m > 0) momentum += 4;
-  if (change5m >= 0.02) momentum += 3;
-  if (change1h > 0) momentum += 3;
-  if (change1h >= 0.05) momentum += 3;
-  if (change6h > 0) momentum += 2;
+  if (change5m > 0) {
+    momentum += 4;
+  }
 
-  if (volume1h >= MIN_VOLUME_1H_USD) setup += 5;
-  if (volume24h >= MIN_VOLUME_24H_USD) setup += 5;
-  if (liquidity >= MIN_LIQUIDITY_USD) setup += 8;
+  if (change5m >= 0.02) {
+    momentum += 3;
+  }
+
+  if (change1h > 0) {
+    momentum += 3;
+  }
+
+  if (change1h >= 0.05) {
+    momentum += 3;
+  }
+
+  if (change6h > 0) {
+    momentum += 2;
+  }
+
+  if (
+    volume1h >=
+    MIN_VOLUME_1H_USD
+  ) {
+    setup += 5;
+  }
+
+  if (
+    volume24h >=
+    MIN_VOLUME_24H_USD
+  ) {
+    setup += 5;
+  }
 
   if (
     liquidity >=
-    2 * MIN_LIQUIDITY_USD
+    MIN_LIQUIDITY_USD
+  ) {
+    setup += 8;
+  }
+
+  if (
+    liquidity >=
+    2 *
+      MIN_LIQUIDITY_USD
   ) {
     setup += 3;
   }
 
   if (
-    change6h <= STRONG_NEGATIVE_6H &&
-    change5m >= BOUNCE_5M
+    change6h <=
+      STRONG_NEGATIVE_6H &&
+    change5m >=
+      BOUNCE_5M
   ) {
     setup += 6;
   }
 
-  if (change5m <= STRONG_NEGATIVE_5M) risk += 8;
-  if (change1h >= EXTREME_1H_MOVE) risk += 10;
-  if (change5m > MAX_5M_GAIN) risk += 10;
-  if (change1h > MAX_1H_GAIN) risk += 10;
-  if (change6h > MAX_6H_GAIN) risk += 8;
-  if (safeNumber(candidate.change_24h) > MAX_24H_GAIN) {
+  if (
+    change5m <=
+    STRONG_NEGATIVE_5M
+  ) {
+    risk += 8;
+  }
+
+  if (
+    change1h >=
+    EXTREME_1H_MOVE
+  ) {
+    risk += 10;
+  }
+
+  if (
+    change5m >
+    MAX_5M_GAIN
+  ) {
+    risk += 10;
+  }
+
+  if (
+    change1h >
+    MAX_1H_GAIN
+  ) {
+    risk += 10;
+  }
+
+  if (
+    change6h >
+    MAX_6H_GAIN
+  ) {
+    risk += 8;
+  }
+
+  if (
+    safeNumber(
+      candidate.change_24h
+    ) >
+    MAX_24H_GAIN
+  ) {
     risk += 8;
   }
 
@@ -1137,7 +1652,8 @@ function scoreCandidate(
 
   if (
     candidate.age_days !== null &&
-    candidate.age_days <= NEW_TOKEN_MAX_AGE_DAYS
+    candidate.age_days <=
+      NEW_TOKEN_MAX_AGE_DAYS
   ) {
     if (
       liquidity <
@@ -1156,24 +1672,33 @@ function scoreCandidate(
     );
 
   return {
-    score: round(
-      momentum +
-      setup +
-      historical -
-      risk -
-      newTokenPenalty,
-      2
-    ),
+    score:
+      round(
+        momentum +
+        setup +
+        historical -
+        risk -
+        newTokenPenalty,
+        2
+      ),
+
     momentum_score:
       round(momentum, 2),
+
     setup_score:
       round(setup, 2),
+
     historical_bonus:
       round(historical, 2),
+
     risk_penalty:
       round(risk, 2),
+
     new_token_penalty:
-      round(newTokenPenalty, 2)
+      round(
+        newTokenPenalty,
+        2
+      )
   };
 }
 
@@ -1188,47 +1713,80 @@ function evaluateCandidate(
   const reasons = [];
 
   if (!candidate?.mint) {
-    reasons.push("MISSING_MINT");
+    reasons.push(
+      "MISSING_MINT"
+    );
   }
 
   if (
-    safeNumber(candidate.price_usd) <
+    safeNumber(
+      candidate.price_usd
+    ) <
     MIN_TOKEN_PRICE
   ) {
-    reasons.push("PRICE_TOO_LOW");
+    reasons.push(
+      "PRICE_TOO_LOW"
+    );
   }
 
-  if (!candidate.liquidity_data_available) {
-    reasons.push("LIQUIDITY_DATA_UNAVAILABLE");
+  if (
+    !candidate.liquidity_data_available
+  ) {
+    reasons.push(
+      "LIQUIDITY_DATA_UNAVAILABLE"
+    );
   } else if (
-    safeNumber(candidate.liquidity_usd) <
+    safeNumber(
+      candidate.liquidity_usd
+    ) <
     MIN_LIQUIDITY_USD
   ) {
-    reasons.push("LIQUIDITY_TOO_LOW");
+    reasons.push(
+      "LIQUIDITY_TOO_LOW"
+    );
   }
 
-  if (!candidate.volume_24h_data_available) {
-    reasons.push("VOLUME_24H_DATA_UNAVAILABLE");
+  if (
+    !candidate.volume_24h_data_available
+  ) {
+    reasons.push(
+      "VOLUME_24H_DATA_UNAVAILABLE"
+    );
   } else if (
-    safeNumber(candidate.volume_24h_usd) <
+    safeNumber(
+      candidate.volume_24h_usd
+    ) <
     MIN_VOLUME_24H_USD
   ) {
-    reasons.push("VOLUME_24H_TOO_LOW");
+    reasons.push(
+      "VOLUME_24H_TOO_LOW"
+    );
   }
 
-  if (!candidate.volume_1h_data_available) {
-    reasons.push("VOLUME_1H_DATA_UNAVAILABLE");
+  if (
+    !candidate.volume_1h_data_available
+  ) {
+    reasons.push(
+      "VOLUME_1H_DATA_UNAVAILABLE"
+    );
   } else if (
-    safeNumber(candidate.volume_1h_usd) <
+    safeNumber(
+      candidate.volume_1h_usd
+    ) <
     MIN_VOLUME_1H_USD
   ) {
-    reasons.push("VOLUME_1H_TOO_LOW");
+    reasons.push(
+      "VOLUME_1H_TOO_LOW"
+    );
   }
 
   if (
     candidate.age_days !== null &&
-    candidate.age_days <= NEW_TOKEN_MAX_AGE_DAYS &&
-    safeNumber(candidate.liquidity_usd) <
+    candidate.age_days <=
+      NEW_TOKEN_MAX_AGE_DAYS &&
+    safeNumber(
+      candidate.liquidity_usd
+    ) <
       NEW_TOKEN_MIN_LIQUIDITY_USD
   ) {
     reasons.push(
@@ -1237,48 +1795,72 @@ function evaluateCandidate(
   }
 
   if (
-    safeNumber(candidate.change_5m) >
+    safeNumber(
+      candidate.change_5m
+    ) >
     MAX_5M_GAIN
   ) {
-    reasons.push("CHASE_5M");
-  }
-
-  if (
-    safeNumber(candidate.change_1h) >
-    MAX_1H_GAIN
-  ) {
-    reasons.push("CHASE_1H");
-  }
-
-  if (
-    safeNumber(candidate.change_6h) >
-    MAX_6H_GAIN
-  ) {
-    reasons.push("CHASE_6H");
-  }
-
-  if (
-    safeNumber(candidate.change_24h) >
-    MAX_24H_GAIN
-  ) {
-    reasons.push("CHASE_24H");
+    reasons.push(
+      "CHASE_5M"
+    );
   }
 
   if (
     safeNumber(
-      portfolio.cooldowns?.[candidate.mint]
-    ) > Date.now()
+      candidate.change_1h
+    ) >
+    MAX_1H_GAIN
   ) {
-    reasons.push("COOLDOWN");
+    reasons.push(
+      "CHASE_1H"
+    );
+  }
+
+  if (
+    safeNumber(
+      candidate.change_6h
+    ) >
+    MAX_6H_GAIN
+  ) {
+    reasons.push(
+      "CHASE_6H"
+    );
+  }
+
+  if (
+    safeNumber(
+      candidate.change_24h
+    ) >
+    MAX_24H_GAIN
+  ) {
+    reasons.push(
+      "CHASE_24H"
+    );
+  }
+
+  if (
+    safeNumber(
+      portfolio.cooldowns?.[
+        candidate.mint
+      ]
+    ) >
+    Date.now()
+  ) {
+    reasons.push(
+      "COOLDOWN"
+    );
   }
 
   if (
     portfolio.positions.some(
       position =>
-        position.mint === candidate.mint
+        position.mint ===
+        candidate.mint
     )
   ) {
-    reasons.push("ALREADY_HELD");
+    reasons.push(
+      "ALREADY_HELD"
+    );
   }
 
   return reasons;
@@ -1292,35 +1874,43 @@ function getEligibleCandidates(
   portfolio,
   candidates
 ) {
-  return candidates.filter(candidate => {
-    if (
-      safeNumber(candidate.score) <
-      MIN_ENTRY_SCORE
-    ) {
-      return false;
-    }
+  return candidates.filter(
+    candidate => {
+      if (
+        safeNumber(
+          candidate.score
+        ) <
+        MIN_ENTRY_SCORE
+      ) {
+        return false;
+      }
 
-    if (
-      safeNumber(candidate.momentum_score) <
-      MIN_MOMENTUM_SCORE
-    ) {
-      return false;
-    }
+      if (
+        safeNumber(
+          candidate.momentum_score
+        ) <
+        MIN_MOMENTUM_SCORE
+      ) {
+        return false;
+      }
 
-    if (
-      safeNumber(candidate.setup_score) <
-      MIN_SETUP_SCORE
-    ) {
-      return false;
-    }
+      if (
+        safeNumber(
+          candidate.setup_score
+        ) <
+        MIN_SETUP_SCORE
+      ) {
+        return false;
+      }
 
-    return (
-      evaluateCandidate(
-        portfolio,
-        candidate
-      ).length === 0
-    );
-  });
+      return (
+        evaluateCandidate(
+          portfolio,
+          candidate
+        ).length === 0
+      );
+    }
+  );
 }
 
 /* ============================================================
@@ -1332,18 +1922,29 @@ function calculateEquity(
   candidateMap
 ) {
   let equity =
-    safeNumber(portfolio.cash_usd);
+    safeNumber(
+      portfolio.cash_usd
+    );
 
   for (
-    const position of portfolio.positions
+    const position of
+    portfolio.positions
   ) {
     const candidate =
-      candidateMap.get(position.mint);
+      candidateMap.get(
+        position.mint
+      );
 
     equity += candidate
-      ? safeNumber(position.quantity) *
-        safeNumber(candidate.price_usd)
-      : safeNumber(position.cost_usd);
+      ? safeNumber(
+          position.quantity
+        ) *
+        safeNumber(
+          candidate.price_usd
+        )
+      : safeNumber(
+          position.cost_usd
+        );
   }
 
   return equity;
@@ -1359,20 +1960,32 @@ function setCooldown(
 ) {
   portfolio.cooldowns[mint] =
     Date.now() +
-    COOLDOWN_SECONDS * 1000;
+    COOLDOWN_SECONDS *
+      1000;
 }
 
-function cleanupCooldowns(portfolio) {
-  const now = Date.now();
+function cleanupCooldowns(
+  portfolio
+) {
+  const now =
+    Date.now();
 
   for (
-    const [mint, until] of
-    Object.entries(
-      portfolio.cooldowns || {}
+    const [
+      mint,
+      until
+    ] of Object.entries(
+      portfolio.cooldowns ||
+        {}
     )
   ) {
-    if (safeNumber(until) <= now) {
-      delete portfolio.cooldowns[mint];
+    if (
+      safeNumber(until) <=
+      now
+    ) {
+      delete portfolio.cooldowns[
+        mint
+      ];
     }
   }
 }
@@ -1386,19 +1999,30 @@ function getSellReason(
   candidate
 ) {
   const entry =
-    safeNumber(position.entry_price_usd);
+    safeNumber(
+      position.entry_price_usd
+    );
 
   const current =
-    safeNumber(candidate.price_usd);
+    safeNumber(
+      candidate.price_usd
+    );
 
-  if (entry <= 0 || current <= 0) {
+  if (
+    entry <= 0 ||
+    current <= 0
+  ) {
     return null;
   }
 
   const pnlRatio =
-    (current - entry) / entry;
+    (current - entry) /
+    entry;
 
-  if (pnlRatio <= STOP_LOSS) {
+  if (
+    pnlRatio <=
+    STOP_LOSS
+  ) {
     return "STOP_LOSS";
   }
 
@@ -1409,15 +2033,19 @@ function getSellReason(
       entry
     )
   ) {
-    position.peak_price_usd = current;
+    position.peak_price_usd =
+      current;
   }
 
   if (
     !position.trailing_active &&
     current >=
-      entry * (1 + TRAILING_ACTIVATION)
+      entry *
+        (1 +
+          TRAILING_ACTIVATION)
   ) {
-    position.trailing_active = true;
+    position.trailing_active =
+      true;
   }
 
   if (
@@ -1427,21 +2055,30 @@ function getSellReason(
         position.peak_price_usd,
         current
       ) *
-      (1 - TRAILING_STOP)
+        (1 -
+          TRAILING_STOP)
   ) {
     return "TRAILING_STOP";
   }
 
   const shortTerm =
-    safeNumber(candidate.change_5m);
+    safeNumber(
+      candidate.change_5m
+    );
 
   const hourly =
-    safeNumber(candidate.change_1h);
+    safeNumber(
+      candidate.change_1h
+    );
 
   if (
     pnlRatio > 0 &&
     shortTerm <=
-      -(1 - 1 / SHORT_TERM_SELL_RATIO)
+      -(
+        1 -
+        1 /
+          SHORT_TERM_SELL_RATIO
+      )
   ) {
     position.reversal_confirmations =
       safeNumber(
@@ -1450,14 +2087,19 @@ function getSellReason(
   } else if (
     pnlRatio > 0 &&
     hourly <=
-      -(1 - 1 / HOURLY_SELL_RATIO)
+      -(
+        1 -
+        1 /
+          HOURLY_SELL_RATIO
+      )
   ) {
     position.reversal_confirmations =
       safeNumber(
         position.reversal_confirmations
       ) + 1;
   } else {
-    position.reversal_confirmations = 0;
+    position.reversal_confirmations =
+      0;
   }
 
   if (
@@ -1468,7 +2110,9 @@ function getSellReason(
     return "REVERSAL";
   }
 
-  if (pnlRatio >= 0.025) {
+  if (
+    pnlRatio >= 0.025
+  ) {
     return "PROFIT_TARGET";
   }
 
@@ -1490,20 +2134,30 @@ const BASE58_ALPHABET =
   "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 function base58Decode(value) {
-  const input = String(value || "").trim();
+  const input =
+    String(value || "")
+      .trim();
 
   if (!input) {
-    throw new Error("EMPTY_BASE58_VALUE");
+    throw new Error(
+      "EMPTY_BASE58_VALUE"
+    );
   }
 
   const digits =
-    new Uint8Array(input.length);
+    new Uint8Array(
+      input.length
+    );
 
   let digitLength = 1;
 
-  for (const char of input) {
+  for (
+    const char of input
+  ) {
     const index =
-      BASE58_ALPHABET.indexOf(char);
+      BASE58_ALPHABET.indexOf(
+        char
+      );
 
     if (index < 0) {
       throw new Error(
@@ -1519,7 +2173,9 @@ function base58Decode(value) {
       i++
     ) {
       const value =
-        digits[i] * 58 + carry;
+        digits[i] *
+          58 +
+        carry;
 
       digits[i] =
         value & 0xff;
@@ -1528,7 +2184,9 @@ function base58Decode(value) {
         value >> 8;
     }
 
-    while (carry > 0) {
+    while (
+      carry > 0
+    ) {
       digits[digitLength++] =
         carry & 0xff;
 
@@ -1539,15 +2197,19 @@ function base58Decode(value) {
   let leadingZeros = 0;
 
   while (
-    leadingZeros < input.length &&
-    input[leadingZeros] === "1"
+    leadingZeros <
+      input.length &&
+    input[
+      leadingZeros
+    ] === "1"
   ) {
     leadingZeros++;
   }
 
   const result =
     new Uint8Array(
-      leadingZeros + digitLength
+      leadingZeros +
+        digitLength
     );
 
   for (
@@ -1556,22 +2218,32 @@ function base58Decode(value) {
     i++
   ) {
     result[
-      result.length - 1 - i
+      result.length -
+        1 -
+        i
     ] = digits[i];
   }
 
   return result;
 }
 
-function base58Encode(bytes) {
-  if (!bytes?.length) return "";
+function base58Encode(
+  bytes
+) {
+  if (!bytes?.length) {
+    return "";
+  }
 
   const digits =
-    new Uint8Array(bytes.length * 2);
+    new Uint8Array(
+      bytes.length * 2
+    );
 
   let digitLength = 1;
 
-  for (const byte of bytes) {
+  for (
+    const byte of bytes
+  ) {
     let carry = byte;
 
     for (
@@ -1580,21 +2252,29 @@ function base58Encode(bytes) {
       i++
     ) {
       const value =
-        digits[i] * 256 + carry;
+        digits[i] *
+          256 +
+        carry;
 
       digits[i] =
         value % 58;
 
       carry =
-        Math.floor(value / 58);
+        Math.floor(
+          value / 58
+        );
     }
 
-    while (carry > 0) {
+    while (
+      carry > 0
+    ) {
       digits[digitLength++] =
         carry % 58;
 
       carry =
-        Math.floor(carry / 58);
+        Math.floor(
+          carry / 58
+        );
     }
   }
 
@@ -1610,12 +2290,15 @@ function base58Encode(bytes) {
   }
 
   for (
-    let i = digitLength - 1;
+    let i =
+      digitLength - 1;
     i >= 0;
     i--
   ) {
     result +=
-      BASE58_ALPHABET[digits[i]];
+      BASE58_ALPHABET[
+        digits[i]
+      ];
   }
 
   return result;
@@ -1625,7 +2308,9 @@ function base58Encode(bytes) {
 BASE64
 ============================================================ */
 
-function bytesToBase64(bytes) {
+function bytesToBase64(
+  bytes
+) {
   let binary = "";
 
   for (
@@ -1633,25 +2318,31 @@ function bytesToBase64(bytes) {
     i < bytes.length;
     i += 0x8000
   ) {
-    binary += String.fromCharCode(
-      ...bytes.subarray(
-        i,
-        Math.min(
-          i + 0x8000,
-          bytes.length
+    binary +=
+      String.fromCharCode(
+        ...bytes.subarray(
+          i,
+          Math.min(
+            i + 0x8000,
+            bytes.length
+          )
         )
-      )
-    );
+      );
   }
 
   return btoa(binary);
 }
 
-function base64ToBytes(value) {
-  const binary = atob(value);
+function base64ToBytes(
+  value
+) {
+  const binary =
+    atob(value);
 
   const bytes =
-    new Uint8Array(binary.length);
+    new Uint8Array(
+      binary.length
+    );
 
   for (
     let i = 0;
@@ -1669,30 +2360,41 @@ function base64ToBytes(value) {
 WALLET
 ============================================================ */
 
-function requireLiveConfig(env) {
-  if (!TRANSACTION_EXECUTION) {
+function requireLiveConfig(
+  env
+) {
+  if (
+    !TRANSACTION_EXECUTION
+  ) {
     throw new Error(
       "LIVE_TRANSACTION_EXECUTION_DISABLED"
     );
   }
 
-  if (!env.SOLANA_RPC_URL) {
+  if (
+    !env.SOLANA_RPC_URL
+  ) {
     throw new Error(
       "MISSING_SOLANA_RPC_URL"
     );
   }
 
-  if (!env.WALLET_PRIVATE_KEY) {
+  if (
+    !env.WALLET_PRIVATE_KEY
+  ) {
     throw new Error(
       "MISSING_WALLET_PRIVATE_KEY"
     );
   }
 }
 
-function parseWalletSecret(env) {
+function parseWalletSecret(
+  env
+) {
   const raw =
     String(
-      env.WALLET_PRIVATE_KEY || ""
+      env.WALLET_PRIVATE_KEY ||
+        ""
     ).trim();
 
   if (!raw) {
@@ -1703,11 +2405,14 @@ function parseWalletSecret(env) {
 
   let bytes;
 
-  if (raw.startsWith("[")) {
+  if (
+    raw.startsWith("[")
+  ) {
     let parsed;
 
     try {
-      parsed = JSON.parse(raw);
+      parsed =
+        JSON.parse(raw);
     } catch {
       throw new Error(
         "INVALID_WALLET_JSON"
@@ -1715,7 +2420,9 @@ function parseWalletSecret(env) {
     }
 
     if (
-      !Array.isArray(parsed) ||
+      !Array.isArray(
+        parsed
+      ) ||
       parsed.length !== 64
     ) {
       throw new Error(
@@ -1729,7 +2436,9 @@ function parseWalletSecret(env) {
     if (
       normalized.some(
         value =>
-          !Number.isInteger(value) ||
+          !Number.isInteger(
+            value
+          ) ||
           value < 0 ||
           value > 255
       )
@@ -1740,13 +2449,20 @@ function parseWalletSecret(env) {
     }
 
     bytes =
-      new Uint8Array(normalized);
+      new Uint8Array(
+        normalized
+      );
   } else if (
-    /^[0-9a-fA-F]+$/.test(raw) &&
-    raw.length % 2 === 0
+    /^[0-9a-fA-F]+$/.test(
+      raw
+    ) &&
+    raw.length % 2 ===
+      0
   ) {
     bytes =
-      new Uint8Array(raw.length / 2);
+      new Uint8Array(
+        raw.length / 2
+      );
 
     for (
       let i = 0;
@@ -1763,10 +2479,13 @@ function parseWalletSecret(env) {
         );
     }
   } else {
-    bytes = base58Decode(raw);
+    bytes =
+      base58Decode(raw);
   }
 
-  if (bytes.length !== 64) {
+  if (
+    bytes.length !== 64
+  ) {
     throw new Error(
       `WALLET_SECRET_MUST_BE_64_BYTES_GOT_${bytes.length}`
     );
@@ -1788,24 +2507,34 @@ function readCompactU16(
   let index = offset;
 
   while (true) {
-    if (index >= bytes.length) {
+    if (
+      index >=
+      bytes.length
+    ) {
       throw new Error(
         "SHORTVEC_OUT_OF_RANGE"
       );
     }
 
-    const byte = bytes[index++];
+    const byte =
+      bytes[index++];
 
     value |=
-      (byte & 0x7f) << shift;
+      (byte & 0x7f) <<
+      shift;
 
-    if ((byte & 0x80) === 0) {
+    if (
+      (byte & 0x80) ===
+      0
+    ) {
       break;
     }
 
     shift += 7;
 
-    if (shift > 28) {
+    if (
+      shift > 28
+    ) {
       throw new Error(
         "SHORTVEC_TOO_LARGE"
       );
@@ -1833,7 +2562,10 @@ async function signSolanaTransaction(
       0
     );
 
-  if (signatureHeader.value !== 1) {
+  if (
+    signatureHeader.value !==
+    1
+  ) {
     throw new Error(
       `EXPECTED_ONE_REQUIRED_SIGNER_GOT_${signatureHeader.value}`
     );
@@ -1855,14 +2587,18 @@ async function signSolanaTransaction(
   }
 
   const message =
-    transaction.slice(messageStart);
+    transaction.slice(
+      messageStart
+    );
 
   const versioned =
-    (message[0] & 0x80) !== 0;
+    (message[0] & 0x80) !==
+    0;
 
   if (
     versioned &&
-    (message[0] & 0x7f) !== 0
+    (message[0] & 0x7f) !==
+      0
   ) {
     throw new Error(
       "UNSUPPORTED_SOLANA_TRANSACTION_VERSION"
@@ -1875,7 +2611,11 @@ async function signSolanaTransaction(
   const accountCountOffset =
     versioned ? 4 : 3;
 
-  if (message[headerOffset] !== 1) {
+  if (
+    message[
+      headerOffset
+    ] !== 1
+  ) {
     throw new Error(
       "EXPECTED_ONE_MESSAGE_SIGNER"
     );
@@ -1887,7 +2627,9 @@ async function signSolanaTransaction(
       accountCountOffset
     );
 
-  if (accountCount.value < 1) {
+  if (
+    accountCount.value < 1
+  ) {
     throw new Error(
       "NO_SOLANA_ACCOUNT_KEYS"
     );
@@ -1898,7 +2640,8 @@ async function signSolanaTransaction(
 
   if (
     accountStart +
-      accountCount.value * 32 >
+      accountCount.value *
+        32 >
     message.length
   ) {
     throw new Error(
@@ -1913,11 +2656,18 @@ async function signSolanaTransaction(
     );
 
   const walletPublicKey =
-    walletSecret.slice(32, 64);
+    walletSecret.slice(
+      32,
+      64
+    );
 
   if (
-    base58Encode(feePayer) !==
-    base58Encode(walletPublicKey)
+    base58Encode(
+      feePayer
+    ) !==
+    base58Encode(
+      walletPublicKey
+    )
   ) {
     throw new Error(
       "TRANSACTION_FEE_PAYER_DOES_NOT_MATCH_CONFIGURED_WALLET"
@@ -1925,7 +2675,10 @@ async function signSolanaTransaction(
   }
 
   const seed =
-    walletSecret.slice(0, 32);
+    walletSecret.slice(
+      0,
+      32
+    );
 
   const pkcs8Prefix =
     new Uint8Array([
@@ -1941,17 +2694,25 @@ async function signSolanaTransaction(
   const pkcs8 =
     new Uint8Array(
       pkcs8Prefix.length +
-      seed.length
+        seed.length
     );
 
-  pkcs8.set(pkcs8Prefix);
-  pkcs8.set(seed, pkcs8Prefix.length);
+  pkcs8.set(
+    pkcs8Prefix
+  );
+
+  pkcs8.set(
+    seed,
+    pkcs8Prefix.length
+  );
 
   const privateKey =
     await crypto.subtle.importKey(
       "pkcs8",
       pkcs8,
-      { name: "Ed25519" },
+      {
+        name: "Ed25519"
+      },
       false,
       ["sign"]
     );
@@ -1965,21 +2726,27 @@ async function signSolanaTransaction(
       )
     );
 
-  if (signature.length !== 64) {
+  if (
+    signature.length !== 64
+  ) {
     throw new Error(
       "INVALID_ED25519_SIGNATURE_LENGTH"
     );
   }
 
   const signed =
-    new Uint8Array(transaction);
+    new Uint8Array(
+      transaction
+    );
 
   signed.set(
     signature,
     signaturesStart
   );
 
-  return bytesToBase64(signed);
+  return bytesToBase64(
+    signed
+  );
 }
 
 /* ============================================================
@@ -2002,12 +2769,13 @@ async function solanaRpc(
           accept:
             "application/json"
         },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method,
-          params
-        })
+        body:
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method,
+            params
+          })
       }
     );
 
@@ -2031,14 +2799,19 @@ async function solanaRpc(
   return data.result;
 }
 
-async function getLiveWalletPublicKey(env) {
+async function getLiveWalletPublicKey(
+  env
+) {
   requireLiveConfig(env);
 
   const secret =
     parseWalletSecret(env);
 
   return base58Encode(
-    secret.slice(32, 64)
+    secret.slice(
+      32,
+      64
+    )
   );
 }
 
@@ -2085,16 +2858,23 @@ async function jupiterHeaders(
   json = false
 ) {
   const headers = {
-    accept: "application/json"
+    accept:
+      "application/json"
   };
 
   if (json) {
-    headers["content-type"] =
+    headers[
+      "content-type"
+    ] =
       "application/json";
   }
 
-  if (env.JUPITER_API_KEY) {
-    headers["x-api-key"] =
+  if (
+    env.JUPITER_API_KEY
+  ) {
+    headers[
+      "x-api-key"
+    ] =
       env.JUPITER_API_KEY;
   }
 
@@ -2108,7 +2888,9 @@ async function jupiterQuote(
   amount
 ) {
   const url =
-    new URL(JUPITER_QUOTE_API);
+    new URL(
+      JUPITER_QUOTE_API
+    );
 
   url.searchParams.set(
     "inputMint",
@@ -2135,11 +2917,15 @@ async function jupiterQuote(
       url.toString(),
       {
         headers:
-          await jupiterHeaders(env)
+          await jupiterHeaders(
+            env
+          )
       }
     );
 
-  if (!quote?.outAmount) {
+  if (
+    !quote?.outAmount
+  ) {
     throw new Error(
       "JUPITER_QUOTE_MISSING_OUT_AMOUNT"
     );
@@ -2163,13 +2949,17 @@ async function jupiterSwapTransaction(
             env,
             true
           ),
-        body: JSON.stringify({
-          quoteResponse,
-          userPublicKey,
-          wrapAndUnwrapSol: true,
-          dynamicComputeUnitLimit: true,
-          prioritizationFeeLamports: "auto"
-        })
+        body:
+          JSON.stringify({
+            quoteResponse,
+            userPublicKey,
+            wrapAndUnwrapSol:
+              true,
+            dynamicComputeUnitLimit:
+              true,
+            prioritizationFeeLamports:
+              "auto"
+          })
       }
     );
 
@@ -2177,23 +2967,29 @@ async function jupiterSwapTransaction(
     let body = "";
 
     try {
-      body = await response.text();
+      body =
+        await response.text();
     } catch {}
 
     throw new Error(
       `JUPITER_SWAP_HTTP_${response.status}` +
-      (
-        body
-          ? `:${body.slice(0, 500)}`
-          : ""
-      )
+        (
+          body
+            ? `:${body.slice(
+                0,
+                500
+              )}`
+            : ""
+        )
     );
   }
 
   const data =
     await response.json();
 
-  if (!data?.swapTransaction) {
+  if (
+    !data?.swapTransaction
+  ) {
     throw new Error(
       "JUPITER_SWAP_TRANSACTION_MISSING"
     );
@@ -2211,13 +3007,19 @@ async function broadcastAndConfirm(
   serializedTransaction
 ) {
   const walletSecret =
-    parseWalletSecret(env);
+    parseWalletSecret(
+      env
+    );
 
   const signed =
     await signSolanaTransaction(
       serializedTransaction,
       walletSecret
     );
+
+  logEvent(
+    "TRANSACTION_SIGNED"
+  );
 
   const signature =
     await solanaRpc(
@@ -2226,9 +3028,12 @@ async function broadcastAndConfirm(
       [
         signed,
         {
-          encoding: "base64",
-          skipPreflight: false,
-          preflightCommitment: "confirmed",
+          encoding:
+            "base64",
+          skipPreflight:
+            false,
+          preflightCommitment:
+            "confirmed",
           maxRetries: 2
         }
       ]
@@ -2240,10 +3045,19 @@ async function broadcastAndConfirm(
     );
   }
 
-  const deadline =
-    Date.now() + 45000;
+  logEvent(
+    "TRANSACTION_BROADCAST",
+    {
+      signature
+    }
+  );
 
-  while (Date.now() < deadline) {
+  for (
+    let poll = 1;
+    poll <=
+      MAX_CONFIRMATION_POLLS;
+    poll++
+  ) {
     const result =
       await solanaRpc(
         env,
@@ -2251,15 +3065,32 @@ async function broadcastAndConfirm(
         [
           [signature],
           {
-            searchTransactionHistory: true
+            searchTransactionHistory:
+              true
           }
         ]
       );
 
     const status =
-      result?.value?.[0] || null;
+      result?.value?.[0] ||
+      null;
 
-    if (status?.err) {
+    logEvent(
+      "TRANSACTION_STATUS",
+      {
+        signature,
+        poll,
+        confirmation_status:
+          status?.confirmationStatus ||
+          null,
+        has_error:
+          !!status?.err
+      }
+    );
+
+    if (
+      status?.err
+    ) {
       throw new Error(
         `LIVE_TRANSACTION_FAILED:${JSON.stringify(
           status.err
@@ -2279,9 +3110,18 @@ async function broadcastAndConfirm(
       };
     }
 
-    await new Promise(resolve =>
-      setTimeout(resolve, 1000)
-    );
+    if (
+      poll <
+      MAX_CONFIRMATION_POLLS
+    ) {
+      await new Promise(
+        resolve =>
+          setTimeout(
+            resolve,
+            CONFIRMATION_POLL_INTERVAL_MS
+          )
+      );
+    }
   }
 
   throw new Error(
@@ -2300,12 +3140,22 @@ async function executeLiveSwap(
 
   if (
     !amount ||
-    String(amount) === "0"
+    String(amount) ===
+      "0"
   ) {
     throw new Error(
       "INVALID_LIVE_SWAP_AMOUNT"
     );
   }
+
+  logEvent(
+    "JUPITER_QUOTE_START",
+    {
+      inputMint,
+      outputMint,
+      amount: String(amount)
+    }
+  );
 
   const quote =
     await jupiterQuote(
@@ -2315,12 +3165,25 @@ async function executeLiveSwap(
       amount
     );
 
+  logEvent(
+    "JUPITER_QUOTE_OK",
+    {
+      inputMint,
+      outputMint,
+      amount: String(amount)
+    }
+  );
+
   const swap =
     await jupiterSwapTransaction(
       env,
       quote,
       walletPublicKey
     );
+
+  logEvent(
+    "JUPITER_SWAP_TRANSACTION_OK"
+  );
 
   const confirmation =
     await broadcastAndConfirm(
@@ -2389,18 +3252,6 @@ async function liveBuy(
   }
 
   if (
-    calculateEquity(
-      portfolio,
-      new Map()
-    ) >
-    MAX_LIVE_BANKROLL_USD
-  ) {
-    throw new Error(
-      "LIVE_BANKROLL_LIMIT_EXCEEDED"
-    );
-  }
-
-  if (
     portfolio.cash_usd -
       amountUsd <
     MIN_CASH_RESERVE_USD
@@ -2410,23 +3261,42 @@ async function liveBuy(
     );
   }
 
+  logEvent(
+    "LIVE_BUY_START",
+    {
+      mint:
+        candidate.mint,
+      symbol:
+        candidate.symbol,
+      amount_usd:
+        amountUsd
+    }
+  );
+
   const solPrice =
     await getSolUsdPrice();
 
   const lamports =
     Math.floor(
-      (amountUsd / solPrice) *
-      1_000_000_000
+      (
+        amountUsd /
+        solPrice
+      ) *
+        1_000_000_000
     );
 
-  if (lamports <= 0) {
+  if (
+    lamports <= 0
+  ) {
     throw new Error(
       "LIVE_BUY_LAMPORT_AMOUNT_TOO_SMALL"
     );
   }
 
   const walletPublicKey =
-    await getLiveWalletPublicKey(env);
+    await getLiveWalletPublicKey(
+      env
+    );
 
   const balance =
     await solanaRpc(
@@ -2435,7 +3305,8 @@ async function liveBuy(
       [
         walletPublicKey,
         {
-          commitment: "confirmed"
+          commitment:
+            "confirmed"
         }
       ]
     );
@@ -2443,12 +3314,15 @@ async function liveBuy(
   const reserveLamports =
     Math.floor(
       MIN_SOL_RESERVE *
-      1_000_000_000
+        1_000_000_000
     );
 
   if (
-    safeNumber(balance?.value) <
-    lamports + reserveLamports
+    safeNumber(
+      balance?.value
+    ) <
+    lamports +
+      reserveLamports
   ) {
     throw new Error(
       "INSUFFICIENT_ONCHAIN_SOL_RESERVE"
@@ -2465,61 +3339,98 @@ async function liveBuy(
     );
 
   const quantityRaw =
-    String(result.quote.outAmount);
+    String(
+      result.quote.outAmount
+    );
 
   const price =
-    safeNumber(candidate.price_usd);
+    safeNumber(
+      candidate.price_usd
+    );
 
-  if (price <= 0) {
+  if (
+    price <= 0
+  ) {
     throw new Error(
       "INVALID_CANDIDATE_PRICE"
     );
   }
 
   const quantity =
-    amountUsd / price;
+    amountUsd /
+    price;
 
   portfolio.cash_usd =
     clamp(
-      portfolio.cash_usd - amountUsd,
+      portfolio.cash_usd -
+        amountUsd,
       0,
       MAX_LIVE_BANKROLL_USD
     );
 
   const position = {
-    mint: candidate.mint,
-    symbol: candidate.symbol || null,
-    name: candidate.name || null,
-    entry_price_usd: price,
+    mint:
+      candidate.mint,
+    symbol:
+      candidate.symbol ||
+      null,
+    name:
+      candidate.name ||
+      null,
+    entry_price_usd:
+      price,
     quantity,
-    quantity_raw: quantityRaw,
-    cost_usd: amountUsd,
-    peak_price_usd: price,
-    trailing_active: false,
-    reversal_confirmations: 0,
-    opened_at: nowIso(),
-    source: candidate.source || null,
+    quantity_raw:
+      quantityRaw,
+    cost_usd:
+      amountUsd,
+    peak_price_usd:
+      price,
+    trailing_active:
+      false,
+    reversal_confirmations:
+      0,
+    opened_at:
+      nowIso(),
+    source:
+      candidate.source ||
+      null,
     transaction_signature:
       result.signature,
-    input_lamports: lamports
+    input_lamports:
+      lamports
   };
 
-  portfolio.positions.push(position);
+  portfolio.positions.push(
+    position
+  );
 
   addHistory(
     portfolio,
     {
-      type: "BUY",
-      mode: "LIVE",
-      mint: candidate.mint,
-      symbol: candidate.symbol || null,
-      amount_usd: round(amountUsd, 6),
-      price_usd: price,
+      type:
+        "BUY",
+      mode:
+        "LIVE",
+      mint:
+        candidate.mint,
+      symbol:
+        candidate.symbol ||
+        null,
+      amount_usd:
+        round(
+          amountUsd,
+          6
+        ),
+      price_usd:
+        price,
       quantity,
-      quantity_raw: quantityRaw,
+      quantity_raw:
+        quantityRaw,
       transaction_signature:
         result.signature,
-      score: candidate.score
+      score:
+        candidate.score
     }
   );
 
@@ -2532,6 +3443,20 @@ async function liveBuy(
   setCooldown(
     portfolio,
     candidate.mint
+  );
+
+  logEvent(
+    "LIVE_BUY_CONFIRMED",
+    {
+      mint:
+        candidate.mint,
+      symbol:
+        candidate.symbol,
+      signature:
+        result.signature,
+      amount_usd:
+        amountUsd
+    }
   );
 
   return position;
@@ -2552,20 +3477,35 @@ async function liveSell(
 
   const quantityRaw =
     String(
-      position.quantity_raw || ""
+      position.quantity_raw ||
+        ""
     );
 
   if (
     !quantityRaw ||
-    quantityRaw === "0"
+    quantityRaw ===
+      "0"
   ) {
     throw new Error(
       "LIVE_POSITION_MISSING_RAW_TOKEN_AMOUNT"
     );
   }
 
+  logEvent(
+    "LIVE_SELL_START",
+    {
+      mint:
+        position.mint,
+      symbol:
+        position.symbol,
+      reason
+    }
+  );
+
   const walletPublicKey =
-    await getLiveWalletPublicKey(env);
+    await getLiveWalletPublicKey(
+      env
+    );
 
   const accounts =
     await solanaRpc(
@@ -2574,35 +3514,49 @@ async function liveSell(
       [
         walletPublicKey,
         {
-          mint: candidate.mint
+          mint:
+            candidate.mint
         },
         {
-          encoding: "jsonParsed",
-          commitment: "confirmed"
+          encoding:
+            "jsonParsed",
+          commitment:
+            "confirmed"
         }
       ]
     );
 
-  let onChainRaw = 0n;
+  let onChainRaw =
+    0n;
 
   for (
     const account of
-    accounts?.value || []
+    accounts?.value ||
+      []
   ) {
     const amount =
-      account?.account?.data
+      account?.account
+        ?.data
         ?.parsed
         ?.info
         ?.tokenAmount
         ?.amount;
 
-    if (amount !== undefined) {
+    if (
+      amount !==
+      undefined
+    ) {
       onChainRaw +=
-        BigInt(String(amount));
+        BigInt(
+          String(amount)
+        );
     }
   }
 
-  if (onChainRaw <= 0n) {
+  if (
+    onChainRaw <=
+    0n
+  ) {
     throw new Error(
       "LIVE_TOKEN_BALANCE_NOT_FOUND"
     );
@@ -2612,7 +3566,9 @@ async function liveSell(
 
   try {
     requestedRaw =
-      BigInt(quantityRaw);
+      BigInt(
+        quantityRaw
+      );
   } catch {
     throw new Error(
       "INVALID_STORED_TOKEN_AMOUNT"
@@ -2620,11 +3576,15 @@ async function liveSell(
   }
 
   const sellRaw =
-    requestedRaw <= onChainRaw
+    requestedRaw <=
+    onChainRaw
       ? requestedRaw
       : onChainRaw;
 
-  if (sellRaw <= 0n) {
+  if (
+    sellRaw <=
+    0n
+  ) {
     throw new Error(
       "LIVE_SELL_AMOUNT_TOO_SMALL"
     );
@@ -2644,7 +3604,10 @@ async function liveSell(
       result.quote.outAmount
     );
 
-  if (solOutLamports <= 0) {
+  if (
+    solOutLamports <=
+    0
+  ) {
     throw new Error(
       "LIVE_SELL_RETURNED_ZERO_SOL"
     );
@@ -2654,51 +3617,77 @@ async function liveSell(
     await getSolUsdPrice();
 
   const proceeds =
-    (solOutLamports / 1_000_000_000) *
+    (
+      solOutLamports /
+      1_000_000_000
+    ) *
     solPrice;
 
   const soldFraction =
     requestedRaw > 0n
-      ? Number(sellRaw) /
-        Number(requestedRaw)
+      ? Number(
+          sellRaw
+        ) /
+        Number(
+          requestedRaw
+        )
       : 1;
 
   const adjustedCost =
-    safeNumber(position.cost_usd) *
-    clamp(soldFraction, 0, 1);
+    safeNumber(
+      position.cost_usd
+    ) *
+    clamp(
+      soldFraction,
+      0,
+      1
+    );
 
   const pnl =
-    proceeds - adjustedCost;
+    proceeds -
+    adjustedCost;
 
   portfolio.cash_usd =
     clamp(
-      portfolio.cash_usd + proceeds,
+      portfolio.cash_usd +
+        proceeds,
       0,
       MAX_LIVE_BANKROLL_USD
     );
 
-  portfolio.realized_pnl_usd += pnl;
+  portfolio.realized_pnl_usd +=
+    pnl;
 
   portfolio.positions =
     portfolio.positions.filter(
       item =>
-        item.mint !== position.mint
+        item.mint !==
+        position.mint
     );
 
   addHistory(
     portfolio,
     {
-      type: "SELL",
-      mode: "LIVE",
-      mint: position.mint,
+      type:
+        "SELL",
+      mode:
+        "LIVE",
+      mint:
+        position.mint,
       symbol:
         position.symbol ||
         candidate.symbol ||
         null,
       proceeds_usd:
-        round(proceeds, 6),
+        round(
+          proceeds,
+          6
+        ),
       pnl_usd:
-        round(pnl, 6),
+        round(
+          pnl,
+          6
+        ),
       output_lamports:
         solOutLamports,
       sold_raw_amount:
@@ -2720,10 +3709,32 @@ async function liveSell(
     position.mint
   );
 
+  logEvent(
+    "LIVE_SELL_CONFIRMED",
+    {
+      mint:
+        position.mint,
+      signature:
+        result.signature,
+      proceeds_usd:
+        round(
+          proceeds,
+          6
+        ),
+      pnl_usd:
+        round(
+          pnl,
+          6
+        ),
+      reason
+    }
+  );
+
   return {
     proceeds,
     pnl,
-    signature: result.signature
+    signature:
+      result.signature
   };
 }
 
@@ -2731,18 +3742,33 @@ async function liveSell(
 SCAN
 ============================================================ */
 
-async function runScan(env) {
-  const started = Date.now();
+async function runScan(
+  env,
+  existingPortfolio = null
+) {
+  const started =
+    Date.now();
 
+  logEvent(
+    "SCAN_START"
+  );
+
+  /*
+  The three discovery calls and three search calls are kept
+  sequential within their respective functions. This prevents
+  excessive simultaneous outgoing connections.
+  */
   const [
     dexDiscovery,
     dexSearch
-  ] = await Promise.all([
-    getDexDiscovery(),
-    getDexSearch()
-  ]);
+  ] =
+    await Promise.all([
+      getDexDiscovery(),
+      getDexSearch()
+    ]);
 
-  const sourceMap = new Map();
+  const sourceMap =
+    new Map();
 
   for (
     const item of [
@@ -2752,7 +3778,9 @@ async function runScan(env) {
   ) {
     if (
       item?.mint &&
-      !sourceMap.has(item.mint)
+      !sourceMap.has(
+        item.mint
+      )
     ) {
       sourceMap.set(
         item.mint,
@@ -2761,15 +3789,21 @@ async function runScan(env) {
     }
   }
 
-  const orderedMints = [];
+  const orderedMints =
+    [];
 
   for (
-    const mint of dexSearch.pairMap.keys()
+    const mint of
+    dexSearch.pairMap.keys()
   ) {
     if (
-      !orderedMints.includes(mint)
+      !orderedMints.includes(
+        mint
+      )
     ) {
-      orderedMints.push(mint);
+      orderedMints.push(
+        mint
+      );
     }
 
     if (
@@ -2791,9 +3825,13 @@ async function runScan(env) {
     }
 
     if (
-      !orderedMints.includes(mint)
+      !orderedMints.includes(
+        mint
+      )
     ) {
-      orderedMints.push(mint);
+      orderedMints.push(
+        mint
+      );
     }
   }
 
@@ -2803,21 +3841,48 @@ async function runScan(env) {
       MAX_CANDIDATES
     );
 
+  /*
+  Search results already contain pair objects.
+  Only discovery-only tokens consume hydration requests.
+  */
   const hydrationMints =
-    mints.filter(
-      mint =>
-        !dexSearch.pairMap.has(mint)
-    );
+    mints
+      .filter(
+        mint =>
+          !dexSearch.pairMap.has(
+            mint
+          )
+      )
+      .slice(
+        0,
+        MAX_DEX_TOKENS_ANALYZED
+      );
+
+  /*
+  If the caller already loaded the portfolio, do not issue
+  another KV read during the same invocation.
+  */
+  const portfolioPromise =
+    existingPortfolio
+      ? Promise.resolve(
+          existingPortfolio
+        )
+      : loadPortfolio(env);
 
   const [
     hydrationResult,
     jupiterResult,
     portfolio
-  ] = await Promise.all([
-    hydrateDexPairs(hydrationMints),
-    getJupiterPrices(mints),
-    loadPortfolio(env)
-  ]);
+  ] =
+    await Promise.all([
+      hydrateDexPairs(
+        hydrationMints
+      ),
+      getJupiterPrices(
+        mints
+      ),
+      portfolioPromise
+    ]);
 
   const hydrated =
     hydrationResult.hydrated;
@@ -2825,14 +3890,19 @@ async function runScan(env) {
   const jupiterPrices =
     jupiterResult.prices;
 
-  const candidates = [];
+  const candidates =
+    [];
 
   for (
     const mint of mints
   ) {
     const pair =
-      dexSearch.pairMap.get(mint) ||
-      hydrated.get(mint) ||
+      dexSearch.pairMap.get(
+        mint
+      ) ||
+      hydrated.get(
+        mint
+      ) ||
       null;
 
     const candidate =
@@ -2840,7 +3910,9 @@ async function runScan(env) {
         mint,
         pair,
         jupiterPrices[mint],
-        sourceMap.get(mint) ||
+        sourceMap.get(
+          mint
+        ) ||
           "DEXSCREENER"
       );
 
@@ -2858,13 +3930,19 @@ async function runScan(env) {
         candidate
       );
 
-    candidates.push(candidate);
+    candidates.push(
+      candidate
+    );
   }
 
   candidates.sort(
     (a, b) =>
-      safeNumber(b.score) -
-      safeNumber(a.score)
+      safeNumber(
+        b.score
+      ) -
+      safeNumber(
+        a.score
+      )
   );
 
   const finalCandidates =
@@ -2880,88 +3958,135 @@ async function runScan(env) {
     );
 
   const top =
-    finalCandidates[0] || null;
+    finalCandidates[0] ||
+    null;
 
-  return {
-    candidates: finalCandidates,
+  /*
+  Approximate scanner-only request count:
+    3 discovery
+    3 search
+    hydration count
+    1 Jupiter
+    1 KV read only when portfolio wasn't supplied
+  */
+  const estimatedRequests =
+    3 +
+    3 +
+    hydrationMints.length +
+    1 +
+    (
+      existingPortfolio
+        ? 0
+        : 1
+    );
 
-    diagnostics: {
-      duration_ms:
-        Date.now() - started,
+  const diagnostics = {
+    duration_ms:
+      Date.now() -
+      started,
 
+    dexscreener_discovery:
+      dexDiscovery.results.length,
+
+    dexscreener_discovery_unique:
+      new Set(
+        dexDiscovery.results.map(
+          item =>
+            item.mint
+        )
+      ).size,
+
+    dexscreener_search_pairs:
+      dexSearch.results.length,
+
+    dexscreener_search_unique_mints:
+      dexSearch.pairMap.size,
+
+    dex_hydration_requested:
+      hydrationMints.length,
+
+    dex_hydration:
+      hydrated.size,
+
+    jupiter_prices_requested:
+      mints.length,
+
+    jupiter_prices:
+      Object.keys(
+        jupiterPrices
+      ).length,
+
+    candidate_count:
+      finalCandidates.length,
+
+    eligible_candidate_count:
+      eligible.length,
+
+    top_candidate:
+      top
+        ? {
+            mint:
+              top.mint,
+            symbol:
+              top.symbol,
+            name:
+              top.name,
+            score:
+              top.score,
+            momentum_score:
+              top.momentum_score,
+            setup_score:
+              top.setup_score,
+            filter_reasons:
+              top.filter_reasons
+          }
+        : null,
+
+    estimated_external_requests:
+      estimatedRequests,
+
+    configured_request_budget:
+      MAX_EXTERNAL_REQUEST_BUDGET,
+
+    target_cloudflare_free_limit:
+      50,
+
+    endpoint_diagnostics: {
       dexscreener_discovery:
-        dexDiscovery.results.length,
+        dexDiscovery.diagnostics,
 
-      dexscreener_discovery_unique:
-        new Set(
-          dexDiscovery.results.map(
-            item => item.mint
-          )
-        ).size,
-
-      dexscreener_search_pairs:
-        dexSearch.results.length,
-
-      dexscreener_search_unique_mints:
-        dexSearch.pairMap.size,
-
-      dex_hydration_requested:
-        hydrationMints.length,
+      dexscreener_search:
+        dexSearch.diagnostics,
 
       dex_hydration:
-        hydrated.size,
-
-      jupiter_prices_requested:
-        mints.length,
+        hydrationResult.diagnostics,
 
       jupiter_prices:
-        Object.keys(jupiterPrices).length,
-
-      candidate_count:
-        finalCandidates.length,
-
-      eligible_candidate_count:
-        eligible.length,
-
-      top_candidate:
-        top
-          ? {
-              mint: top.mint,
-              symbol: top.symbol,
-              name: top.name,
-              score: top.score,
-              momentum_score:
-                top.momentum_score,
-              setup_score:
-                top.setup_score,
-              filter_reasons:
-                top.filter_reasons
-            }
-          : null,
-
-      estimated_external_requests:
-        3 +
-        3 +
-        hydrationMints.length +
-        1,
-
-      target_limit:
-        50,
-
-      endpoint_diagnostics: {
-        dexscreener_discovery:
-          dexDiscovery.diagnostics,
-
-        dexscreener_search:
-          dexSearch.diagnostics,
-
-        dex_hydration:
-          hydrationResult.diagnostics,
-
-        jupiter_prices:
-          jupiterResult.diagnostics
-      }
+        jupiterResult.diagnostics
     }
+  };
+
+  logEvent(
+    "SCAN_COMPLETE",
+    {
+      duration_ms:
+        diagnostics.duration_ms,
+      candidates:
+        diagnostics.candidate_count,
+      eligible:
+        diagnostics.eligible_candidate_count,
+      top:
+        diagnostics.top_candidate,
+      estimated_requests:
+        diagnostics.estimated_external_requests
+    }
+  );
+
+  return {
+    candidates:
+      finalCandidates,
+    diagnostics,
+    portfolio
   };
 }
 
@@ -2974,7 +4099,9 @@ async function runLiveEngine(
   portfolio,
   scan
 ) {
-  cleanupCooldowns(portfolio);
+  cleanupCooldowns(
+    portfolio
+  );
 
   const candidateMap =
     new Map(
@@ -2994,13 +4121,19 @@ async function runLiveEngine(
 
   let sells = 0;
 
+  /*
+  Exit logic is preserved.
+  Each confirmed sell immediately persists its new state.
+  */
   for (
     const position of [
       ...portfolio.positions
     ]
   ) {
     const candidate =
-      candidateMap.get(position.mint);
+      candidateMap.get(
+        position.mint
+      );
 
     if (!candidate) {
       continue;
@@ -3041,7 +4174,8 @@ async function runLiveEngine(
     MAX_POSITIONS
   ) {
     for (
-      const candidate of scan.candidates
+      const candidate of
+      scan.candidates
     ) {
       if (
         buys >=
@@ -3051,7 +4185,9 @@ async function runLiveEngine(
       }
 
       if (
-        safeNumber(candidate.score) <
+        safeNumber(
+          candidate.score
+        ) <
         MIN_ENTRY_SCORE
       ) {
         continue;
@@ -3110,7 +4246,8 @@ async function runLiveEngine(
   }
 
   for (
-    const candidate of scan.candidates
+    const candidate of
+    scan.candidates
   ) {
     recordMarketObservation(
       portfolio,
@@ -3129,15 +4266,20 @@ async function runLiveEngine(
       scan.candidates[0]
         ? {
             mint:
-              scan.candidates[0].mint,
+              scan.candidates[0]
+                .mint,
             symbol:
-              scan.candidates[0].symbol,
+              scan.candidates[0]
+                .symbol,
             name:
-              scan.candidates[0].name,
+              scan.candidates[0]
+                .name,
             score:
-              scan.candidates[0].score,
+              scan.candidates[0]
+                .score,
             filter_reasons:
-              scan.candidates[0].filter_reasons
+              scan.candidates[0]
+                .filter_reasons
           }
         : null
   };
@@ -3173,9 +4315,12 @@ function jsonResponse(
 EXECUTION STATUS
 ============================================================ */
 
-function executionStatus(env) {
+function executionStatus(
+  env
+) {
   return {
-    paper_mode: false,
+    paper_mode:
+      false,
 
     live_beta_mode:
       LIVE_BETA_MODE,
@@ -3198,6 +4343,11 @@ function executionStatus(env) {
     scheduled_execution:
       true,
 
+    kv_binding:
+      !!env.BOT_KV
+        ? "BOT_KV"
+        : null,
+
     max_live_trade_usd:
       MAX_LIVE_TRADE_USD,
 
@@ -3207,12 +4357,21 @@ function executionStatus(env) {
     min_sol_reserve:
       MIN_SOL_RESERVE,
 
+    max_confirmation_polls:
+      MAX_CONFIRMATION_POLLS,
+
+    configured_request_budget:
+      MAX_EXTERNAL_REQUEST_BUDGET,
+
     required_secrets: {
       SOLANA_RPC_URL:
         !!env.SOLANA_RPC_URL,
 
       WALLET_PRIVATE_KEY:
-        !!env.WALLET_PRIVATE_KEY
+        !!env.WALLET_PRIVATE_KEY,
+
+      JUPITER_API_KEY:
+        !!env.JUPITER_API_KEY
     }
   };
 }
@@ -3221,15 +4380,19 @@ function executionStatus(env) {
 HEALTH
 ============================================================ */
 
-async function health(env) {
+async function health(
+  env
+) {
   return {
-    ok: true,
+    ok:
+      true,
 
     bot:
       BOT_NAME,
 
     mode: {
-      type: "LIVE",
+      type:
+        "LIVE",
 
       live_beta:
         LIVE_BETA_MODE,
@@ -3245,13 +4408,17 @@ async function health(env) {
       "OK",
 
     scanner_subrequest_protection: {
-      enabled: true,
+      enabled:
+        true,
 
       max_candidates:
         MAX_CANDIDATES,
 
       max_dex_hydration:
         MAX_DEX_TOKENS_ANALYZED,
+
+      max_jupiter_prices:
+        MAX_JUPITER_PRICE_CHECKS,
 
       gecko_hydration:
         false
@@ -3300,6 +4467,17 @@ async function health(env) {
         NEW_TOKEN_MIN_LIQUIDITY_USD
     },
 
+    logging: {
+      console_logging:
+        true,
+
+      persistent_stage_tracking:
+        true,
+
+      persistent_error_tracking:
+        true
+    },
+
     time:
       nowIso()
   };
@@ -3309,18 +4487,24 @@ async function health(env) {
 STATUS
 ============================================================ */
 
-async function status(env) {
+async function status(
+  env
+) {
   const portfolio =
-    await loadPortfolio(env);
+    await loadPortfolio(
+      env
+    );
 
   return {
-    ok: true,
+    ok:
+      true,
 
     bot:
       BOT_NAME,
 
     mode: {
-      type: "LIVE",
+      type:
+        "LIVE",
 
       live_beta:
         LIVE_BETA_MODE,
@@ -3384,14 +4568,18 @@ async function handleRequest(
   env
 ) {
   const url =
-    new URL(request.url);
+    new URL(
+      request.url
+    );
 
   const pathname =
     url.pathname;
 
   if (
-    request.method === "GET" &&
-    pathname === "/health"
+    request.method ===
+      "GET" &&
+    pathname ===
+      "/health"
   ) {
     return jsonResponse(
       await health(env)
@@ -3399,8 +4587,10 @@ async function handleRequest(
   }
 
   if (
-    request.method === "GET" &&
-    pathname === "/status"
+    request.method ===
+      "GET" &&
+    pathname ===
+      "/status"
   ) {
     return jsonResponse(
       await status(env)
@@ -3408,15 +4598,20 @@ async function handleRequest(
   }
 
   if (
-    request.method === "GET" &&
-    pathname === "/scan"
+    request.method ===
+      "GET" &&
+    pathname ===
+      "/scan"
   ) {
     try {
       const scan =
-        await runScan(env);
+        await runScan(
+          env
+        );
 
       return jsonResponse({
-        ok: true,
+        ok:
+          true,
 
         bot:
           BOT_NAME,
@@ -3430,9 +4625,15 @@ async function handleRequest(
         scan
       });
     } catch (error) {
+      logError(
+        "HTTP_SCAN_FAILED",
+        error
+      );
+
       return jsonResponse(
         {
-          ok: false,
+          ok:
+            false,
 
           bot:
             BOT_NAME,
@@ -3448,16 +4649,12 @@ async function handleRequest(
     }
   }
 
-  /*
-  Live trading is intentionally not exposed
-  through unauthenticated HTTP endpoints.
-  Scheduled() is the automatic execution path.
-  */
-
   return jsonResponse(
     {
-      ok: false,
-      error: "NOT_FOUND"
+      ok:
+        false,
+      error:
+        "NOT_FOUND"
     },
     404
   );
@@ -3467,17 +4664,36 @@ async function handleRequest(
 SCHEDULED LIVE RUN
 ============================================================ */
 
-async function scheduledRun(env) {
+async function scheduledRun(
+  env
+) {
   const started =
     Date.now();
 
-  let portfolio = null;
+  let portfolio =
+    null;
+
+  let currentStage =
+    "INITIALIZING";
 
   try {
-    requireLiveConfig(env);
+    logEvent(
+      "SCHEDULED_RUN_START"
+    );
 
+    requireLiveConfig(
+      env
+    );
+
+    /*
+    One KV portfolio load for the entire scheduled run.
+    The scanner reuses this object instead of reading BOT_KV
+    again.
+    */
     portfolio =
-      await loadPortfolio(env);
+      await loadPortfolio(
+        env
+      );
 
     portfolio.runtime.total_scheduled_runs++;
 
@@ -3490,8 +4706,24 @@ async function scheduledRun(env) {
     portfolio.runtime.last_scheduled_error =
       null;
 
+    setStage(
+      portfolio,
+      "SCAN"
+    );
+
+    currentStage =
+      "SCAN";
+
     const scan =
-      await runScan(env);
+      await runScan(
+        env,
+        portfolio
+      );
+
+    completeStage(
+      portfolio,
+      "SCAN"
+    );
 
     const eligible =
       getEligibleCandidates(
@@ -3509,24 +4741,57 @@ async function scheduledRun(env) {
       scan.candidates[0]
         ? {
             mint:
-              scan.candidates[0].mint,
+              scan.candidates[0]
+                .mint,
             symbol:
-              scan.candidates[0].symbol,
+              scan.candidates[0]
+                .symbol,
             name:
-              scan.candidates[0].name,
+              scan.candidates[0]
+                .name,
             score:
-              scan.candidates[0].score,
+              scan.candidates[0]
+                .score,
             momentum_score:
-              scan.candidates[0].momentum_score,
+              scan.candidates[0]
+                .momentum_score,
             setup_score:
-              scan.candidates[0].setup_score,
+              scan.candidates[0]
+                .setup_score,
             filter_reasons:
-              scan.candidates[0].filter_reasons
+              scan.candidates[0]
+                .filter_reasons
           }
         : null;
 
     portfolio.runtime.last_scan_diagnostics =
       scan.diagnostics;
+
+    /*
+    Save diagnostics once before trading.
+    This is intentionally one forced KV write.
+    */
+    try {
+      await savePortfolio(
+        env,
+        portfolio,
+        "SCAN_DIAGNOSTICS",
+        true
+      );
+    } catch (persistError) {
+      logError(
+        "SCAN_DIAGNOSTICS_PERSIST_FAILED",
+        persistError
+      );
+    }
+
+    setStage(
+      portfolio,
+      "LIVE_ENGINE"
+    );
+
+    currentStage =
+      "LIVE_ENGINE";
 
     const engine =
       await runLiveEngine(
@@ -3535,14 +4800,26 @@ async function scheduledRun(env) {
         scan
       );
 
+    completeStage(
+      portfolio,
+      "LIVE_ENGINE"
+    );
+
     portfolio.runtime.last_scheduled_run_ok =
       true;
 
     portfolio.runtime.last_scheduled_error =
       null;
 
+    portfolio.runtime.last_error_stage =
+      null;
+
+    portfolio.runtime.last_error_time =
+      null;
+
     portfolio.runtime.last_run_duration_ms =
-      Date.now() - started;
+      Date.now() -
+      started;
 
     portfolio.runtime.last_buy_count =
       engine.buys;
@@ -3558,25 +4835,72 @@ async function scheduledRun(env) {
 
     portfolio.runtime.total_successful_scheduled_runs++;
 
+    setStage(
+      portfolio,
+      "PERSIST"
+    );
+
+    currentStage =
+      "PERSIST";
+
+    /*
+    Trade functions already force-persist after confirmed
+    trades. For a no-trade run, only checkpoint when due.
+    */
     if (
-      checkpointDue(portfolio) ||
-      engine.buys > 0 ||
-      engine.sells > 0
+      checkpointDue(
+        portfolio
+      ) &&
+      engine.buys === 0 &&
+      engine.sells === 0
     ) {
       await savePortfolio(
         env,
         portfolio,
-        engine.buys > 0 ||
-          engine.sells > 0
-          ? "LIVE_TRADE"
-          : "LIVE_CHECKPOINT",
-        engine.buys > 0 ||
-          engine.sells > 0
+        "LIVE_CHECKPOINT",
+        true
       );
     }
 
+    completeStage(
+      portfolio,
+      "PERSIST"
+    );
+
+    portfolio.runtime.current_stage =
+      null;
+
+    /*
+    Final runtime persistence.
+    One KV write, not several redundant writes.
+    */
+    await savePortfolio(
+      env,
+      portfolio,
+      "SCHEDULED_SUCCESS",
+      true
+    );
+
+    logEvent(
+      "SCHEDULED_RUN_SUCCESS",
+      {
+        duration_ms:
+          Date.now() -
+          started,
+        buys:
+          engine.buys,
+        sells:
+          engine.sells,
+        positions:
+          engine.positions,
+        eligible:
+          engine.eligible_candidates
+      }
+    );
+
     return {
-      ok: true,
+      ok:
+        true,
       engine
     };
   } catch (error) {
@@ -3586,11 +4910,24 @@ async function scheduledRun(env) {
     if (!portfolio) {
       try {
         portfolio =
-          await loadPortfolio(env);
-      } catch {}
+          await loadPortfolio(
+            env
+          );
+      } catch (loadError) {
+        logError(
+          "ERROR_RECOVERY_PORTFOLIO_LOAD_FAILED",
+          loadError
+        );
+      }
     }
 
     if (portfolio) {
+      failStage(
+        portfolio,
+        currentStage,
+        error
+      );
+
       portfolio.runtime.last_scheduled_run_ok =
         false;
 
@@ -3598,7 +4935,8 @@ async function scheduledRun(env) {
         message;
 
       portfolio.runtime.last_run_duration_ms =
-        Date.now() - started;
+        Date.now() -
+        started;
 
       portfolio.runtime.total_failed_scheduled_runs++;
 
@@ -3609,8 +4947,25 @@ async function scheduledRun(env) {
           "SCHEDULED_ERROR",
           true
         );
-      } catch {}
+      } catch (persistError) {
+        logError(
+          "SCHEDULED_ERROR_PERSIST_FAILED",
+          persistError
+        );
+      }
     }
+
+    logError(
+      "SCHEDULED_RUN_FAILED",
+      error,
+      {
+        stage:
+          currentStage,
+        duration_ms:
+          Date.now() -
+          started
+      }
+    );
 
     throw error;
   }
@@ -3632,9 +4987,15 @@ export default {
         env
       );
     } catch (error) {
+      logError(
+        "HTTP_HANDLER_FAILED",
+        error
+      );
+
       return jsonResponse(
         {
-          ok: false,
+          ok:
+            false,
 
           bot:
             BOT_NAME,
@@ -3655,8 +5016,11 @@ export default {
     env,
     ctx
   ) {
-    ctx.waitUntil(
-      scheduledRun(env)
+    /*
+    The scheduled operation itself is awaited.
+    */
+    await scheduledRun(
+      env
     );
   }
 };
