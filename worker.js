@@ -35,7 +35,8 @@ DEX DISCOVERY
 - GeckoTerminal is not used
 
 LIVE SAFETY
-- Minimum entry score: 20
+- Minimum entry score: 15
+- Minimum momentum score: 0
 - DEX/Jupiter severe price mismatch rejection
 - $2 maximum live trade
 - $20 maximum tracked bankroll
@@ -79,9 +80,20 @@ const REVERSAL_CONFIRMATIONS_REQUIRED = 2;
 const SHORT_TERM_SELL_RATIO = 1.50;
 const HOURLY_SELL_RATIO = 1.43;
 
-const MIN_ENTRY_SCORE = 20;
-const MIN_MOMENTUM_SCORE = 3;
+/*
+Loosened entry gate:
+- Score 15 allows stronger setups such as the recent CAT
+  candidate that scored 15.
+- Momentum floor is 0 so a setup does not need positive
+  short-term momentum to qualify.
+- Liquidity, volume, chase, price mismatch, cooldown,
+  position, bankroll, and SOL reserve protections remain
+  enforced separately.
+*/
+const MIN_ENTRY_SCORE = 15;
+const MIN_MOMENTUM_SCORE = 0;
 const MIN_SETUP_SCORE = 3;
+
 const MAX_HISTORICAL_SETUP_BONUS = 15;
 
 const MIN_TOKEN_PRICE = 0.00000001;
